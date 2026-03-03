@@ -114,8 +114,11 @@ UNCHANGED:
 ```
 RIR/LIR allocation:     3fff::/32          (provider allocation)
   Site A (DC-East):      3fff:0a::/48       (65,536 /64s)
-    Infra (p2p links):   3fff:0a:ff00::/56  (256 /64s for p2p)
-    Hosts:               3fff:0a:0000::/52  (4,096 /64s for hosts)
+    Rack /64s:           3fff:0a:ff00::/56  (256 /64s, one per rack)
+      Rack 1:            3fff:0a:ff01::/64  (shared L2, all hosts in rack)
+      Rack 2:            3fff:0a:ff02::/64
+      ...
+    Pod /64s:            3fff:0a:0000::/52  (4,096 /64s, one per host)
       worker-1:          3fff:0a:0001::/64
       worker-2:          3fff:0a:0002::/64
       ...
@@ -126,28 +129,81 @@ RIR/LIR allocation:     3fff::/32          (provider allocation)
     ...
 ```
 
-### Per-Host Addressing
+### Dual-Address Model: Rack /64 + Pod /64
 
-Each host has two distinct address scopes:
+Every host has **two IPv6 addresses from two different /64 prefixes**:
+
+1. **Rack address (/128 from the rack's /64):** The host's identity on the
+   data center fabric. All hosts in the same rack share one /64 on the L2
+   segment connecting them to the ToR switch. Each host gets a single /128
+   from this prefix. Used for: management, BGP peering, WireGuard
+   endpoints, node-to-node communication.
+
+2. **Pod prefix (dedicated /64):** A separate /64 routed to this host for
+   pod addressing. Every pod on the host gets a /128 from this prefix.
+   Advertised via BGP so the fabric knows to send pod traffic here.
+
+```
+Rack 1 (ToR-1):
+  Rack /64:    3fff:0a:ff01::/64  (shared L2 segment)
+  ToR switch:  3fff:0a:ff01::1/128
+
+  Host worker-1:
+    eth0 (rack):   3fff:0a:ff01::11/128  (from rack /64)
+    Pod /64:       3fff:0a:0001::/64     (dedicated, routed to this host)
+      gateway:     3fff:0a:0001::1
+      Pod A:       3fff:0a:0001::a
+      Pod B:       3fff:0a:0001::b
+
+  Host worker-2:
+    eth0 (rack):   3fff:0a:ff01::12/128  (from rack /64)
+    Pod /64:       3fff:0a:0002::/64     (dedicated, routed to this host)
+      gateway:     3fff:0a:0002::1
+      Pod C:       3fff:0a:0002::1a
+
+Rack 2 (ToR-2):
+  Rack /64:    3fff:0a:ff02::/64
+  ToR switch:  3fff:0a:ff02::1/128
+
+  Host worker-3:
+    eth0 (rack):   3fff:0a:ff02::11/128
+    Pod /64:       3fff:0a:0003::/64
+      ...
+```
+
+### Why Two Prefixes
+
+The separation is deliberate:
+
+- **The rack /64 is infrastructure.** It's the L2 segment. The ToR switch
+  has a directly-connected route for it. NDP works naturally -- all hosts
+  on the rack can discover each other via standard Neighbor Solicitation
+  on this shared /64. No proxy NDP, no hacks.
+
+- **The pod /64 is routed, not bridged.** The ToR learns about each host's
+  pod /64 via BGP (next-hop = host's rack address). Pods are not on the
+  rack L2 segment -- they're behind the host, which acts as a router.
+  This is cleaner, scales better, and prevents pod NDP traffic from
+  flooding the rack segment.
+
+- **Clear failure domain.** If a host goes down, only its pod /64 is
+  affected. The rack /64 remains operational for all other hosts. BGP
+  withdraws the dead host's pod /64 automatically.
+
+### WireGuard Endpoint
+
+The WireGuard endpoint uses the host's rack address (stable,
+infrastructure-level):
 
 ```
 Host worker-1:
-  Uplink interface (eth0):
-    Link-local:    fe80::1/64            (always present)
-    P2P to ToR:    3fff:0a:ff01::1/127  (BGP peering)
-    OR: use link-local only for BGP (RFC 5549 unnumbered)
-
-  Pod network (internal routing):
-    Pod CIDR:      3fff:0a:0001::/64
-    Gateway:       3fff:0a:0001::1   (host acts as gateway)
-    Pod A:         3fff:0a:0001::a
-    Pod B:         3fff:0a:0001::b
-    ...
-
-  WireGuard (for cross-site encryption):
-    wg0 endpoint:  [3fff:0a:ff01::1]:51820
-    wg0 address:   (none needed -- encryption only, no routing)
+  WireGuard endpoint:  [3fff:0a:ff01::11]:51820  (rack address)
+  wg0 has no IP assigned -- it's an encryption-only device
 ```
+
+This means WireGuard peers use the rack address to reach each other,
+while pod traffic is routed via the pod /64. The two address spaces serve
+completely different purposes and never overlap.
 
 ### Pod Address Assignment
 
@@ -200,21 +256,25 @@ which host owns which /64. BGP is the standard mechanism for this:
 ### Topology: eBGP to ToR
 
 The recommended deployment is **eBGP peering from each host to its
-Top-of-Rack (ToR) switch**:
+Top-of-Rack (ToR) switch** over the shared rack /64:
 
 ```
                     Spine switches (AS 65000)
                    /          |          \
                   /           |           \
         ToR-1 (AS 65001)  ToR-2 (AS 65002)  ToR-3 (AS 65003)
+        3fff:0a:ff01::1   3fff:0a:ff02::1   3fff:0a:ff03::1
           |       |          |       |          |       |
        host-1  host-2    host-3  host-4     host-5  host-6
+       ::11    ::12       ::11    ::12       ::11    ::12
        AS 65011 AS 65012  AS 65021 AS 65022  AS 65031 AS 65032
 ```
 
-Each host runs its own private ASN and peers with its ToR switch.
-The host advertises its /64 pod prefix. The ToR aggregates and
-re-advertises upstream to the spines.
+Each host runs its own private ASN and peers with its ToR via the rack
+/64. The BGP session runs over the shared rack L2 segment -- no tunnels
+or special config needed. The host advertises its pod /64 prefix with its
+rack address as the next-hop. The ToR aggregates and re-advertises
+upstream to the spines.
 
 ### Wirescale BGP Speaker
 
@@ -235,12 +295,14 @@ spec:
       peerGroups:
         - name: tor
           peerASN: 65001
-          # Auto-discover peer from default gateway, or explicit:
-          # peerAddress: "3fff:0a:ff01::0"
+          # Auto-discover: peer with the ToR at ::1 on the rack /64
+          # (detected from the host's rack address prefix)
+          # OR explicit:
+          # peerAddress: "3fff:0a:ff01::1"
           addressFamilies:
             - ipv6Unicast
           exportPrefixes:
-            - podCIDR                # export this node's /64 pod prefix
+            - podCIDR                # export this node's pod /64
           importPrefixes:
             - "0.0.0.0/0"           # default route
             - "::/0"                # default route
@@ -253,23 +315,24 @@ The agent translates this into GoBGP API calls:
 bgpServer := gobgp.NewBgpServer()
 
 // Configure local AS (auto-assigned from range based on node index)
+// RouterID: derived from rack address or hash of hostname (BGP requires 32-bit ID)
 bgpServer.Start(&config.Global{
-    ASN:      uint32(65010 + nodeIndex),
-    RouterID: nodeIPv4,  // BGP requires 32-bit router ID
-    ListenAddresses: []string{nodeIPv6},
+    ASN:            uint32(65010 + nodeIndex),
+    RouterID:       routerIDFromHostname(hostname),
+    ListenAddresses: []string{rackAddress}, // e.g., "3fff:0a:ff01::11"
 })
 
-// Add ToR peer
+// Add ToR peer (discovered from rack /64 gateway or explicit config)
 bgpServer.AddPeer(&config.Neighbor{
     PeerASN:  65001,
-    Address:  torAddress,
+    Address:  torAddress,  // e.g., "3fff:0a:ff01::1"
     AFISAFIs: []config.AfiSafi{{Name: "ipv6-unicast"}},
 })
 
-// Advertise pod /64
+// Advertise pod /64 with rack address as next-hop
 bgpServer.AddPath(&table.Path{
-    Prefix: podCIDRv6,  // "3fff:0a:0001::/64"
-    NextHop: nodeIPv6,
+    Prefix:  podCIDRv6,    // "3fff:0a:0001::/64"
+    NextHop: rackAddress,  // "3fff:0a:ff01::11"
 })
 ```
 
@@ -295,8 +358,11 @@ agent can configure static routes via the WirescaleNode CRD. The
 controller computes routes and each agent installs them:
 
 ```bash
-# On host-1, for reaching pods on host-2:
-ip -6 route add 3fff:0a:0002::/64 via 3fff:0a:ff02::1 dev eth0
+# On host-1 (rack 1), for reaching pods on host-2 (same rack):
+ip -6 route add 3fff:0a:0002::/64 via 3fff:0a:ff01::12 dev eth0
+
+# For reaching pods on host-3 (rack 2, different rack):
+ip -6 route add 3fff:0a:0003::/64 via 3fff:0a:ff01::1 dev eth0  # via ToR
 ```
 
 This doesn't scale well but works for clusters under ~50 nodes.
@@ -305,11 +371,15 @@ This doesn't scale well but works for clusters under ~50 nodes.
 
 ```bash
 # Accept RAs even with forwarding enabled (critical!)
+# The host receives RAs from the ToR on the rack /64 for default route.
+# Without accept_ra=2, enabling forwarding silently disables RA processing.
 net.ipv6.conf.eth0.accept_ra = 2
 net.ipv6.conf.all.forwarding = 1
 net.ipv6.conf.eth0.forwarding = 1
 
-# Proxy NDP is NOT needed -- BGP handles reachability
+# Proxy NDP is NOT needed:
+# - Pod /64 reachability is via BGP (ToR has a route, not an L2 adjacency)
+# - Rack /64 uses standard NDP (hosts are on the same L2 segment)
 net.ipv6.conf.eth0.proxy_ndp = 0
 ```
 
@@ -330,15 +400,17 @@ mode.
 ### Architecture
 
 ```
-Pod A (3fff:0a:1::a) -> Pod B (3fff:0a:2::b)
+Pod A (3fff:0a:0001::a) on host-1 -> Pod B (3fff:0a:0002::b) on host-2
+  host-1 rack addr: 3fff:0a:ff01::11
+  host-2 rack addr: 3fff:0a:ff01::12
 
 WITHOUT encryption (same-site, trusted fabric):
-  Pod A -> veth -> host routing -> eth0 -> fabric -> host-2 eth0 -> veth -> Pod B
+  Pod A -> veth -> host routing -> eth0 -> rack L2 -> host-2 eth0 -> veth -> Pod B
   (pure native IPv6, line rate, zero overhead)
 
 WITH encryption (cross-site, or policy requires it):
-  Pod A -> veth -> eBPF redirect -> wg0 -> encrypt -> eth0 -> fabric
-  -> host-2 eth0 -> wg0 -> decrypt -> eBPF redirect -> veth -> Pod B
+  Pod A -> veth -> eBPF redirect -> wg0 -> encrypt -> eth0 (via rack addr)
+  -> fabric -> remote host eth0 -> wg0 -> decrypt -> eBPF redirect -> veth -> Pod B
   (WireGuard overhead, but only when policy demands it)
 ```
 
@@ -388,11 +460,12 @@ When WireGuard is encryption-only, its configuration is simpler:
 ListenPort = 51820
 PrivateKey = <generated-at-boot>
 # No Address -- wg0 is not a routed interface, just an encryption hop
+# Endpoint uses the host's rack address (3fff:0a:ff01::11)
 
 [Peer]  # Remote site gateway
 PublicKey = <site-B-gateway-key>
-Endpoint = [3fff:0b:ff01::1]:51820
-AllowedIPs = 3fff:0b::/48    # All of Site B's address space
+Endpoint = [3fff:0b:ff01::1]:51820   # Site B gateway's rack address
+AllowedIPs = 3fff:0b::/48            # All of Site B's address space
 ```
 
 Traffic doesn't "route through" wg0 in the normal sense. The eBPF program
@@ -527,10 +600,10 @@ to the internet required SNAT because ULA addresses are not routable.
 With GUA pod addresses:
 
 ```
-Pod (3fff:0a:1::a) -> connect to [2607:f8b0:4004::200e]:443 (google.com)
+Pod (3fff:0a:0001::a) -> connect to [2607:f8b0:4004::200e]:443 (google.com)
   -> Native IPv6 routing
   -> No SNAT, no NAT64, no translation of any kind
-  -> Google sees source = 3fff:0a:1::a
+  -> Google sees source = 3fff:0a:0001::a
   -> Return traffic routes directly back to pod
 ```
 
@@ -726,21 +799,22 @@ Each site has 2-3 gateway nodes (for HA) that:
 2. Run BGP to advertise the local site's /48 to remote sites (over WireGuard)
 3. Act as transit routers for cross-site pod traffic
 
-The gateway's WireGuard config:
+The gateway's WireGuard config (using rack addresses as endpoints):
 
 ```
 [Interface]
 ListenPort = 51820
 PrivateKey = <key>
+# Gateway's own endpoint: its rack address, e.g. [3fff:0a:ff01::11]:51820
 
-[Peer]  # Site B gateway 1
+[Peer]  # Site B gateway 1 (rack 1 in DC-West)
 PublicKey = <site-b-gw1-key>
-Endpoint = [3fff:0b:ff01::1]:51820
+Endpoint = [3fff:0b:ff01::11]:51820  # Site B rack 1 address
 AllowedIPs = 3fff:0b::/48
 
-[Peer]  # Site B gateway 2 (HA)
+[Peer]  # Site B gateway 2 (rack 2 in DC-West, HA)
 PublicKey = <site-b-gw2-key>
-Endpoint = [3fff:0b:ff02::1]:51820
+Endpoint = [3fff:0b:ff02::11]:51820  # Site B rack 2 address
 AllowedIPs = 3fff:0b::/48
 ```
 
@@ -782,13 +856,18 @@ it assigns from the node's GUA /64:
 
 ```
 CNI ADD:
-  1. Read node's pod CIDR from WirescaleNode CRD: 3fff:0a:1::/64
-  2. Allocate next available address: 3fff:0a:1::a
+  1. Read node's pod CIDR from WirescaleNode CRD: 3fff:0a:0001::/64
+  2. Allocate next available address: 3fff:0a:0001::a
   3. Create veth pair, assign address in pod netns
-  4. Set gateway: 3fff:0a:1::1 (host's address on pod bridge)
+  4. Set gateway: 3fff:0a:0001::1 (host's address on pod subnet)
   5. Set MTU: physical MTU (no WireGuard overhead for native traffic)
        OR: physical MTU - 80 if always-encrypt mode
   6. Assign CLAT IPv4: 100.64.1.10 (via clat0 TUN, unchanged)
+
+Note: the pod gateway (3fff:0a:0001::1) is on the pod /64, NOT the rack /64.
+The host has addresses on both prefixes:
+  - 3fff:0a:ff01::11  (rack /64, on eth0, faces the fabric)
+  - 3fff:0a:0001::1   (pod /64, on the internal bridge, faces pods)
 ```
 
 ### MTU Handling
@@ -814,7 +893,7 @@ The CNI installs a host route for each pod on the host's routing table:
 
 ```bash
 # Inside host netns (done by CNI):
-ip -6 route add 3fff:0a:1::a/128 dev veth_podA
+ip -6 route add 3fff:0a:0001::a/128 dev veth_podA
 ```
 
 The host then advertises the covering /64 via BGP. The per-pod /128 routes
@@ -828,38 +907,60 @@ external routing).
 ### Case 1: Pod-to-Pod, Same Node (GUA)
 
 ```
-Pod A (3fff:0a:1::a) -> Pod B (3fff:0a:1::b)
+Pod A (3fff:0a:0001::a) -> Pod B (3fff:0a:0001::b)
   |
   | eth0 -> veth_A -> host kernel routing
-  | route: 3fff:0a:1::b/128 dev veth_B
+  | route: 3fff:0a:0001::b/128 dev veth_B
   | -> veth_B -> Pod B eth0
   |
   | No WireGuard. No eBPF translation. Pure kernel forwarding.
   | Latency: ~2-5 us. Throughput: limited by veth, ~40+ Gbps.
 ```
 
-### Case 2: Pod-to-Pod, Same Site, Different Node (Native IPv6)
+### Case 2a: Pod-to-Pod, Same Rack, Different Node (Native IPv6)
 
 ```
-Pod A on host-1 (3fff:0a:1::a) -> Pod C on host-2 (3fff:0a:2::1)
+Pod A on host-1 (3fff:0a:0001::a) -> Pod C on host-2 (3fff:0a:0002::1)
+  Both hosts are on rack 1: 3fff:0a:ff01::/64
   |
   | eth0 -> veth -> host-1 routing
-  | route: 3fff:0a:2::/64 via 3fff:0a:ff02::1 dev eth0
-  |   (learned via BGP from host-2's advertisement)
+  | route: 3fff:0a:0002::/64 via 3fff:0a:ff01::12 dev eth0
+  |   (learned via BGP, next-hop = host-2's rack address)
+  |   (host-2 is on the same L2 segment, so this is a single hop)
   v
-  Physical NIC -> fabric -> ToR -> host-2 physical NIC
+  Physical NIC -> rack L2 switch -> host-2 physical NIC
   |
-  | host-2 routing: 3fff:0a:2::1/128 dev veth_C
+  | host-2 routing: 3fff:0a:0002::1/128 dev veth_C
   | -> veth_C -> Pod C eth0
   |
-  | No WireGuard. No encapsulation. Line rate.
-  | The fabric routes native IPv6 -- this is just standard IP forwarding.
+  | No WireGuard. No encapsulation. Single L2 hop. Line rate.
+```
+
+### Case 2b: Pod-to-Pod, Different Rack, Same Site (Native IPv6)
+
+```
+Pod A on host-1/rack-1 (3fff:0a:0001::a) -> Pod D on host-3/rack-2 (3fff:0a:0003::5)
+  host-1 rack address: 3fff:0a:ff01::11
+  host-3 rack address: 3fff:0a:ff02::11
+  |
+  | eth0 -> veth -> host-1 routing
+  | route: 3fff:0a:0003::/64 via 3fff:0a:ff01::1 dev eth0
+  |   (BGP: ToR-1 learned host-3's /64 from ToR-2 via spine)
+  |   (next-hop rewritten by ToR to reach host-3's rack address)
+  v
+  Physical NIC -> ToR-1 -> spine -> ToR-2 -> host-3 physical NIC
+  |
+  | host-3 routing: 3fff:0a:0003::5/128 dev veth_D
+  | -> veth_D -> Pod D eth0
+  |
+  | No WireGuard. Standard L3 fabric routing. Line rate.
 ```
 
 ### Case 3: Pod-to-Pod, Cross-Site (WireGuard Encrypted)
 
 ```
-Pod A in DC-East (3fff:0a:1::a) -> Pod X in DC-West (3fff:0b:3::7)
+Pod A in DC-East (3fff:0a:0001::a) -> Pod X in DC-West (3fff:0b:0003::7)
+  host-1 rack address: 3fff:0a:ff01::11
   |
   | eth0 -> veth -> eBPF checks encrypt_map
   | 3fff:0b::/48 -> require_encryption = true
@@ -867,12 +968,13 @@ Pod A in DC-East (3fff:0a:1::a) -> Pod X in DC-West (3fff:0b:3::7)
   v
   wg0 on host-1:
   | peer: dc-west-gateway, AllowedIPs = 3fff:0b::/48
-  | encrypt -> UDP to [3fff:0b:ff01::1]:51820
+  | encrypt -> UDP from [3fff:0a:ff01::11] to [3fff:0b:ff01::11]:51820
+  |   (outer header uses rack addresses for both endpoints)
   v
-  Physical NIC -> internet/MPLS/DCI -> DC-West gateway
+  Physical NIC -> ToR -> spine -> DCI/MPLS -> DC-West spine -> ToR -> gateway
   |
   | wg0 on dc-west-gateway: decrypt
-  | -> kernel routing: 3fff:0b:3::/64 via host-X
+  | -> kernel routing: 3fff:0b:0003::/64 via host-X's rack address
   | -> fabric -> host-X
   | -> veth -> Pod X
 ```
@@ -880,16 +982,17 @@ Pod A in DC-East (3fff:0a:1::a) -> Pod X in DC-West (3fff:0b:3::7)
 ### Case 4: Pod to Internet (IPv6, Zero Overhead)
 
 ```
-Pod A (3fff:0a:1::a) -> google.com [2607:f8b0:4004::200e]:443
+Pod A (3fff:0a:0001::a) -> google.com [2607:f8b0:4004::200e]:443
   |
   | eth0 -> veth -> host routing
-  | route: ::/0 via 3fff:0a:ff01::0 (default via ToR)
+  | route: ::/0 via 3fff:0a:ff01::1 (default via ToR on rack /64)
   v
   Physical NIC -> ToR -> spine -> border -> internet
   |
   | No SNAT. No NAT64. No WireGuard. No translation.
-  | Google sees source = 3fff:0a:1::a
-  | Return traffic routes directly back.
+  | Google sees source = 3fff:0a:0001::a (pod's GUA from pod /64)
+  | Return traffic routes: border -> spine -> ToR-1 -> host-1 -> pod
+  |   (ToR knows 3fff:0a:0001::/64 -> host-1 via BGP)
   |
   | THIS IS THE IDEAL PATH. Zero overhead. Line rate.
 ```
@@ -897,11 +1000,11 @@ Pod A (3fff:0a:1::a) -> google.com [2607:f8b0:4004::200e]:443
 ### Case 5: Pod to Internet (IPv4 via NAT64)
 
 ```
-Pod A (3fff:0a:1::a / 100.64.1.10) -> example.com (93.184.216.34)
+Pod A (3fff:0a:0001::a / 100.64.1.10) -> example.com (93.184.216.34)
   |
   | App calls connect("93.184.216.34", 80) -- IPv4 socket
   | clat0 TUN: IPv4 -> IPv6
-  |   src: 3fff:0a:1::a
+  |   src: 3fff:0a:0001::a
   |   dst: 64:ff9b::5db8:d822
   v
   eth0 -> veth -> host routing
@@ -917,19 +1020,22 @@ Pod A (3fff:0a:1::a / 100.64.1.10) -> example.com (93.184.216.34)
 ### Case 6: Internet to Pod (Explicit Ingress)
 
 ```
-Client [2607:f8b0::1]:54321 -> Pod web (3fff:0a:1::a):443
+Client [2607:f8b0::1]:54321 -> Pod web (3fff:0a:0001::a):443
   |
-  | Internet -> border -> spine -> ToR -> host-1 NIC
+  | Internet -> border -> spine -> ToR-1
+  | ToR-1 BGP table: 3fff:0a:0001::/64 via 3fff:0a:ff01::11 (host-1)
+  | -> host-1 NIC (on rack /64)
   v
   XDP ingress firewall on eth0:
-  | dst = 3fff:0a:1::a (local pod)
-  | src = 2607:f8b0::1 (external)
+  | dst = 3fff:0a:0001::a (matches local pod /64)
+  | src = 2607:f8b0::1 (external -- not in any cluster prefix)
   | Check external_ingress_map: port 443, app=web-frontend -> ALLOW
   v
-  Kernel routing -> veth -> Pod eth0
+  Kernel routing: 3fff:0a:0001::a/128 dev veth_web -> Pod eth0
   |
   | Pod handles TLS, responds
-  | Return traffic routes directly (no SNAT needed)
+  | Return: src=3fff:0a:0001::a -> veth -> host routing -> eth0
+  |   -> ToR -> spine -> border -> internet (no SNAT needed)
 ```
 
 ---
