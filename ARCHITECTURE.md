@@ -9,6 +9,8 @@
   (GRO/GSO, eBPF fast paths, kernel tuning, hardware acceleration)
 - [SECURITY.md](SECURITY.md) -- Network security and dynamic access control
   (identity model, policy enforcement, BPF maps, audit)
+- [ROUTABLE-PREFIX.md](ROUTABLE-PREFIX.md) -- Globally routable /64-per-host
+  design (BGP routing, selective encryption, native IPv6 performance)
 
 ---
 
