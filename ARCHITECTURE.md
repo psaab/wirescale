@@ -4,6 +4,12 @@
 > IPv4 and IPv6 connectivity in IPv6-only clusters, inspired by Tailscale's
 > control/data plane separation and mesh networking model.
 
+**See also:**
+- [PERFORMANCE.md](PERFORMANCE.md) -- Line-rate performance engineering
+  (GRO/GSO, eBPF fast paths, kernel tuning, hardware acceleration)
+- [SECURITY.md](SECURITY.md) -- Network security and dynamic access control
+  (identity model, policy enforcement, BPF maps, audit)
+
 ---
 
 ## Table of Contents
