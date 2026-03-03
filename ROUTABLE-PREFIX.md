@@ -11,7 +11,7 @@
 1. [The /64-per-Host Model](#1-the-64-per-host-model)
 2. [What Changes from the Base Architecture](#2-what-changes-from-the-base-architecture)
 3. [Address Architecture](#3-address-architecture)
-4. [Routing: BGP to the Fabric](#4-routing-bgp-to-the-fabric)
+4. [Routing: Fabric-Managed BGP](#4-routing-fabric-managed-bgp)
 5. [WireGuard as Encryption-Only Layer](#5-wireguard-as-encryption-only-layer)
 6. [Selective Encryption Modes](#6-selective-encryption-modes)
 7. [IPv4 Compatibility in the GUA Model](#7-ipv4-compatibility-in-the-gua-model)
@@ -77,7 +77,7 @@ host model fundamentally restructures the data plane:
 | Encryption | Always (WireGuard) | Selective (WireGuard when needed) |
 | Internet reachability | Via NAT64 gateway | Direct (pods are globally routable) |
 | Inbound from internet | Not possible without proxy | Direct to pod (filtered by policy) |
-| Routing protocol | None (WireGuard AllowedIPs) | BGP (eBGP to ToR or iBGP mesh) |
+| Routing protocol | None (WireGuard AllowedIPs) | Fabric BGP (managed by network, not Wirescale) |
 | SNAT for outbound | MASQUERADE at NAT64 | None (preserve pod source IP) |
 | IPv4 for pods | CLAT -> NAT64 | CLAT -> NAT64 (unchanged) |
 | Performance ceiling | WireGuard crypto throughput | Line rate (native forwarding) |
@@ -91,7 +91,6 @@ REMOVED:
   - ULA address allocation
 
 ADDED:
-  - BGP speaker per node (embedded GoBGP or BIRD)
   - /64 prefix allocation from site CIDR
   - Ingress firewall (pods are internet-exposed)
   - Selective encryption policy (encrypt cross-site, optional same-site)
@@ -103,6 +102,7 @@ UNCHANGED:
   - CRD model (WirescaleMesh, WirescaleNode, WirescalePolicy)
   - DNS architecture (CoreDNS + dns64)
   - IPv4 compatibility (CLAT + NAT64)
+  - Fabric BGP routing (managed by the network, not Wirescale)
 ```
 
 ---
@@ -136,12 +136,13 @@ Every host has **two IPv6 addresses from two different /64 prefixes**:
 1. **Rack address (/128 from the rack's /64):** The host's identity on the
    data center fabric. All hosts in the same rack share one /64 on the L2
    segment connecting them to the ToR switch. Each host gets a single /128
-   from this prefix. Used for: management, BGP peering, WireGuard
-   endpoints, node-to-node communication.
+   from this prefix. Used for: management, WireGuard endpoints,
+   node-to-node communication, and as the BGP next-hop for the pod /64
+   (configured by the fabric, not Wirescale).
 
 2. **Pod prefix (dedicated /64):** A separate /64 routed to this host for
    pod addressing. Every pod on the host gets a /128 from this prefix.
-   Advertised via BGP so the fabric knows to send pod traffic here.
+   The fabric routes this prefix to the host (via BGP or static config).
 
 ```
 Rack 1 (ToR-1):
@@ -187,8 +188,8 @@ The separation is deliberate:
   flooding the rack segment.
 
 - **Clear failure domain.** If a host goes down, only its pod /64 is
-  affected. The rack /64 remains operational for all other hosts. BGP
-  withdraws the dead host's pod /64 automatically.
+  affected. The rack /64 remains operational for all other hosts. The
+  fabric automatically withdraws the dead host's pod /64 route.
 
 ### WireGuard Endpoint
 
@@ -240,23 +241,40 @@ mechanism is identical: stateless CLAT translation at the pod veth.
 
 ---
 
-## 4. Routing: BGP to the Fabric
+## 4. Routing: Fabric-Managed BGP
 
-### Why BGP
+### Assumption: The Fabric Handles BGP
 
-With globally routable /64 prefixes per host, the network fabric must know
-which host owns which /64. BGP is the standard mechanism for this:
+Wirescale assumes the data center network fabric already manages BGP
+routing for both the rack /64 and pod /64 prefixes. This is the standard
+operating model in modern data center networks:
 
-- Proven at scale (the internet runs on it)
-- Dynamic -- handles host additions, failures, and migrations
-- Policy-rich -- can express preferences, communities, prepending
-- Supported by all data center switches (Arista, Cisco, Juniper, SONiC)
-- Well-understood by network operations teams
+- **The rack /64** is a directly-connected L2 segment on the ToR. The
+  ToR learns host addresses via NDP and has a connected route for the
+  rack prefix. No configuration needed from Wirescale.
 
-### Topology: eBGP to ToR
+- **The pod /64** is routed to each host by the fabric. The ToR learns
+  each host's pod /64 (next-hop = host's rack address) through the
+  existing fabric BGP configuration -- eBGP from host to ToR, or static
+  provisioning, or whatever mechanism the network team has deployed.
 
-The recommended deployment is **eBGP peering from each host to its
-Top-of-Rack (ToR) switch** over the shared rack /64:
+Wirescale does **not** embed a BGP speaker. The routing infrastructure
+is managed by the network operations team using their existing tools
+(BIRD, FRR, SONiC, Arista EOS, etc.). This is the right separation of
+concerns:
+
+| Responsibility | Owner |
+|---------------|-------|
+| Pod /64 allocation per host | Wirescale controller (IPAM) |
+| Route advertisement (pod /64 → host) | Fabric BGP (network team) |
+| Pod address assignment within /64 | Wirescale CNI |
+| Per-pod /128 host routes | Wirescale CNI (local only, not in BGP) |
+| Encryption policy | Wirescale agent |
+| Pod network policy | Wirescale agent (eBPF) |
+
+### Typical Fabric Topology
+
+The fabric typically runs eBGP between each layer:
 
 ```
                     Spine switches (AS 65000)
@@ -267,107 +285,46 @@ Top-of-Rack (ToR) switch** over the shared rack /64:
           |       |          |       |          |       |
        host-1  host-2    host-3  host-4     host-5  host-6
        ::11    ::12       ::11    ::12       ::11    ::12
-       AS 65011 AS 65012  AS 65021 AS 65022  AS 65031 AS 65032
 ```
 
-Each host runs its own private ASN and peers with its ToR via the rack
-/64. The BGP session runs over the shared rack L2 segment -- no tunnels
-or special config needed. The host advertises its pod /64 prefix with its
-rack address as the next-hop. The ToR aggregates and re-advertises
-upstream to the spines.
+Each host peers with its ToR (or uses static routes provisioned by the
+fabric automation). The host advertises its pod /64 with its rack
+address as the next-hop. The ToR aggregates and re-advertises upstream
+to the spines. **All of this is outside Wirescale's scope.**
 
-### Wirescale BGP Speaker
+### What Wirescale Expects from the Fabric
 
-The wirescale-agent embeds a BGP speaker (GoBGP library). Configuration
-is driven by the `WirescaleMesh` and `WirescaleNode` CRDs:
+For Wirescale to function correctly, the fabric must provide:
+
+1. **Reachability for the rack /64:** Hosts on the same rack can reach
+   each other via L2 (NDP) on the shared rack /64 segment.
+
+2. **Route for each pod /64:** The fabric routes each host's pod /64
+   (next-hop = host's rack address) so that any host in the site can
+   reach any other host's pods via native IPv6 forwarding.
+
+3. **Default route:** Each host has a default IPv6 route (typically
+   learned from the ToR via RA or BGP) for internet egress.
+
+The `WirescaleNode` CRD records each node's addressing for Wirescale's
+own use (IPAM, encryption policy, WireGuard peer config) but does **not**
+drive any BGP configuration:
 
 ```yaml
 apiVersion: wirescale.io/v1alpha1
-kind: WirescaleMesh
+kind: WirescaleNode
 metadata:
-  name: default
+  name: worker-1
 spec:
-  routing:
-    mode: bgp                    # "bgp" | "static" | "wireguard-only"
-    bgp:
-      localASNRange: "65010-65999"  # auto-assign per node
-      # OR: localASN: 65010         # single ASN (iBGP)
-      peerGroups:
-        - name: tor
-          peerASN: 65001
-          # Auto-discover: peer with the ToR at ::1 on the rack /64
-          # (detected from the host's rack address prefix)
-          # OR explicit:
-          # peerAddress: "3fff:0a:ff01::1"
-          addressFamilies:
-            - ipv6Unicast
-          exportPrefixes:
-            - podCIDR                # export this node's pod /64
-          importPrefixes:
-            - "0.0.0.0/0"           # default route
-            - "::/0"                # default route
+  rackAddress: "3fff:0a:ff01::11"     # host's address on rack /64
+  podCIDR: "3fff:0a:0001::/64"        # host's dedicated pod /64
+  site: "dc-east"                      # for encryption policy decisions
 ```
-
-The agent translates this into GoBGP API calls:
-
-```go
-// Pseudocode for BGP setup
-bgpServer := gobgp.NewBgpServer()
-
-// Configure local AS (auto-assigned from range based on node index)
-// RouterID: derived from rack address or hash of hostname (BGP requires 32-bit ID)
-bgpServer.Start(&config.Global{
-    ASN:            uint32(65010 + nodeIndex),
-    RouterID:       routerIDFromHostname(hostname),
-    ListenAddresses: []string{rackAddress}, // e.g., "3fff:0a:ff01::11"
-})
-
-// Add ToR peer (discovered from rack /64 gateway or explicit config)
-bgpServer.AddPeer(&config.Neighbor{
-    PeerASN:  65001,
-    Address:  torAddress,  // e.g., "3fff:0a:ff01::1"
-    AFISAFIs: []config.AfiSafi{{Name: "ipv6-unicast"}},
-})
-
-// Advertise pod /64 with rack address as next-hop
-bgpServer.AddPath(&table.Path{
-    Prefix:  podCIDRv6,    // "3fff:0a:0001::/64"
-    NextHop: rackAddress,  // "3fff:0a:ff01::11"
-})
-```
-
-### Alternative: iBGP with Route Reflectors
-
-For environments where per-host ASNs are impractical, iBGP with route
-reflectors works:
-
-```
-All hosts: AS 65000
-Route reflectors (3 for HA): AS 65000, cluster-id per RR
-Each host peers with 2 RRs
-RRs reflect all /64 routes to all clients
-```
-
-This is the Calico model and scales to thousands of nodes with 3-5
-route reflectors.
-
-### Alternative: Static Routes
-
-For small clusters or cloud environments where BGP is unavailable, the
-agent can configure static routes via the WirescaleNode CRD. The
-controller computes routes and each agent installs them:
-
-```bash
-# On host-1 (rack 1), for reaching pods on host-2 (same rack):
-ip -6 route add 3fff:0a:0002::/64 via 3fff:0a:ff01::12 dev eth0
-
-# For reaching pods on host-3 (rack 2, different rack):
-ip -6 route add 3fff:0a:0003::/64 via 3fff:0a:ff01::1 dev eth0  # via ToR
-```
-
-This doesn't scale well but works for clusters under ~50 nodes.
 
 ### Kernel Sysctls for Host-as-Router
+
+The wirescale-agent configures the host to forward packets between pod
+veths and the physical NIC:
 
 ```bash
 # Accept RAs even with forwarding enabled (critical!)
@@ -378,7 +335,7 @@ net.ipv6.conf.all.forwarding = 1
 net.ipv6.conf.eth0.forwarding = 1
 
 # Proxy NDP is NOT needed:
-# - Pod /64 reachability is via BGP (ToR has a route, not an L2 adjacency)
+# - Pod /64 reachability is via fabric BGP (ToR has a route, not an L2 adjacency)
 # - Rack /64 uses standard NDP (hosts are on the same L2 segment)
 net.ipv6.conf.eth0.proxy_ndp = 0
 ```
@@ -390,7 +347,7 @@ net.ipv6.conf.eth0.proxy_ndp = 0
 ### The Paradigm Shift
 
 In the base architecture, WireGuard serves dual duty: routing overlay +
-encryption. With globally routable /64s and BGP, routing is native.
+encryption. With globally routable /64s and fabric-managed routing, routing is native.
 WireGuard's role shrinks to **transparent encryption** for traffic that
 requires confidentiality.
 
@@ -784,11 +741,11 @@ Site A (DC-East)                    Site B (DC-West)
 3fff:0a::/48                    3fff:0b::/48
   |                                   |
   +-- gateway-a                       +-- gateway-b
-  |   BGP to internet + Site B        |   BGP to internet + Site A
   |   WireGuard peer: gateway-b       |   WireGuard peer: gateway-a
+  |   Cross-site encrypted transit    |   Cross-site encrypted transit
   |                                   |
   +-- worker-1..100                   +-- worker-1..100
-      BGP to local ToR                    BGP to local ToR
+      Fabric routes pod /64s              Fabric routes pod /64s
       Native routing within site          Native routing within site
 ```
 
@@ -796,7 +753,8 @@ Site A (DC-East)                    Site B (DC-West)
 
 Each site has 2-3 gateway nodes (for HA) that:
 1. Peer with all other sites' gateways via WireGuard
-2. Run BGP to advertise the local site's /48 to remote sites (over WireGuard)
+2. Advertise the remote site's /48 as reachable through themselves
+   (the fabric routes cross-site traffic to the gateway)
 3. Act as transit routers for cross-site pod traffic
 
 The gateway's WireGuard config (using rack addresses as endpoints):
@@ -896,9 +854,9 @@ The CNI installs a host route for each pod on the host's routing table:
 ip -6 route add 3fff:0a:0001::a/128 dev veth_podA
 ```
 
-The host then advertises the covering /64 via BGP. The per-pod /128 routes
-are local only -- they don't leak into BGP (the /64 is sufficient for
-external routing).
+The fabric advertises the covering /64 via BGP. The per-pod /128 routes
+are local to the host only -- they don't appear in fabric BGP (the /64
+is sufficient for external routing).
 
 ---
 
@@ -925,7 +883,7 @@ Pod A on host-1 (3fff:0a:0001::a) -> Pod C on host-2 (3fff:0a:0002::1)
   |
   | eth0 -> veth -> host-1 routing
   | route: 3fff:0a:0002::/64 via 3fff:0a:ff01::12 dev eth0
-  |   (learned via BGP, next-hop = host-2's rack address)
+  |   (installed by fabric BGP, next-hop = host-2's rack address)
   |   (host-2 is on the same L2 segment, so this is a single hop)
   v
   Physical NIC -> rack L2 switch -> host-2 physical NIC
@@ -945,7 +903,7 @@ Pod A on host-1/rack-1 (3fff:0a:0001::a) -> Pod D on host-3/rack-2 (3fff:0a:0003
   |
   | eth0 -> veth -> host-1 routing
   | route: 3fff:0a:0003::/64 via 3fff:0a:ff01::1 dev eth0
-  |   (BGP: ToR-1 learned host-3's /64 from ToR-2 via spine)
+  |   (fabric BGP: ToR-1 learned host-3's /64 from ToR-2 via spine)
   |   (next-hop rewritten by ToR to reach host-3's rack address)
   v
   Physical NIC -> ToR-1 -> spine -> ToR-2 -> host-3 physical NIC
@@ -992,7 +950,7 @@ Pod A (3fff:0a:0001::a) -> google.com [2607:f8b0:4004::200e]:443
   | No SNAT. No NAT64. No WireGuard. No translation.
   | Google sees source = 3fff:0a:0001::a (pod's GUA from pod /64)
   | Return traffic routes: border -> spine -> ToR-1 -> host-1 -> pod
-  |   (ToR knows 3fff:0a:0001::/64 -> host-1 via BGP)
+  |   (ToR knows 3fff:0a:0001::/64 -> host-1 via fabric BGP)
   |
   | THIS IS THE IDEAL PATH. Zero overhead. Line rate.
 ```
@@ -1023,7 +981,7 @@ Pod A (3fff:0a:0001::a / 100.64.1.10) -> example.com (93.184.216.34)
 Client [2607:f8b0::1]:54321 -> Pod web (3fff:0a:0001::a):443
   |
   | Internet -> border -> spine -> ToR-1
-  | ToR-1 BGP table: 3fff:0a:0001::/64 via 3fff:0a:ff01::11 (host-1)
+  | ToR-1 fabric BGP: 3fff:0a:0001::/64 via 3fff:0a:ff01::11 (host-1)
   | -> host-1 NIC (on rack /64)
   v
   XDP ingress firewall on eth0:
@@ -1042,16 +1000,17 @@ Client [2607:f8b0::1]:54321 -> Pod web (3fff:0a:0001::a):443
 
 ## 12. Deployment Topologies
 
-### Bare Metal with eBGP to ToR (Recommended)
+### Bare Metal with Fabric BGP (Recommended)
 
 ```
 Best for: Production data centers, high performance
-Routing: eBGP per-host to ToR switches
+Routing: Fabric-managed BGP (eBGP host-to-ToR, managed by network team)
 Encryption: cross-site (same-site traffic is native)
 IPv4: NAT64 on each node for outbound
 MTU: 9000 (jumbo frames on fabric)
 
-Requires: BGP-capable ToR switches, /48 per site
+Requires: BGP-capable fabric with pod /64 routes, /48 per site
+Wirescale's role: IPAM, pod addressing, encryption, policy -- not routing
 ```
 
 ### Cloud (AWS/GCP) with VPC Routing
@@ -1073,12 +1032,12 @@ Note: Not all clouds support /64-per-host. AWS gives /80 per ENI.
 
 ```
 Best for: Development, testing, small deployments
-Routing: Static routes (no BGP needed)
+Routing: All hosts on one L2 segment, static routes or single ToR
 Encryption: never or always (depending on trust model)
 IPv4: NAT64 or dual-stack
 MTU: 9000
 
-Simplest deployment -- no BGP, no gateways, just direct routing.
+Simplest deployment -- all pods reachable via L2 or single router hop.
 ```
 
 ---
@@ -1092,8 +1051,8 @@ Simplest deployment -- no BGP, no gateways, just direct routing.
 | **Pod to IPv6 internet** | SNAT required | Direct, no SNAT |
 | **Pod to IPv4 internet** | CLAT + NAT64 | CLAT + NAT64 (same) |
 | **Internet to pod** | Not possible (proxy required) | Direct (with policy) |
-| **Setup complexity** | Low (no BGP, no fabric config) | Medium (BGP peering, prefix allocation) |
-| **Network requirements** | Any (even NAT'd IPv4) | Routable IPv6 + BGP-capable fabric |
+| **Setup complexity** | Low (no fabric config needed) | Medium (fabric must route pod /64s) |
+| **Network requirements** | Any (even NAT'd IPv4) | Routable IPv6 + fabric with BGP routing |
 | **Security posture** | Implicitly isolated | Explicitly firewalled (mandatory policy) |
 | **MTU overhead** | -80 bytes (WireGuard) | 0 (native) |
 | **Latency overhead** | +encrypt/decrypt time | 0 (native) |
@@ -1105,13 +1064,13 @@ Simplest deployment -- no BGP, no gateways, just direct routing.
 
 **Use ULA + WireGuard Overlay when:**
 - Running on shared/untrusted infrastructure (public cloud, multi-tenant)
-- No control over the network fabric (can't configure BGP)
+- No control over the network fabric (can't get pod /64 routes installed)
 - IPv6 globally routable space not available
 - Maximum security is more important than maximum performance
 
 **Use GUA + Native Routing when:**
 - Running on dedicated infrastructure (own data center, bare metal)
-- Full control over the network fabric (BGP-capable ToR switches)
+- Full control over the network fabric (BGP routing for pod /64s)
 - Performance is critical (financial trading, HPC, media streaming)
 - Direct internet accessibility for services is desired
 - Operating at scale where WireGuard per-packet overhead is measurable
