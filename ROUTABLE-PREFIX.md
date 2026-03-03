@@ -34,13 +34,13 @@ Every pod on that host gets an address from the host's /64. These addresses
 are routable on the internet without NAT, without tunnels, without overlays.
 
 ```
-Site allocation:     2001:db8:site::/48     (65,536 /64s available)
-  Host worker-1:     2001:db8:site:0001::/64
-    Pod A:           2001:db8:site:0001::a/128
-    Pod B:           2001:db8:site:0001::b/128
-  Host worker-2:     2001:db8:site:0002::/64
-    Pod C:           2001:db8:site:0002::1/128
-  Host worker-3:     2001:db8:site:0003::/64
+Site allocation:     3fff:site::/48     (65,536 /64s available)
+  Host worker-1:     3fff:site:0001::/64
+    Pod A:           3fff:site:0001::a/128
+    Pod B:           3fff:site:0001::b/128
+  Host worker-2:     3fff:site:0002::/64
+    Pod C:           3fff:site:0002::1/128
+  Host worker-3:     3fff:site:0003::/64
     ...
 ```
 
@@ -72,7 +72,7 @@ host model fundamentally restructures the data plane:
 
 | Aspect | Base (ULA + WG Overlay) | /64-per-Host (GUA + Native Routing) |
 |--------|------------------------|--------------------------------------|
-| Pod IPv6 addresses | ULA (`fd00:ws:N::P`) | GUA (`2001:db8:site:N::P`) |
+| Pod IPv6 addresses | ULA (`fd00:ws:N::P`) | GUA (`3fff:site:N::P`) |
 | Inter-node reachability | WireGuard tunnel | Native IP routing (BGP) |
 | Encryption | Always (WireGuard) | Selective (WireGuard when needed) |
 | Internet reachability | Via NAT64 gateway | Direct (pods are globally routable) |
@@ -112,17 +112,17 @@ UNCHANGED:
 ### Allocation Hierarchy
 
 ```
-RIR/LIR allocation:     2001:db8::/32          (provider allocation)
-  Site A (DC-East):      2001:db8:0a::/48       (65,536 /64s)
-    Infra (p2p links):   2001:db8:0a:ff00::/56  (256 /64s for p2p)
-    Hosts:               2001:db8:0a:0000::/52  (4,096 /64s for hosts)
-      worker-1:          2001:db8:0a:0001::/64
-      worker-2:          2001:db8:0a:0002::/64
+RIR/LIR allocation:     3fff::/32          (provider allocation)
+  Site A (DC-East):      3fff:0a::/48       (65,536 /64s)
+    Infra (p2p links):   3fff:0a:ff00::/56  (256 /64s for p2p)
+    Hosts:               3fff:0a:0000::/52  (4,096 /64s for hosts)
+      worker-1:          3fff:0a:0001::/64
+      worker-2:          3fff:0a:0002::/64
       ...
-      worker-4096:       2001:db8:0a:1000::/64
-    Services:            2001:db8:0a:f000::/52  (service VIPs)
+      worker-4096:       3fff:0a:1000::/64
+    Services:            3fff:0a:f000::/52  (service VIPs)
 
-  Site B (DC-West):      2001:db8:0b::/48
+  Site B (DC-West):      3fff:0b::/48
     ...
 ```
 
@@ -134,18 +134,18 @@ Each host has two distinct address scopes:
 Host worker-1:
   Uplink interface (eth0):
     Link-local:    fe80::1/64            (always present)
-    P2P to ToR:    2001:db8:0a:ff01::1/127  (BGP peering)
+    P2P to ToR:    3fff:0a:ff01::1/127  (BGP peering)
     OR: use link-local only for BGP (RFC 5549 unnumbered)
 
   Pod network (internal routing):
-    Pod CIDR:      2001:db8:0a:0001::/64
-    Gateway:       2001:db8:0a:0001::1   (host acts as gateway)
-    Pod A:         2001:db8:0a:0001::a
-    Pod B:         2001:db8:0a:0001::b
+    Pod CIDR:      3fff:0a:0001::/64
+    Gateway:       3fff:0a:0001::1   (host acts as gateway)
+    Pod A:         3fff:0a:0001::a
+    Pod B:         3fff:0a:0001::b
     ...
 
   WireGuard (for cross-site encryption):
-    wg0 endpoint:  [2001:db8:0a:ff01::1]:51820
+    wg0 endpoint:  [3fff:0a:ff01::1]:51820
     wg0 address:   (none needed -- encryption only, no routing)
 ```
 
@@ -156,10 +156,10 @@ The CNI assigns addresses directly (no SLAAC, no DHCPv6):
 ```
 IPAM strategy: sequential from pool, skip gateway and reserved
 
-Pool:     2001:db8:0a:0001::a  through  2001:db8:0a:0001:ffff:ffff:ffff:ffff
-Reserved: 2001:db8:0a:0001::0  (subnet-router anycast, RFC 4291)
-          2001:db8:0a:0001::1  (host gateway)
-          2001:db8:0a:0001::2  through ::9 (infrastructure, future use)
+Pool:     3fff:0a:0001::a  through  3fff:0a:0001:ffff:ffff:ffff:ffff
+Reserved: 3fff:0a:0001::0  (subnet-router anycast, RFC 4291)
+          3fff:0a:0001::1  (host gateway)
+          3fff:0a:0001::2  through ::9 (infrastructure, future use)
 Available: ~18.4 quintillion addresses (2^64 - 10)
 ```
 
@@ -176,7 +176,7 @@ IPv4 pod addresses still use the CGNAT range from the base architecture:
 
 ```
 Pod IPv4 (CLAT):   100.64.N.P/32
-Mapping:           100.64.N.P  <-->  2001:db8:0a:N::P
+Mapping:           100.64.N.P  <-->  3fff:0a:N::P
 ```
 
 The mapping is now from CGNAT to GUA instead of CGNAT to ULA, but the
@@ -236,7 +236,7 @@ spec:
         - name: tor
           peerASN: 65001
           # Auto-discover peer from default gateway, or explicit:
-          # peerAddress: "2001:db8:0a:ff01::0"
+          # peerAddress: "3fff:0a:ff01::0"
           addressFamilies:
             - ipv6Unicast
           exportPrefixes:
@@ -268,7 +268,7 @@ bgpServer.AddPeer(&config.Neighbor{
 
 // Advertise pod /64
 bgpServer.AddPath(&table.Path{
-    Prefix: podCIDRv6,  // "2001:db8:0a:0001::/64"
+    Prefix: podCIDRv6,  // "3fff:0a:0001::/64"
     NextHop: nodeIPv6,
 })
 ```
@@ -296,7 +296,7 @@ controller computes routes and each agent installs them:
 
 ```bash
 # On host-1, for reaching pods on host-2:
-ip -6 route add 2001:db8:0a:0002::/64 via 2001:db8:0a:ff02::1 dev eth0
+ip -6 route add 3fff:0a:0002::/64 via 3fff:0a:ff02::1 dev eth0
 ```
 
 This doesn't scale well but works for clusters under ~50 nodes.
@@ -330,7 +330,7 @@ mode.
 ### Architecture
 
 ```
-Pod A (2001:db8:0a:1::a) -> Pod B (2001:db8:0a:2::b)
+Pod A (3fff:0a:1::a) -> Pod B (3fff:0a:2::b)
 
 WITHOUT encryption (same-site, trusted fabric):
   Pod A -> veth -> host routing -> eth0 -> fabric -> host-2 eth0 -> veth -> Pod B
@@ -391,8 +391,8 @@ PrivateKey = <generated-at-boot>
 
 [Peer]  # Remote site gateway
 PublicKey = <site-B-gateway-key>
-Endpoint = [2001:db8:0b:ff01::1]:51820
-AllowedIPs = 2001:db8:0b::/48    # All of Site B's address space
+Endpoint = [3fff:0b:ff01::1]:51820
+AllowedIPs = 3fff:0b::/48    # All of Site B's address space
 ```
 
 Traffic doesn't "route through" wg0 in the normal sense. The eBPF program
@@ -420,9 +420,9 @@ spec:
     # When mode is "cross-site", define site boundaries:
     sites:
       - name: dc-east
-        prefixes: ["2001:db8:0a::/48"]
+        prefixes: ["3fff:0a::/48"]
       - name: dc-west
-        prefixes: ["2001:db8:0b::/48"]
+        prefixes: ["3fff:0b::/48"]
     # Traffic within a site: unencrypted (native routing)
     # Traffic between sites: WireGuard encrypted
 
@@ -498,7 +498,7 @@ Unchanged from the base architecture. Every pod gets a CLAT `clat0`
 interface with a CGNAT IPv4 address. The deterministic mapping is:
 
 ```
-100.64.N.P  <-->  2001:db8:0a:N::P
+100.64.N.P  <-->  3fff:0a:N::P
 ```
 
 The only difference: the IPv6 side is now a GUA instead of ULA. The eBPF
@@ -527,10 +527,10 @@ to the internet required SNAT because ULA addresses are not routable.
 With GUA pod addresses:
 
 ```
-Pod (2001:db8:0a:1::a) -> connect to [2607:f8b0:4004::200e]:443 (google.com)
+Pod (3fff:0a:1::a) -> connect to [2607:f8b0:4004::200e]:443 (google.com)
   -> Native IPv6 routing
   -> No SNAT, no NAT64, no translation of any kind
-  -> Google sees source = 2001:db8:0a:1::a
+  -> Google sees source = 3fff:0a:1::a
   -> Return traffic routes directly back to pod
 ```
 
@@ -708,7 +708,7 @@ encrypts the transit:
 
 ```
 Site A (DC-East)                    Site B (DC-West)
-2001:db8:0a::/48                    2001:db8:0b::/48
+3fff:0a::/48                    3fff:0b::/48
   |                                   |
   +-- gateway-a                       +-- gateway-b
   |   BGP to internet + Site B        |   BGP to internet + Site A
@@ -735,13 +735,13 @@ PrivateKey = <key>
 
 [Peer]  # Site B gateway 1
 PublicKey = <site-b-gw1-key>
-Endpoint = [2001:db8:0b:ff01::1]:51820
-AllowedIPs = 2001:db8:0b::/48
+Endpoint = [3fff:0b:ff01::1]:51820
+AllowedIPs = 3fff:0b::/48
 
 [Peer]  # Site B gateway 2 (HA)
 PublicKey = <site-b-gw2-key>
-Endpoint = [2001:db8:0b:ff02::1]:51820
-AllowedIPs = 2001:db8:0b::/48
+Endpoint = [3fff:0b:ff02::1]:51820
+AllowedIPs = 3fff:0b::/48
 ```
 
 Worker nodes don't need WireGuard at all (in `cross-site` encryption
@@ -755,7 +755,7 @@ behind a residential ISP) can still join the mesh using the base
 architecture's ULA + WireGuard overlay model:
 
 ```
-Site A (DC, GUA):  2001:db8:0a::/48  (native routing)
+Site A (DC, GUA):  3fff:0a::/48  (native routing)
 Site B (Office, ULA): fd00:ws:b::/48  (WireGuard overlay)
 
 Gateway-A peers with Office-VPN peer:
@@ -782,10 +782,10 @@ it assigns from the node's GUA /64:
 
 ```
 CNI ADD:
-  1. Read node's pod CIDR from WirescaleNode CRD: 2001:db8:0a:1::/64
-  2. Allocate next available address: 2001:db8:0a:1::a
+  1. Read node's pod CIDR from WirescaleNode CRD: 3fff:0a:1::/64
+  2. Allocate next available address: 3fff:0a:1::a
   3. Create veth pair, assign address in pod netns
-  4. Set gateway: 2001:db8:0a:1::1 (host's address on pod bridge)
+  4. Set gateway: 3fff:0a:1::1 (host's address on pod bridge)
   5. Set MTU: physical MTU (no WireGuard overhead for native traffic)
        OR: physical MTU - 80 if always-encrypt mode
   6. Assign CLAT IPv4: 100.64.1.10 (via clat0 TUN, unchanged)
@@ -814,7 +814,7 @@ The CNI installs a host route for each pod on the host's routing table:
 
 ```bash
 # Inside host netns (done by CNI):
-ip -6 route add 2001:db8:0a:1::a/128 dev veth_podA
+ip -6 route add 3fff:0a:1::a/128 dev veth_podA
 ```
 
 The host then advertises the covering /64 via BGP. The per-pod /128 routes
@@ -828,10 +828,10 @@ external routing).
 ### Case 1: Pod-to-Pod, Same Node (GUA)
 
 ```
-Pod A (2001:db8:0a:1::a) -> Pod B (2001:db8:0a:1::b)
+Pod A (3fff:0a:1::a) -> Pod B (3fff:0a:1::b)
   |
   | eth0 -> veth_A -> host kernel routing
-  | route: 2001:db8:0a:1::b/128 dev veth_B
+  | route: 3fff:0a:1::b/128 dev veth_B
   | -> veth_B -> Pod B eth0
   |
   | No WireGuard. No eBPF translation. Pure kernel forwarding.
@@ -841,15 +841,15 @@ Pod A (2001:db8:0a:1::a) -> Pod B (2001:db8:0a:1::b)
 ### Case 2: Pod-to-Pod, Same Site, Different Node (Native IPv6)
 
 ```
-Pod A on host-1 (2001:db8:0a:1::a) -> Pod C on host-2 (2001:db8:0a:2::1)
+Pod A on host-1 (3fff:0a:1::a) -> Pod C on host-2 (3fff:0a:2::1)
   |
   | eth0 -> veth -> host-1 routing
-  | route: 2001:db8:0a:2::/64 via 2001:db8:0a:ff02::1 dev eth0
+  | route: 3fff:0a:2::/64 via 3fff:0a:ff02::1 dev eth0
   |   (learned via BGP from host-2's advertisement)
   v
   Physical NIC -> fabric -> ToR -> host-2 physical NIC
   |
-  | host-2 routing: 2001:db8:0a:2::1/128 dev veth_C
+  | host-2 routing: 3fff:0a:2::1/128 dev veth_C
   | -> veth_C -> Pod C eth0
   |
   | No WireGuard. No encapsulation. Line rate.
@@ -859,20 +859,20 @@ Pod A on host-1 (2001:db8:0a:1::a) -> Pod C on host-2 (2001:db8:0a:2::1)
 ### Case 3: Pod-to-Pod, Cross-Site (WireGuard Encrypted)
 
 ```
-Pod A in DC-East (2001:db8:0a:1::a) -> Pod X in DC-West (2001:db8:0b:3::7)
+Pod A in DC-East (3fff:0a:1::a) -> Pod X in DC-West (3fff:0b:3::7)
   |
   | eth0 -> veth -> eBPF checks encrypt_map
-  | 2001:db8:0b::/48 -> require_encryption = true
+  | 3fff:0b::/48 -> require_encryption = true
   | bpf_redirect(wg0_ifindex)
   v
   wg0 on host-1:
-  | peer: dc-west-gateway, AllowedIPs = 2001:db8:0b::/48
-  | encrypt -> UDP to [2001:db8:0b:ff01::1]:51820
+  | peer: dc-west-gateway, AllowedIPs = 3fff:0b::/48
+  | encrypt -> UDP to [3fff:0b:ff01::1]:51820
   v
   Physical NIC -> internet/MPLS/DCI -> DC-West gateway
   |
   | wg0 on dc-west-gateway: decrypt
-  | -> kernel routing: 2001:db8:0b:3::/64 via host-X
+  | -> kernel routing: 3fff:0b:3::/64 via host-X
   | -> fabric -> host-X
   | -> veth -> Pod X
 ```
@@ -880,15 +880,15 @@ Pod A in DC-East (2001:db8:0a:1::a) -> Pod X in DC-West (2001:db8:0b:3::7)
 ### Case 4: Pod to Internet (IPv6, Zero Overhead)
 
 ```
-Pod A (2001:db8:0a:1::a) -> google.com [2607:f8b0:4004::200e]:443
+Pod A (3fff:0a:1::a) -> google.com [2607:f8b0:4004::200e]:443
   |
   | eth0 -> veth -> host routing
-  | route: ::/0 via 2001:db8:0a:ff01::0 (default via ToR)
+  | route: ::/0 via 3fff:0a:ff01::0 (default via ToR)
   v
   Physical NIC -> ToR -> spine -> border -> internet
   |
   | No SNAT. No NAT64. No WireGuard. No translation.
-  | Google sees source = 2001:db8:0a:1::a
+  | Google sees source = 3fff:0a:1::a
   | Return traffic routes directly back.
   |
   | THIS IS THE IDEAL PATH. Zero overhead. Line rate.
@@ -897,11 +897,11 @@ Pod A (2001:db8:0a:1::a) -> google.com [2607:f8b0:4004::200e]:443
 ### Case 5: Pod to Internet (IPv4 via NAT64)
 
 ```
-Pod A (2001:db8:0a:1::a / 100.64.1.10) -> example.com (93.184.216.34)
+Pod A (3fff:0a:1::a / 100.64.1.10) -> example.com (93.184.216.34)
   |
   | App calls connect("93.184.216.34", 80) -- IPv4 socket
   | clat0 TUN: IPv4 -> IPv6
-  |   src: 2001:db8:0a:1::a
+  |   src: 3fff:0a:1::a
   |   dst: 64:ff9b::5db8:d822
   v
   eth0 -> veth -> host routing
@@ -917,12 +917,12 @@ Pod A (2001:db8:0a:1::a / 100.64.1.10) -> example.com (93.184.216.34)
 ### Case 6: Internet to Pod (Explicit Ingress)
 
 ```
-Client [2607:f8b0::1]:54321 -> Pod web (2001:db8:0a:1::a):443
+Client [2607:f8b0::1]:54321 -> Pod web (3fff:0a:1::a):443
   |
   | Internet -> border -> spine -> ToR -> host-1 NIC
   v
   XDP ingress firewall on eth0:
-  | dst = 2001:db8:0a:1::a (local pod)
+  | dst = 3fff:0a:1::a (local pod)
   | src = 2607:f8b0::1 (external)
   | Check external_ingress_map: port 443, app=web-frontend -> ALLOW
   v

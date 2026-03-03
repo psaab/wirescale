@@ -94,7 +94,7 @@ When a packet arrives at a node's WireGuard interface, the identity
 resolution chain is:
 
 ```
-Encrypted UDP datagram from [2001:db8::3]:51820
+Encrypted UDP datagram from [3fff::3]:51820
   |
   | WireGuard decrypts using peer's public key
   | (peer = node-3, verified cryptographically)

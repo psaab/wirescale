@@ -346,13 +346,13 @@ PrivateKey = <generated-at-boot>
 # Peer: node-worker-2
 [Peer]
 PublicKey = <from WirescaleNode CRD>
-Endpoint = [2001:db8::2]:51820
+Endpoint = [3fff::2]:51820
 AllowedIPs = fd00:ws:2::/64, 100.64.2.0/24
 
 # Peer: node-worker-3
 [Peer]
 PublicKey = <from WirescaleNode CRD>
-Endpoint = [2001:db8::3]:51820
+Endpoint = [3fff::3]:51820
 AllowedIPs = fd00:ws:3::/64, 100.64.3.0/24
 ```
 
@@ -595,7 +595,7 @@ metadata:
   name: office-server
 spec:
   publicKey: "YWJjZGVm..."
-  endpoint: "[2001:db8:office::1]:51820"
+  endpoint: "[3fff:office::1]:51820"
   allowedIPs:
     - "fd00:ws:ext:1::/64"     # External peer's subnet
     - "100.64.200.0/24"        # External peer's IPv4 range
@@ -792,7 +792,7 @@ metadata:
 spec:
   # Set by agent at boot
   publicKey: "YWJjZGVm..."
-  endpoint: "[2001:db8::3]:51820"
+  endpoint: "[3fff::3]:51820"
   # Set by controller (IPAM)
   podCIDRv6: "fd00:ws:3::/64"
   podCIDRv4: "100.64.3.0/24"
@@ -822,7 +822,7 @@ metadata:
   name: dev-laptop
 spec:
   publicKey: "eHl6MTIz..."
-  endpoint: "[2001:db8:home::1]:51820"
+  endpoint: "[3fff:home::1]:51820"
   allowedIPs:
     - "fd00:ws:ext:1::1/128"
     - "100.64.200.1/32"
@@ -891,7 +891,7 @@ Pod A on node-1 (fd00:ws:1::5) -> Pod B on node-2 (fd00:ws:2::7)
 Pod A: eth0 -> veth -> host
 Host node-1: route fd00:ws:2::/64 dev wg0
   -> wg0: encrypt with node-2's public key
-  -> UDP to [2001:db8::2]:51820
+  -> UDP to [3fff::2]:51820
 
 Network: IPv6 UDP packet transit
 
@@ -940,7 +940,7 @@ Dev laptop (fd00:ws:ext:1::1) -> Pod B (fd00:ws:2::7)
 
 Laptop: wirescale-join agent
   -> wg0: encrypt with node-2's public key
-  -> UDP to [2001:db8::2]:51820
+  -> UDP to [3fff::2]:51820
 
 Node-2: wg0 decrypt -> verify AllowedIPs -> route to Pod B
 ```
