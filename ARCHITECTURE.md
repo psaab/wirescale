@@ -17,6 +17,8 @@
   (identity model, policy enforcement, BPF maps, audit)
 - [ROUTABLE-PREFIX.md](ROUTABLE-PREFIX.md) -- Globally routable /64-per-host
   design (BGP routing, selective encryption, native IPv6 performance)
+- [CILIUM-INTEGRATION.md](CILIUM-INTEGRATION.md) -- Architecture comparison
+  with Cilium as CNI (what changes, what Wirescale still provides)
 
 ---
 
