@@ -1,8 +1,9 @@
 # Wirescale: Kubernetes Network Operator Architecture
 
 > A WireGuard-based network operator for Kubernetes that provides seamless
-> IPv4 and IPv6 connectivity in IPv6-only clusters, inspired by Tailscale's
-> control/data plane separation and mesh networking model.
+> IPv4 and IPv6 connectivity in IPv6-only clusters, with a hyperscale-ready
+> three-tier control plane supporting central authentication, decentralized
+> forwarding, on-demand peering, and federated cross-cluster connectivity.
 >
 > Status: design document. Unless explicitly linked to implementation artifacts,
 > behavior described here should be treated as target architecture.
@@ -26,13 +27,13 @@
 
 1. [Problem Statement](#1-problem-statement)
 2. [Design Principles](#2-design-principles)
-3. [High-Level Architecture](#3-high-level-architecture)
+3. [Three-Tier Control Hierarchy](#3-three-tier-control-hierarchy)
 4. [Component Deep Dives](#4-component-deep-dives)
-5. [Address Architecture](#5-address-architecture)
-6. [Data Plane: WireGuard Mesh](#6-data-plane-wireguard-mesh)
-7. [IPv4 in an IPv6-Only World](#7-ipv4-in-an-ipv6-only-world)
-8. [DNS Architecture](#8-dns-architecture)
-9. [Cross-Cluster and External Connectivity](#9-cross-cluster-and-external-connectivity)
+5. [Address Architecture and Hierarchical Prefix Aggregation](#5-address-architecture-and-hierarchical-prefix-aggregation)
+6. [Data Plane: On-Demand WireGuard Peering](#6-data-plane-on-demand-wireguard-peering)
+7. [Cross-Cluster Connectivity](#7-cross-cluster-connectivity)
+8. [IPv4 in an IPv6-Only World](#8-ipv4-in-an-ipv6-only-world)
+9. [DNS Architecture](#9-dns-architecture)
 10. [Security Model](#10-security-model)
 11. [Custom Resource Definitions](#11-custom-resource-definitions)
 12. [Packet Flow Walkthrough](#12-packet-flow-walkthrough)
@@ -54,6 +55,32 @@ IPv6-only infrastructure. However:
 - Kubernetes networking assumes dual-stack or IPv4-primary in most tooling
 - Pod-to-pod communication across nodes needs encryption (zero-trust)
 
+### The Full-Mesh Scaling Wall
+
+Traditional WireGuard mesh architectures require every node to know about
+every other node in the fleet:
+
+- Every agent watches ALL peer CRDs -- O(N) watches per node
+- Identity propagation pushes ALL pod identities to ALL nodes -- O(N^2) state
+- Policy compilation generates per-node rules for ALL nodes -- O(N^2) work
+- WireGuard mesh: every node peers with every other node -- N-1 peers per node
+
+This model works for a single cluster under ~10K nodes but **completely breaks
+cross-cluster** where you would have hundreds of thousands of hosts. At that
+scale, O(total_hosts) routing state and O(total_pods) identity state on every
+node becomes unmanageable.
+
+### The Cross-Cluster Gap
+
+Existing approaches to cross-cluster connectivity fall into two traps:
+
+1. **Full state sync** -- replicate all pod/node/identity state across clusters.
+   This creates O(total_pods_all_clusters) state on every node and does not
+   scale past a handful of small clusters.
+2. **Gateway bottleneck** -- funnel all cross-cluster traffic through a small
+   number of gateway nodes. This creates throughput bottlenecks, single points
+   of failure, and adds latency to every cross-cluster packet.
+
 ### What We Want
 
 A conformant Wirescale deployment SHOULD satisfy the following goals for pods
@@ -64,13 +91,26 @@ in an IPv6-only Kubernetes cluster:
 2. **Transparent IPv4 connectivity** -- the platform MUST provide an IPv4
    compatibility path so pods can use IPv4 socket semantics over an IPv6
    underlay.
-3. **Encrypted pod-to-pod mesh** -- in full-mesh mode, inter-node traffic MUST
-   be encrypted with WireGuard; location-aware mode MAY use native intra-zone
-   routing by policy.
-4. **Control/data simplicity** -- the architecture SHOULD keep control-plane
-   distribution (keys/routes/policy) separate from data-plane forwarding.
-5. **External mesh capability** -- deployments MAY extend the mesh to external
-   services (other clusters, bare-metal, cloud VMs).
+3. **Encrypted pod-to-pod mesh** -- inter-node traffic MUST be encrypted with
+   WireGuard via on-demand peering; peers MUST be established only when
+   traffic demands it and garbage-collected when idle.
+4. **Central authentication, decentralized forwarding** -- a central control
+   plane MUST handle authentication, authorization, and peer brokering. The
+   data plane MUST remain fully decentralized. Nodes MUST make forwarding
+   decisions locally with cached state.
+5. **Minimal state distribution** -- nodes MUST only learn about hosts and
+   identities they actively communicate with. Per-node state MUST be
+   O(active_peers), not O(total_nodes). Pod-level state MUST NOT be
+   distributed globally.
+6. **Hyperscale readiness** -- the system MUST scale to 10K+ nodes per cluster
+   and support federations of hundreds of clusters (hundreds of thousands of
+   total hosts) without requiring any node to hold global state.
+7. **Cross-cluster without full sync** -- cross-cluster connectivity MUST use
+   on-demand resolution and hierarchical prefix aggregation. Remote clusters
+   MUST be representable as a single aggregate route, not per-host entries.
+8. **External mesh capability** -- deployments MAY extend the mesh to external
+   services (other clusters, bare-metal, cloud VMs) via federated control
+   planes.
 
 ---
 
@@ -79,107 +119,280 @@ in an IPv6-only Kubernetes cluster:
 | Principle | Rationale |
 |-----------|-----------|
 | **IPv6-native, IPv4-compatible** | The underlay is IPv6-only. IPv4 is provided as a service via translation, not as infrastructure. |
-| **Control/data plane separation** | Inspired by Tailscale: the control plane distributes keys and policy; the data plane (WireGuard) handles encryption and routing. Control plane failure does not break existing connections. |
-| **Key-per-node, not key-per-pod** | Matches the WireGuard model and avoids O(n^2) key distribution. Pods on the same node share a tunnel. Same-node traffic is unencrypted (already isolated by kernel namespaces). |
-| **CRD-driven configuration** | All mesh state (peers, routes, policies) is expressed as Kubernetes Custom Resources. The cluster API server IS the coordination database. |
+| **Three-tier control hierarchy** | A global directory tracks clusters (O(clusters) state). Per-cluster controllers track nodes and pods within their cluster. Per-node agents hold only active flow state. No component holds global state for the entire federation. |
+| **Central authentication, decentralized forwarding** | The control plane (wirescale-control and wirescale-directory) handles authentication, authorization, peer brokering, and identity resolution. The data plane (WireGuard on each node) handles encryption and forwarding with no central mediation. Control plane failure does not break existing connections. |
+| **On-demand peering, not full mesh** | Nodes establish WireGuard peers only when traffic requires it. Idle peers are garbage-collected. A node with 50 active communication partners holds 50 peers, not 10,000. |
+| **Hierarchical prefix aggregation** | Each cluster is allocated a contiguous prefix. Intra-cluster routing uses per-host /64 routes. Cross-cluster routing uses one aggregate route per remote cluster. Total per-node route state: O(local_hosts + clusters). |
+| **Signaling gateways, not data-path gateways** | Cross-cluster gateways handle signaling (initial peer resolution) only. Data flows directly between source and destination nodes. Gateways are never in the data path for established flows. |
+| **Pull-based identity and policy** | Nodes request identity and policy information on demand, cache it with TTLs, and expire it. No push-based global state distribution. |
+| **O(active_peers) per node, not O(total_nodes)** | Every per-node resource -- WireGuard peers, identity cache entries, policy rules, route table entries -- scales with the number of active communication partners, not with the total size of the fleet. |
+| **Key-per-node, not key-per-pod** | Matches the WireGuard model and avoids quadratic key distribution. Pods on the same node share a tunnel. Same-node traffic is unencrypted (already isolated by kernel namespaces). |
 | **CNI-complementary, not CNI-replacing** | Wirescale can operate as a standalone CNI or as an overlay on top of an existing CNI (like Flannel or kubenet) for the intra-node path. |
-| **No additional external dependencies** | No extra coordination system beyond the Kubernetes control plane. The Kubernetes API is the source of truth for Wirescale state. |
-| **Graceful degradation** | If the controller is down, existing mesh connections SHOULD persist (cached WireGuard config). New nodes MAY wait until the controller recovers. |
+| **Cluster autonomy** | Each cluster operates independently. The global directory is a thin registry. A cluster MUST continue operating normally if the global directory is temporarily unavailable -- only new cross-cluster peer establishment is affected. |
+| **Graceful degradation** | If wirescale-control is unavailable, existing WireGuard peers and cached identities MUST persist. New peer establishment MAY wait until control recovers. The data plane never depends on real-time control plane availability. |
 
 ---
 
-## 3. High-Level Architecture
+## 3. Three-Tier Control Hierarchy
+
+The control plane is organized into three tiers, each holding only the state
+appropriate to its scope. This is the fundamental architectural change from
+flat mesh designs.
 
 ```
-+------------------------------------------------------------------+
-|                        CONTROL PLANE                              |
-|                                                                   |
-|  +---------------------------+  +-----------------------------+   |
-|  | wirescale-controller      |  | Kubernetes API Server       |   |
-|  | (Deployment, 1-3 replicas)|  |                             |   |
-|  |                           |  |  WirescaleNode CRD          |   |
-|  | - IPAM allocation         |  |  WirescaleMesh CRD          |   |
-|  | - Mesh topology mgmt      |  |  WirescalePolicy CRD        |   |
-|  | - Key distribution via CRD|  |  WirescaleExternalPeer CRD   |   |
-|  | - Policy compilation      |  |                             |   |
-|  | - Health monitoring        |  |                             |   |
-|  +---------------------------+  +-----------------------------+   |
-+------------------------------------------------------------------+
-                              |
-              CRD watch/update via kube API
-                              |
-+------------------------------------------------------------------+
-|                         DATA PLANE (per node)                     |
-|                                                                   |
-|  +------------------------------------------------------------+  |
-|  | wirescale-agent (DaemonSet)                                 |  |
-|  |                                                             |  |
-|  |  +------------------+  +------------------+  +-----------+  |  |
-|  |  | WireGuard Manager|  | Route Manager    |  | Policy    |  |  |
-|  |  | - wg0 interface  |  | - kernel routes  |  | Enforcer  |  |  |
-|  |  | - peer config    |  | - ip rules       |  | (eBPF/    |  |  |
-|  |  | - key generation |  | - IPAM state     |  |  nftables)|  |  |
-|  |  +------------------+  +------------------+  +-----------+  |  |
-|  |                                                             |  |
-|  |  +------------------+  +------------------+                 |  |
-|  |  | NAT64 Engine     |  | CLAT Engine      |                 |  |
-|  |  | (eBPF xlat on    |  | (per-pod IPv4    |                 |  |
-|  |  |  nat64 iface)    |  |  address via tun) |                 |  |
-|  |  +------------------+  +------------------+                 |  |
-|  +------------------------------------------------------------+  |
-|                                                                   |
-|  +------------------------------------------------------------+  |
-|  | wirescale-cni (CNI binary, /opt/cni/bin/wirescale)          |  |
-|  | - veth pair creation                                        |  |
-|  | - IPv6 address assignment (primary)                         |  |
-|  | - IPv4 address assignment (CLAT tun)                        |  |
-|  | - route injection into pod netns                            |  |
-|  +------------------------------------------------------------+  |
-+------------------------------------------------------------------+
++=========================================================================+
+|                     TIER 1: GLOBAL DIRECTORY                            |
+|                     (wirescale-directory)                                |
+|                                                                         |
+|  Globally replicated service (Raft consensus or similar)                |
+|  State: O(clusters) -- tens to hundreds of entries                      |
+|                                                                         |
+|  Maps: cluster_id -> {                                                  |
+|    gateway_endpoints,                                                   |
+|    prefix_allocation,   (e.g., 3fff:ws:0001::/32)                       |
+|    cluster_CA_cert,                                                     |
+|    controller_endpoint,                                                 |
+|    metadata                                                             |
+|  }                                                                      |
+|                                                                         |
+|  Root of trust for cross-cluster authentication.                        |
+|  Does NOT know about individual pods or nodes.                          |
++=========================================================================+
+          |                    |                    |
+     cluster registration     |              cluster lookup
+          |                    |                    |
++=========================+  +=========================+  +=================+
+| TIER 2: CLUSTER         |  | TIER 2: CLUSTER         |  | TIER 2: ...     |
+| CONTROLLER              |  | CONTROLLER              |  |                 |
+| (wirescale-control)     |  | (wirescale-control)     |  |                 |
+| Cluster 1               |  | Cluster 2               |  |                 |
+|                         |  |                         |  |                 |
+| State: O(nodes * pods)  |  | State: O(nodes * pods)  |  |                 |
+| - within this cluster   |  | - within this cluster   |  |                 |
+|                         |  |                         |  |                 |
+| - AuthN/AuthZ           |  | - AuthN/AuthZ           |  |                 |
+| - Peer Broker           |  | - Peer Broker           |  |                 |
+| - Identity Service      |  | - Identity Service      |  |                 |
+| - Policy Service        |  | - Policy Service        |  |                 |
+| - IPAM                  |  | - IPAM                  |  |                 |
+| - Cross-cluster proxy   |  | - Cross-cluster proxy   |  |                 |
++=========================+  +=========================+  +=================+
+     |          |                 |          |
+  gRPC(mTLS)  CRD watch       gRPC(mTLS)  CRD watch
+  (per-node)  (own node)      (per-node)  (own node)
+     |          |                 |          |
++=========================+  +=========================+
+| TIER 3: NODE AGENT      |  | TIER 3: NODE AGENT      |
+| (wirescale-agent)       |  | (wirescale-agent)       |
+| Per node                |  | Per node                |
+|                         |  |                         |
+| State: O(active_peers)  |  | State: O(active_peers)  |
+| - WireGuard peers       |  | - WireGuard peers       |
+| - Identity cache        |  | - Identity cache        |
+| - Route table           |  | - Route table           |
+| - Policy for local pods |  | - Policy for local pods |
++=========================+  +=========================+
+     |                            |
+     |    On-demand WireGuard     |
+     |    tunnels (direct,        |
+     |    including cross-cluster)|
+     +----------------------------+
 ```
 
-### Component Summary
+### Tier 1: Global Directory (`wirescale-directory`)
 
-| Component | Type | Runs On | Purpose |
-|-----------|------|---------|---------|
-| `wirescale-controller` | Deployment (HA) | Control plane nodes | IPAM, mesh topology, key coordination, policy compilation |
-| `wirescale-agent` | DaemonSet | Every node | WireGuard mesh, NAT64/CLAT, route programming, policy enforcement |
-| `wirescale-cni` | CNI binary | Every node (invoked by CRI) | Pod network namespace setup |
-| CoreDNS `dns64` plugin | ConfigMap patch | CoreDNS pods | Synthesize AAAA records for IPv4-only destinations |
+A lightweight, globally replicated service that serves as the root of trust
+for cross-cluster operations.
+
+**Responsibilities:**
+- Cluster registry: maps cluster IDs to gateway endpoints, prefix allocations,
+  cluster CA certificates, and controller endpoints
+- Root of trust: issues or validates cross-cluster authentication credentials
+- Prefix allocation: assigns contiguous prefixes to clusters from the
+  federation's address space
+
+**What it does NOT do:**
+- It does NOT know about individual pods or nodes
+- It does NOT participate in data-plane forwarding
+- It does NOT store identity or policy state
+- It does NOT need to be in the hot path for any per-packet operation
+
+**State size:** O(clusters) -- typically tens to hundreds of entries. A
+federation of 500 clusters requires ~500 registry entries. This state is small
+enough to be fully replicated across all directory replicas with negligible
+overhead.
+
+**Availability:** The directory MUST be replicated (3+ nodes, Raft or similar)
+for HA. However, the directory is only needed for:
+- New cluster registration
+- Cross-cluster peer establishment (cache miss on the cluster controller)
+- Certificate renewal
+
+Existing cross-cluster peers, cached cluster info on controllers, and all
+intra-cluster operations continue without the directory.
+
+### Tier 2: Cluster Controller (`wirescale-control`)
+
+A per-cluster service that knows all nodes and pods within its cluster. This
+is the primary control plane component that agents interact with.
+
+**Responsibilities:**
+- Authentication and authorization for agents within its cluster
+- Peer brokering: on-demand peer discovery for intra-cluster peers
+- Identity service: pod-to-identity resolution for pods in this cluster
+- Policy service: per-node policy compilation and push
+- IPAM: node /64 and /24 allocation within the cluster's prefix
+- Cross-cluster proxy: for cross-cluster peer requests, queries the global
+  directory for remote cluster info, then queries the remote cluster's
+  controller directly
+- Cluster registration: registers with the global directory at startup
+
+**State size:** O(nodes_in_cluster x pods_per_node). For a 10K-node cluster
+with 100 pods per node, this is ~1M entries -- manageable for an in-memory
+service with persistent backing.
+
+**Horizontal scaling:** The controller is stateless for read operations (reads
+from Kubernetes API / in-memory cache) and SHOULD be deployed as 3+ replicas
+behind a Service for HA. Write operations (IPAM, CRD updates) use leader
+election.
+
+### Tier 3: Node Agent (`wirescale-agent`)
+
+A per-node daemon with minimal state, responsible for data-plane operations.
+
+**Responsibilities:**
+- WireGuard interface management (key generation, peer setup, peer GC)
+- On-demand peering via cluster controller
+- Identity caching (pull-based, TTL-expiring)
+- Policy enforcement (eBPF/nftables for local pods only)
+- NAT64/CLAT translation
+- Route programming
+
+**State size:** O(active_peers) for WireGuard peers and identity cache. The
+agent MUST NOT watch all pods or nodes across the cluster -- only its own
+node's CRDs.
+
+**Routing table:** O(hosts_in_local_cluster) + O(remote_clusters) aggregate
+routes. Intra-cluster: one /64 route per local peer (programmed on demand).
+Cross-cluster: one aggregate route per remote cluster, pointing to the local
+signaling gateway.
+
+### State Distribution Summary
+
+| What | Flat Mesh (Broken at Scale) | Three-Tier (Hyperscale) |
+|------|---------------------------|------------------------|
+| Routes per node | O(all_hosts_in_fleet) | O(local_hosts + clusters) |
+| Identity state per node | O(all_pods_in_fleet) | O(active_flows) -- pull-based cache |
+| Policy per node | Grows with fleet | Local pods only |
+| CRD watches per node | O(N) events/sec | O(1) -- own node only |
+| Cross-cluster state | Full sync | On-demand resolution, cached |
+| Route updates on pod churn | O(pod_churn) globally | O(0) -- pods do not affect routes |
+| Route updates on host churn | O(host_churn) globally | O(host_churn) within cluster only |
+| Global directory state | N/A | O(clusters) -- tiny |
 
 ---
 
 ## 4. Component Deep Dives
 
-### 4.1 wirescale-controller
+### 4.1 wirescale-directory (Tier 1)
 
-The controller runs as a standard Kubernetes Deployment with leader election.
-It uses controller-runtime (kubebuilder) and manages several reconciliation
-loops:
+The global directory runs as a replicated service (3+ nodes) outside any
+single Kubernetes cluster. It MAY run on dedicated infrastructure, as a
+multi-cluster service, or within a designated management cluster.
+
+**Cluster Registry:**
+- Each cluster controller registers at startup:
+  `{cluster_id, gateway_endpoints, prefix_allocation, controller_endpoint, cluster_CA_cert}`
+- Registration MUST be authenticated (the directory issues bootstrap tokens
+  or uses a shared root CA)
+- The directory MUST validate that prefix allocations do not overlap
+- Registry entries include a heartbeat TTL; controllers MUST refresh
+  periodically (default 60s)
+- The directory MUST expose a gRPC API for cluster lookup by prefix or ID
+
+**Cross-Cluster Trust Root:**
+- The directory maintains the root CA (or a set of cross-signed CAs) for
+  federation-wide mTLS
+- Cluster controllers present their cluster CA certificate during registration
+- The directory validates and stores the CA certificate, making it available
+  to other cluster controllers that need to establish cross-cluster mTLS
+
+**Prefix Allocation:**
+- The directory allocates contiguous prefixes from the federation address
+  space (see [Section 5](#5-address-architecture-and-hierarchical-prefix-aggregation))
+- Allocation is idempotent: re-registering with the same cluster ID returns
+  the existing allocation
+- Deallocated prefixes are quarantined (default 7 days) before reuse
+
+### 4.2 wirescale-control (Tier 2)
+
+The per-cluster control plane service runs as a Kubernetes Deployment with 3+
+replicas behind a Service for high availability. It is the single component
+within a cluster that maintains cluster-wide state. Agents connect to it via
+gRPC over mTLS.
+
+**Authentication & Authorization:**
+- Nodes MUST authenticate to control via mTLS using kubelet client
+  certificates or projected ServiceAccount tokens.
+- Control MUST validate node identity against the Kubernetes API before
+  responding to any request.
+- Control MUST issue short-lived WireGuard peer authorization tokens that
+  bind a specific node pair for a bounded TTL.
+- Unauthorized or revoked nodes MUST be rejected immediately.
+
+**Peer Broker** -- on-demand peer discovery:
+- When node-A needs encrypted traffic to node-B, it queries control:
+  "I need the peer info for the node owning prefix `3fff:ws:0001:002a::/64`"
+- Control authenticates the request, checks authorization, and returns:
+  `{publicKey, endpoint, allowedIPs, token, TTL}`
+- Node-A configures a WireGuard peer with the returned parameters.
+- Control does NOT mediate data-plane traffic -- only peer discovery.
+- Peer info responses SHOULD include a TTL (default 300s). The agent
+  MUST re-validate before TTL expiry or on next cache miss.
+
+**Identity Service** -- pod identity resolution:
+- Agents query control to resolve: "Who owns IP `3fff:ws:0001:0003::7`?"
+- Control returns: `{namespace, serviceAccount, labels, nodeName}`
+- Agents cache identity responses locally (default TTL 60s).
+- Control is the only component that subscribes to global Pod events
+  within its cluster. It maintains a complete pod-to-identity index internally.
+- On identity cache miss, the agent queries control synchronously.
+  The expected latency budget for this path is ~5-10ms.
+
+**Policy Service** -- per-node policy push:
+- Each agent subscribes to control via a gRPC stream for policy updates
+  relevant to its own local pods only.
+- Control compiles policy rules on demand (or caches compiled results)
+  by intersecting WirescalePolicy/NetworkPolicy objects with the set of
+  pods running on each node.
+- Policy updates MUST be pushed to subscribed agents within 1s of a
+  policy or pod change that affects them.
+- Each node receives only the policy rules for its own pods -- not the
+  global policy set.
 
 **Node IPAM Reconciler** -- watches `Node` objects:
 - When a node joins, allocates a `/64` IPv6 pod CIDR from the cluster's
-  IPv6 pod range and a `/24` IPv4 pod CIDR from an internal CGNAT-like range
-- Writes allocations to the corresponding `WirescaleNode` CRD
-- Handles node removal and CIDR reclamation
+  IPv6 pod range and a `/24` IPv4 pod CIDR from an internal CGNAT-like range.
+- Writes allocations to the corresponding `WirescaleNode` CRD.
+- Handles node removal and CIDR reclamation.
 
-**Mesh Topology Reconciler** -- watches `WirescaleMesh` and `WirescaleNode` CRDs:
-- Computes the full mesh topology: which nodes are peers
-- Supports location-aware topology (like Kilo): nodes in the same zone use
-  direct routing; cross-zone traffic goes through WireGuard
-- Writes computed peer lists to each `WirescaleNode` status
-
-**Policy Reconciler** -- watches `WirescalePolicy` and `NetworkPolicy` objects:
-- Compiles policy rules into per-node filter sets
-- Writes compiled rules to `ConfigMap` objects consumed by the agents
-- Supports both Kubernetes-native `NetworkPolicy` and extended
-  `WirescalePolicy` (identity-based, like Tailscale ACLs)
+**Cross-Cluster Proxy:**
+- When an agent requests a peer in a prefix not belonging to this cluster,
+  control resolves the target cluster via the global directory (or its local
+  cache of directory state).
+- Control then contacts the remote cluster's controller directly via mTLS
+  (using the CA certificate from the directory) to resolve the specific node.
+- The response is relayed back to the requesting agent.
+- Cluster controller MUST cache directory responses (cluster -> controller
+  mapping) with a TTL (default 300s) to avoid hot-path queries to the
+  directory.
 
 **External Peer Reconciler** -- watches `WirescaleExternalPeer` CRDs:
-- Manages peers outside the cluster (bare metal, other clusters, VMs)
-- Distributes external peer keys and routes to relevant nodes
+- Manages peers outside the cluster (bare metal, other clusters, VMs).
+- Issues peer authorization for external nodes through the same broker
+  interface used by in-cluster agents.
 
-### 4.2 wirescale-agent
+### 4.3 wirescale-agent (Tier 3)
 
 The agent is the workhorse. It runs as a privileged DaemonSet with
 `hostNetwork: true` and capabilities `NET_ADMIN`, `NET_RAW`, `SYS_MODULE`.
@@ -192,32 +405,59 @@ On startup:
    - Node endpoint (IPv6 address + UDP port)
    - Allocated pod CIDRs (from IPAM)
 3. Create the `wg0` WireGuard interface bound to the node's IPv6 address
-4. Watch all `WirescaleNode` CRDs -- add/remove WireGuard peers as nodes
-   join/leave
-5. Program kernel routes: remote pod CIDRs -> `wg0`
-6. Create `nat64` interface for NAT64 translation
-7. Start CLAT engine for per-pod IPv4 address provision
+4. Establish gRPC connection to wirescale-control (mTLS)
+5. Subscribe to policy stream for local pods from control
+6. Program kernel routes:
+   - Intra-cluster: /64 routes for active local peers (on demand)
+   - Cross-cluster: aggregate routes for each known remote cluster,
+     pointing to local signaling gateway
+7. Create `nat64` interface for NAT64 translation
+8. Start CLAT engine for per-pod IPv4 address provision
 
-**Reconciliation loop** (continuous):
+The agent MUST NOT watch all `WirescaleNode` CRDs. It watches only its own
+`WirescaleNode` CRD for IPAM updates and configuration changes.
+
+**On-demand peer establishment:**
 ```
-for each WirescaleNode CRD (excluding self):
-    if peer not in wg0 config:
-        wg set wg0 peer <pubkey> allowed-ips <cidrs> endpoint <ipv6:port>
-        ip -6 route add <remote-pod-cidr-v6> dev wg0
-        ip route add <remote-pod-cidr-v4> dev wg0
-
-    if peer in wg0 but CRD deleted:
-        wg set wg0 peer <pubkey> remove
-        delete associated routes
-
-    if peer config changed (key rotation, endpoint change):
-        update peer config
+Packet destined for remote pod arrives at egress path:
+  1. eBPF checks encrypt_map -> encryption required for destination /64
+  2. If WireGuard peer exists for destination /64:
+       forward through wg0 (warm path, zero additional latency)
+  3. If no WireGuard peer for destination /64:
+       a. Queue packet in userspace buffer (bounded, default 64 packets)
+       b. Request peer info from wirescale-control via gRPC
+       c. Control authenticates, authorizes, returns peer parameters
+          (for cross-cluster: control proxies through directory + remote control)
+       d. Agent configures WireGuard peer:
+            wg set wg0 peer <pubkey> allowed-ips <cidrs> endpoint <ipv6:port>
+       e. Program kernel routes for remote pod CIDRs -> wg0
+       f. Drain queued packets through the new peer
+  4. Peer idle GC (continuous):
+       - Track last handshake time per peer
+       - If no traffic for peer_idle_timeout (default 300s): remove peer
+       - Next packet to that destination re-triggers step 3 (cache-miss path)
 ```
 
-The agent also periodically verifies actual WireGuard state matches desired
-state (drift correction).
+**Cross-cluster aggregate route handling:**
+When a packet matches an aggregate route for a remote cluster (no specific
+/64 peer route exists yet):
+1. The packet is intercepted by the agent (or forwarded to the signaling
+   gateway first, which hands it to the agent)
+2. The agent queries wirescale-control for the specific remote node
+3. A direct WireGuard tunnel is established to the remote node
+4. A specific /64 route is installed, overriding the aggregate route
+5. All subsequent traffic flows directly -- the gateway is bypassed
 
-### 4.3 wirescale-cni
+**Identity cache:**
+The agent maintains a local TTL-based cache of pod identities. On cache miss,
+it queries wirescale-control synchronously. Cache entries expire after a
+configurable TTL (default 60s) and are re-fetched on next access.
+
+**Drift correction:**
+The agent periodically verifies actual WireGuard state matches desired state
+and removes stale peers that should have been garbage-collected.
+
+### 4.4 wirescale-cni
 
 A stateless binary invoked by the container runtime per-pod. The binary is
 short-lived -- it sets up the pod's network namespace and exits. All ongoing
@@ -240,22 +480,81 @@ mesh management is handled by the agent.
 9. Return CNI result with both IPs
 ```
 
+### Component Summary
+
+| Component | Type | Runs On | State Size | Purpose |
+|-----------|------|---------|------------|---------|
+| `wirescale-directory` | Replicated service (3+ nodes, Raft) | Dedicated / management cluster | O(clusters) | Cluster registry, cross-cluster trust root, prefix allocation |
+| `wirescale-control` | Deployment (HA, 3+ replicas) | Per cluster, control plane nodes | O(nodes x pods) within cluster | AuthN/AuthZ, peer brokering, identity service, policy service, IPAM, cross-cluster proxy |
+| `wirescale-agent` | DaemonSet | Every node | O(active_peers) | On-demand WireGuard peering, NAT64/CLAT, route programming, policy enforcement, identity caching |
+| `wirescale-cni` | CNI binary | Every node (invoked by CRI) | Stateless | Pod network namespace setup |
+| CoreDNS `dns64` plugin | ConfigMap patch | CoreDNS pods | N/A | Synthesize AAAA records for IPv4-only destinations |
+
 ---
 
-## 5. Address Architecture
+## 5. Address Architecture and Hierarchical Prefix Aggregation
+
+### Hierarchical Prefix Model
+
+The addressing scheme is hierarchical: a federation-wide prefix is subdivided
+into per-cluster prefixes, which are further subdivided into per-host prefixes.
+This enables route aggregation at cluster boundaries.
+
+```
+Federation prefix:   3fff:ws::/20              (configurable, from RFC 9637 space)
+                     |
+  +------------------+------------------+
+  |                                     |
+Cluster 1:           3fff:ws:0001::/32  Cluster 2:           3fff:ws:0002::/32
+  |                                       |
+  +------+------+                         +------+------+
+  |      |      |                         |      |      |
+Host 1  Host 2  Host N                  Host 1  Host 2  Host N
+:0001:: :0002:: :000N::                 :0001:: :0002:: :000N::
+ /64     /64     /64                     /64     /64     /64
+```
+
+**Federation level:**
+- The global directory allocates a `/32` (or configurable prefix length) per
+  cluster from the federation's address space.
+- Example: federation uses `3fff:ws::/20`, Cluster 1 gets `3fff:ws:0001::/32`,
+  Cluster 2 gets `3fff:ws:0002::/32`.
+- This allows up to 4096 clusters per `/20` (12 bits of cluster space in a /32).
+
+**Cluster level:**
+- Each cluster's `/32` provides 32 bits of host space (2^32 possible /64
+  allocations) -- far more than any single cluster would need.
+- Each host is allocated a `/64` from its cluster's prefix.
+- Example: Cluster 1, Host 42 = `3fff:ws:0001:002a::/64`
+- Pods on Host 42 receive /128 addresses from that /64.
+
+**Routing implications:**
+- Intra-cluster: O(hosts_in_cluster) /64 routes -- one per host, programmed
+  on demand as peers are established.
+- Cross-cluster: O(clusters) aggregate routes -- one per remote cluster,
+  pointing to the local signaling gateway (or directly to known peers).
+- A node in a 10K-node cluster with 200 remote clusters has at most ~10,200
+  route entries (most programmed on demand), compared to hundreds of thousands
+  in a flat model.
 
 ### IPv6 Addressing (Primary)
 
 ```
-Cluster pod CIDR:     fd12:3456:7800::/48        (ULA, configurable)
-Per-node allocation:  fd12:3456:7800:N::/64      (N = node index)
-Pod address:          fd12:3456:7800:N::P/128    (P = pod index within node)
-Service CIDR:         fd12:3456:78ff::/108
+Federation prefix:    3fff:ws::/20              (ULA/documentation, configurable)
+Cluster allocation:   3fff:ws:CCCC::/32         (C = cluster index)
+Per-node allocation:  3fff:ws:CCCC:HHHH::/64    (H = host index within cluster)
+Pod address:          3fff:ws:CCCC:HHHH::P/128  (P = pod index within node)
+Service CIDR:         3fff:ws:CCCC:ffff::/108    (per-cluster)
 ```
 
 All pod-to-pod, pod-to-service, and pod-to-external communication uses IPv6
 natively. The WireGuard mesh endpoints are IPv6 addresses on the physical
 network.
+
+In routable-prefix mode (see [ROUTABLE-PREFIX.md](ROUTABLE-PREFIX.md)), pods
+receive globally routable /128 addresses from a site /48 allocation. Fabric
+BGP routes /64 prefixes to hosts without any WireGuard involvement in the
+forwarding path.
 
 ### IPv4 Addressing (Translated)
 
@@ -271,7 +570,7 @@ These IPv4 addresses exist only within the WireGuard mesh. They are never
 exposed on the physical network. The mapping is:
 
 ```
-Pod IPv4: 100.64.N.P  <-->  Pod IPv6: fd12:3456:7800:N::P
+Pod IPv4: 100.64.N.P  <-->  Pod IPv6: 3fff:ws:CCCC:N::P
 ```
 
 This deterministic mapping enables stateless translation between the two
@@ -289,45 +588,131 @@ embedded in the last 32 bits: `64:ff9b::1.2.3.4`.
 ### Address Summary
 
 ```
-+------------------+------------------------+---------------------------+
-| Purpose          | IPv6                   | IPv4                      |
-+------------------+------------------------+---------------------------+
-| Pod addressing   | fd00:ws:N::P/128       | 100.64.N.P/32             |
-| Service VIPs     | fd00:ws:svc::/108      | 100.64.255.0/24 (opt.)    |
-| WireGuard endpt  | <node phys IPv6>:51820 | (none - IPv6 underlay)    |
-| External v4 dst  | 64:ff9b::<ipv4>/128    | (translated at egress)    |
-| DNS resolver     | fd00:ws::64/128        | 100.100.100.100 (compat)  |
-+------------------+------------------------+---------------------------+
++------------------+-----------------------------+---------------------------+
+| Purpose          | IPv6                        | IPv4                      |
++------------------+-----------------------------+---------------------------+
+| Federation pfx   | 3fff:ws::/20                | (none)                    |
+| Cluster alloc    | 3fff:ws:CCCC::/32           | (none)                    |
+| Pod addressing   | 3fff:ws:CCCC:N::P/128       | 100.64.N.P/32             |
+| Service VIPs     | 3fff:ws:CCCC:ffff::/108     | 100.64.255.0/24 (opt.)    |
+| WireGuard endpt  | <node phys IPv6>:51820      | (none - IPv6 underlay)    |
+| External v4 dst  | 64:ff9b::<ipv4>/128         | (translated at egress)    |
+| DNS resolver     | 3fff:ws:CCCC::64/128        | 100.100.100.100 (compat)  |
++------------------+-----------------------------+---------------------------+
 ```
+
+### Aggregate Route Table (Per-Node Example)
+
+A node in Cluster 1 (3fff:ws:0001::/32) with 3 active intra-cluster peers
+and 2 known remote clusters:
+
+```
+# Intra-cluster: specific /64 routes (on-demand, only for active peers)
+3fff:ws:0001:0005::/64  dev wg0 peer=worker-5    # active peer
+3fff:ws:0001:002a::/64  dev wg0 peer=worker-42   # active peer
+3fff:ws:0001:006b::/64  dev wg0 peer=worker-107  # active peer
+
+# Cross-cluster: aggregate routes (one per remote cluster)
+3fff:ws:0002::/32       via gateway0              # Cluster 2 aggregate
+3fff:ws:0003::/32       via gateway0              # Cluster 3 aggregate
+
+# Local
+3fff:ws:0001:0001::/64  dev cni0                  # this node's pods
+
+# Default
+::/0                    via <physical-gw>         # underlay default
+```
+
+When a packet for `3fff:ws:0002:0017::5` arrives, it matches the Cluster 2
+aggregate route and is sent toward the gateway. The agent (or gateway)
+resolves the specific remote node, establishes a direct WireGuard tunnel,
+and installs a /64 route that overrides the aggregate for subsequent traffic.
 
 ---
 
-## 6. Data Plane: WireGuard Mesh
+## 6. Data Plane: On-Demand WireGuard Peering
 
-### Mesh Topology
+### On-Demand Peer Lifecycle
 
-**Full mesh (default for small clusters, <100 nodes):**
-Every node has a WireGuard peer entry for every other node. N nodes = N-1
-peers per node. Key distribution is O(N) via CRDs.
-
-**Location-aware mesh (large clusters or multi-zone):**
-Inspired by Kilo's topology model:
+Wirescale does NOT maintain a full mesh of WireGuard peers. Instead, peers
+are established on demand when traffic requires encryption, and
+garbage-collected when idle. This reduces per-node WireGuard state from
+O(total_nodes) to O(active_peers).
 
 ```
-Zone A (3 nodes)              Zone B (4 nodes)
-+-------+-------+-------+    +-------+-------+-------+-------+
-| nodeA1| nodeA2| nodeA3|    | nodeB1| nodeB2| nodeB3| nodeB4|
-| (ldr) |       |       |    | (ldr) |       |       |       |
-+---+---+-------+-------+    +---+---+-------+-------+-------+
-    |                             |
-    +---- WireGuard tunnel -------+
-    (only leaders peer with each other)
+         Node A                   wirescale-control              Node B
+           |                             |                          |
+           |  Packet for Node B's /64    |                          |
+           |  (no WireGuard peer exists) |                          |
+           |                             |                          |
+           |--- gRPC: PeerRequest ------>|                          |
+           |    (dst prefix, my pubkey)  |                          |
+           |                             |--- validate authz ------>|
+           |                             |    (is A allowed to      |
+           |                             |     peer with B?)        |
+           |                             |                          |
+           |<-- PeerResponse ------------|                          |
+           |    {pubkey, endpoint,       |                          |
+           |     allowedIPs, TTL}        |                          |
+           |                             |                          |
+           |  wg set wg0 peer ...        |                          |
+           |  (configure peer)           |                          |
+           |                             |                          |
+           |========= WireGuard Tunnel ============================|
+           |  (encrypted traffic flows)  |                          |
+           |                             |                          |
+           | ...idle timeout (300s)...   |                          |
+           |                             |                          |
+           |  wg set wg0 peer remove     |                          |
+           |  (GC idle peer)             |                          |
+           |                             |                          |
 ```
 
-- Intra-zone: direct routing via existing network fabric (no WireGuard)
-- Inter-zone: traffic flows through zone leader's WireGuard tunnel
-- Zone leaders are elected per `topology.kubernetes.io/zone` label
-- If a leader fails, another node in the zone is promoted
+**Peer states:**
+
+| State | Description | Transition |
+|-------|-------------|------------|
+| **absent** | No peer configured for this /64 | First packet triggers PeerRequest |
+| **establishing** | PeerRequest in flight, packets queued | PeerResponse received -> active |
+| **active** | Peer configured, traffic flowing | Idle timeout -> idle |
+| **idle** | No traffic for peer_idle_timeout | GC removes peer -> absent |
+
+**Cold path latency budget (intra-cluster):**
+
+| Operation | Expected Latency |
+|-----------|-----------------|
+| Identity cache miss (gRPC to control) | ~5-10ms |
+| Peer setup (gRPC + WireGuard handshake) | ~10-20ms |
+| Total first-packet latency (cold path) | ~15-30ms |
+| Subsequent packets (warm path) | 0ms additional overhead |
+
+**Cold path latency budget (cross-cluster):**
+
+| Operation | Expected Latency |
+|-----------|-----------------|
+| Agent -> local control | ~5ms |
+| Local control -> directory (cache miss) | ~10-20ms |
+| Local control -> remote control | ~10-30ms (depends on inter-cluster RTT) |
+| WireGuard handshake | ~5-10ms |
+| Total first-packet latency (cold, cross-cluster) | ~30-65ms |
+| Subsequent packets (warm path) | 0ms additional overhead |
+
+The cold path latency of ~15-65ms is acceptable for TCP SYN (which already
+tolerates RTT-scale delays). After peer establishment, the warm path is
+identical in performance to a pre-configured full mesh.
+
+### State Comparison: Full Mesh vs. On-Demand
+
+| Per-Node State | Full Mesh (Old) | On-Demand (Hyperscale) |
+|----------------|----------------|------------------------|
+| WireGuard peers | N-1 (all nodes) | Active peers only (~10-50 typical) |
+| Identity cache | All pods in cluster | Recently-seen pods (TTL-based) |
+| Policy rules | All rules compiled for all nodes | Only rules for local pods |
+| Route table | N-1 routes (one per node) | Active peer routes + aggregate routes |
+| CRD watches | All WirescaleNode CRDs | Own WirescaleNode CRD only |
+
+At 10,000 nodes, a node communicating with 50 peers holds 50 WireGuard
+peer entries instead of 9,999.
 
 ### Key Distribution
 
@@ -336,41 +721,71 @@ Node boot:
   1. Generate Curve25519 (X25519) keypair (WireGuard)
   2. Private key: memory-only (never written to disk/CRD)
   3. Public key: written to WirescaleNode CRD
+  4. Public key: registered with wirescale-control
 
 Key rotation:
   1. Agent generates new keypair
-  2. Updates WirescaleNode CRD with new public key
-  3. All peer agents detect CRD change via watch
-  4. Peers update their wg0 config with new key
+  2. Updates WirescaleNode CRD and notifies control
+  3. Control invalidates cached peer info for this node
+  4. Active peers of the rotating node receive key-update
+     notification via control's push channel
   5. Brief handshake interruption (~1-2 RTT), then traffic resumes
+  6. New peers automatically receive the current key from control
 ```
 
-No pre-shared keys by default (simplicity). PSK support available as an
+No pre-shared keys by default (simplicity). PSK support is available as an
 option for post-quantum defense-in-depth.
 
 ### WireGuard Configuration per Node
+
+At any given moment, a node's WireGuard configuration contains only its
+active peers -- not all nodes in the cluster:
 
 ```
 [Interface]
 ListenPort = 51820
 PrivateKey = <generated-at-boot>
 
-# Peer: node-worker-2
+# Active Peer: worker-42 (established 2m ago, last handshake 15s ago)
 [Peer]
-PublicKey = <from WirescaleNode CRD>
-Endpoint = [3fff::2]:51820
-AllowedIPs = fd12:3456:7800:2::/64, 100.64.2.0/24
+PublicKey = <from wirescale-control PeerResponse>
+Endpoint = [3fff::2a]:51820
+AllowedIPs = 3fff:ws:0001:002a::/64, 100.64.42.0/24
 
-# Peer: node-worker-3
+# Active Peer: worker-107 (established 30s ago, last handshake 5s ago)
 [Peer]
-PublicKey = <from WirescaleNode CRD>
-Endpoint = [3fff::3]:51820
-AllowedIPs = fd12:3456:7800:3::/64, 100.64.3.0/24
+PublicKey = <from wirescale-control PeerResponse>
+Endpoint = [3fff::6b]:51820
+AllowedIPs = 3fff:ws:0001:006b::/64, 100.64.107.0/24
+
+# Cross-cluster Peer: cluster-2-node-23 (established 5m ago)
+[Peer]
+PublicKey = <from remote cluster's control via proxy>
+Endpoint = [3fff:ext::17]:51820
+AllowedIPs = 3fff:ws:0002:0017::/64
+
+# (only 3 active peers out of 10,000+ nodes across clusters)
 ```
 
 The `AllowedIPs` for each peer covers both the IPv6 and IPv4 pod CIDRs of
-that node. This means WireGuard's cryptokey routing handles both address
-families through the same tunnel.
+that node. WireGuard's cryptokey routing handles both address families
+through the same tunnel.
+
+### Routing Modes
+
+**ULA overlay mode (default):**
+- All inter-node pod traffic goes through WireGuard (encryption + routing)
+- On-demand peering: first packet to a new /64 triggers peer setup via control
+- Routes for active peers are programmed dynamically as peers are established
+- Cross-cluster aggregate routes point to local signaling gateway
+
+**Routable-prefix mode (see [ROUTABLE-PREFIX.md](ROUTABLE-PREFIX.md)):**
+- Fabric BGP routes /64 prefixes to hosts -- packets reach the right host
+  without WireGuard involvement in the forwarding path
+- WireGuard is used for encryption only, not routing
+- On-demand peering still applies: WireGuard peers are established only when
+  encryption policy requires it for a given destination
+- Unencrypted intra-zone traffic MAY bypass WireGuard entirely (by policy)
 
 ### MTU Handling
 
@@ -387,12 +802,197 @@ prevent fragmentation.
 
 ---
 
-## 7. IPv4 in an IPv6-Only World
+## 7. Cross-Cluster Connectivity
+
+### Signaling Gateway Model
+
+Each cluster designates gateway nodes (typically 2-3 for HA). Gateways handle
+**signaling only** -- initial cross-cluster peer resolution. They are NOT in
+the data path for established flows.
+
+```
+Cluster 1 (3fff:ws:0001::/32)        Cluster 2 (3fff:ws:0002::/32)
+
++---------+                           +---------+
+| Node A  |                           | Node B  |
+| (agent) |                           | (agent) |
++----+----+                           +----+----+
+     |                                     |
+     | 1. Packet for 3fff:ws:0002::/32     |
+     |    hits aggregate route             |
+     |    -> signaling gateway             |
+     |                                     |
++----+----+                           +----+----+
+| Gateway |                           | Gateway |
+| (signal |                           | (signal |
+|  only)  |                           |  only)  |
++----+----+                           +----+----+
+     |                                     |
+     | 2. Agent resolves via               |
+     |    control -> directory -> remote   |
+     |    control -> specific node B info  |
+     |                                     |
+     +=====================================+
+     | 3. Direct WireGuard tunnel          |
+     |    Node A <-> Node B                |
+     |    (gateway bypassed for data)      |
+     +=====================================+
+```
+
+**Why signaling-only gateways?**
+- Gateways are NOT a throughput bottleneck -- data flows directly between nodes
+- Gateways CAN be data relays for nodes without direct reachability (NAT
+  traversal), but this is the exception, not the rule
+- Gateway failure does not disrupt established cross-cluster tunnels
+- No single point of failure for cross-cluster data traffic
+
+### Cross-Cluster Peer Establishment Flow
+
+```
+Node A (cluster 1) wants to reach Pod on Node B (cluster 2):
+
+  1. Packet matches aggregate route 3fff:ws:0002::/32 -> gateway
+  2. Agent intercepts (or gateway forwards to agent): cache miss
+  3. Agent -> local wirescale-control: "resolve 3fff:ws:0002:002a::/64"
+  4. Local control checks cache for cluster 2 info
+     a. Cache miss: local control -> global directory: "where is cluster 2?"
+     b. Global directory -> local control:
+        {cluster_2_controller_endpoint, cluster_2_CA}
+     c. Local control caches this (TTL 300s)
+  5. Local control -> cluster 2 controller:
+     "resolve host 002a, here's my cluster 1 cert"
+  6. Cluster 2 controller authenticates cluster 1, checks policy, returns:
+     {node_B_endpoint, node_B_pubkey, allowed_IPs}
+  7. Local control -> agent: peer info for node B
+  8. Agent establishes direct WireGuard tunnel to node B
+  9. Agent installs /64 route for node B pointing to wg peer
+     (overrides aggregate route)
+  10. All traffic flows directly, gateway bypassed
+```
+
+**Subsequent packets to the same node:** Warm path, zero additional overhead
+(the specific /64 route already exists).
+
+**Subsequent packets to a different node in the same remote cluster:** Steps
+3-10 repeat for the new node, but step 4 is a cache hit (cluster info is
+already cached). Total latency is reduced by ~10-20ms.
+
+### Cross-Cluster Trust Model
+
+- The global directory is the root of trust for cross-cluster authentication
+- Each cluster controller holds a cluster-scoped CA certificate
+- During cross-cluster peer resolution, controllers authenticate via mTLS
+  using their cluster CA certificates (validated against the directory's
+  trusted CA list)
+- No per-pod or per-node state is exchanged between clusters at rest --
+  only at the time of connection establishment
+- Cross-cluster peer authorization tokens are scoped to the specific
+  cluster pair and node pair, with bounded TTL
+
+### Cross-Cluster Addressing
+
+- Hierarchical prefix aggregation (see [Section 5](#5-address-architecture-and-hierarchical-prefix-aggregation))
+  makes cross-cluster routing efficient: one aggregate route per remote cluster.
+- In routable-prefix mode (see [ROUTABLE-PREFIX.md](ROUTABLE-PREFIX.md)),
+  each cluster's prefix is routable via BGP, so packets reach the correct
+  cluster without Wirescale involvement in the forwarding path.
+- WireGuard provides encryption for cross-cluster traffic using the same
+  on-demand peering model as intra-cluster traffic.
+
+### Any-Node Peering
+
+Unlike gateway-only models, any node in Cluster A MAY establish a direct
+WireGuard peer with any node in Cluster B. There is no requirement to
+funnel cross-cluster traffic through designated gateway nodes once the
+initial peer resolution is complete. This eliminates single-point-of-failure
+and bandwidth bottleneck concerns inherent in gateway-based designs.
+
+### External Peers (Non-Kubernetes Nodes)
+
+Wirescale supports connecting external machines (bare metal servers, VMs,
+developer laptops) to the mesh via the `WirescaleExternalPeer` CRD:
+
+```yaml
+apiVersion: wirescale.io/v1alpha1
+kind: WirescaleExternalPeer
+metadata:
+  name: office-server
+spec:
+  publicKey: "YWJjZGVm..."
+  endpoint: "[3fff:office::1]:51820"
+  allowedIPs:
+    - "3fff:ws:ext:1::/64"     # External peer's subnet
+    - "100.64.200.0/24"        # External peer's IPv4 range
+  # Optional: advertise routes FROM the external peer into the mesh
+  advertisedRoutes:
+    - "192.168.1.0/24"         # Office LAN (subnet router mode)
+```
+
+External peers authenticate to wirescale-control using a pre-shared
+registration token. After initial registration and admin approval, the
+external peer uses the same on-demand peering model as in-cluster nodes:
+it queries control for peer info when it needs to reach a cluster pod,
+and cluster nodes query control when they need to reach the external peer.
+
+### Subnet Router Mode
+
+Any node (or external peer) can advertise additional routes into the mesh,
+like Tailscale's subnet router:
+
+```yaml
+apiVersion: wirescale.io/v1alpha1
+kind: WirescaleNode
+metadata:
+  name: node-with-legacy-lan
+spec:
+  # ... normal fields ...
+  advertisedRoutes:
+    - "10.0.0.0/8"     # Legacy corporate network
+    - "172.16.0.0/12"  # Another internal range
+```
+
+Nodes that need to reach advertised subnets establish on-demand WireGuard
+peers with the advertising node through wirescale-control.
+
+### Exit Node Mode
+
+A node can be designated as an exit node for internet-bound traffic:
+
+```yaml
+apiVersion: wirescale.io/v1alpha1
+kind: WirescaleNode
+metadata:
+  name: egress-node
+spec:
+  exitNode: true   # Advertise 0.0.0.0/0 and ::/0
+```
+
+Pods can be configured (via annotation or policy) to route all non-mesh
+traffic through the exit node. This is useful for:
+- Centralizing egress through a node with both IPv4 and IPv6 connectivity
+- Egress filtering/auditing at a single point
+- Providing IPv4 internet access when most nodes are IPv6-only
+
+### NAT Traversal
+
+When direct node-to-node reachability is not available (nodes behind NAT),
+the signaling gateway MAY act as a data relay:
+
+- The gateway maintains a WireGuard peer with both nodes
+- Traffic is relayed through the gateway's WireGuard interface
+- This adds one extra hop but preserves end-to-end encryption
+- The agent SHOULD periodically attempt to re-establish a direct tunnel
+  (NAT hole-punching via coordinated endpoint exchange through control)
+- A DERP-like relay protocol MAY be implemented for better NAT traversal
+
+---
+
+## 8. IPv4 in an IPv6-Only World
 
 This is the core innovation: making IPv4 "just work" for pods on an
 IPv6-only underlay. Three mechanisms work together:
 
-### 7.1 CLAT (Customer-side Translator) -- Pod-Local IPv4
+### 8.1 CLAT (Customer-side Translator) -- Pod-Local IPv4
 
 Each pod gets a `clat0` TUN interface that provides a real IPv4 address.
 Applications can bind to IPv4, connect to IPv4 addresses, and use IPv4
@@ -400,8 +1000,8 @@ socket APIs.
 
 ```
 Pod network namespace:
-  eth0:   fd12:3456:7800:1::5/128    (primary, IPv6)
-  clat0:  100.64.1.5/32       (CLAT, IPv4)
+  eth0:   3fff:ws:0001:0001::5/128    (primary, IPv6)
+  clat0:  100.64.1.5/32              (CLAT, IPv4)
 
   IPv4 default route -> clat0
   IPv6 default route -> eth0
@@ -416,7 +1016,7 @@ App sends IPv4 packet to 93.184.216.34 (example.com)
    clat0 TUN interface (in pod netns)
          |
    Stateless SIIT translation (RFC 7915):
-     src: 100.64.1.5        -> fd12:3456:7800:1::5
+     src: 100.64.1.5        -> 3fff:ws:0001:0001::5
      dst: 93.184.216.34     -> 64:ff9b::93.184.216.34
          |
          v
@@ -431,7 +1031,7 @@ The CLAT translation is stateless and deterministic. The reverse mapping
 works because of the 1:1 correspondence between IPv4 pod addresses and
 IPv6 pod addresses.
 
-### 7.2 NAT64 -- Reaching External IPv4 Destinations
+### 8.2 NAT64 -- Reaching External IPv4 Destinations
 
 For traffic destined to IPv4-only hosts on the internet, a per-node NAT64
 engine translates at the cluster edge.
@@ -457,7 +1057,7 @@ wirescale-agent on each node:
 perform stateless address translation. Connection tracking is handled by
 Linux conntrack for the MASQUERADE step.
 
-### 7.3 DNS64 -- Making It Transparent
+### 8.3 DNS64 -- Making It Transparent
 
 CoreDNS is configured with the `dns64` plugin:
 
@@ -491,15 +1091,15 @@ When a pod queries `example.com` and only an A record exists:
 When an AAAA record exists, it is returned directly unless `translate_all` is
 explicitly enabled.
 
-### 7.4 Complete IPv4 Flow (Pod to External IPv4 Host)
+### 8.4 Complete IPv4 Flow (Pod to External IPv4 Host)
 
 ```
-Pod (100.64.1.5 / fd00:ws:1::5)
+Pod (100.64.1.5 / 3fff:ws:0001:0001::5)
   |
   | App: connect("93.184.216.34", 80)
   v
 clat0 (CLAT: IPv4 -> IPv6)
-  | src: fd00:ws:1::5
+  | src: 3fff:ws:0001:0001::5
   | dst: 64:ff9b::5db8:d822
   v
 eth0 -> veth -> host routing
@@ -515,20 +1115,21 @@ Physical NIC -> Internet -> 93.184.216.34
 Return path reverses each step.
 ```
 
-### 7.5 IPv4 Within the Mesh
+### 8.5 IPv4 Within the Mesh
 
 Pod-to-pod IPv4 traffic stays within the WireGuard mesh and never hits
 NAT64. The routing is:
 
 ```
-Pod A (100.64.1.5) -> connect to Pod B (100.64.2.7)
+Pod A on node-1: app connects to 100.64.2.7 (Pod B's IPv4)
   |
   | clat0: translate to IPv6
-  | src: fd00:ws:1::5, dst: fd00:ws:2::7
+  | src: 3fff:ws:0001:0001::5, dst: 3fff:ws:0001:0002::7
   v
   eth0 -> host routing
   |
-  | route: fd00:ws:2::/64 -> wg0
+  | route: 3fff:ws:0001:0002::/64 -> wg0
+  | (if no WireGuard peer for node-2: on-demand peer setup via control)
   v
   wg0: encrypt and send to node-2
   |
@@ -542,26 +1143,37 @@ Pod A (100.64.1.5) -> connect to Pod B (100.64.2.7)
 
 ---
 
-## 8. DNS Architecture
+## 9. DNS Architecture
 
 ### In-Mesh DNS (MagicDNS-inspired)
 
 Every pod in the mesh is resolvable by name, like Tailscale's MagicDNS:
 
 ```
-<pod-name>.<namespace>.ws.cluster.internal          -> fd12:3456:7800:N::P (AAAA)
-<pod-name>.<namespace>.ws.cluster.internal          -> 100.64.N.P          (A)
+<pod-name>.<namespace>.ws.cluster.internal          -> 3fff:ws:CCCC:N::P (AAAA)
+<pod-name>.<namespace>.ws.cluster.internal          -> 100.64.N.P        (A)
 <service-name>.<namespace>.svc.ws.cluster.internal  -> service VIP
 ```
 
 The wirescale-agent runs a lightweight DNS sidecar that:
-1. Watches Pod objects for IP assignments
+1. Receives pod IP-to-name mappings from wirescale-control (pushed for local
+   pods, queried on demand for remote pods)
 2. Maintains an in-memory name-to-IP map
 3. Serves DNS queries for `*.ws.cluster.internal` domain
 4. Forwards all other queries to CoreDNS (which handles `dns64`)
 
-This is push-based, like Tailscale, which reduces stale records. DNS clients
-still honor TTL semantics for cached responses.
+### Cross-Cluster DNS
+
+For cross-cluster name resolution, the DNS sidecar queries wirescale-control,
+which proxies the request to the remote cluster's controller (the same path
+used for cross-cluster peer resolution). This enables:
+
+```
+<pod-name>.<namespace>.ws.<cluster-name>.internal   -> 3fff:ws:CCCC:N::P (AAAA)
+```
+
+Cross-cluster DNS queries are resolved on demand and cached with TTLs. The
+agent does NOT pre-fetch DNS records for remote clusters.
 
 ### DNS Query Flow
 
@@ -576,7 +1188,8 @@ CoreDNS (cluster DNS)
 wirescale-agent DNS
   |
   | lookup in-memory map
-  | returns AAAA: fd00:ws:3::12 and A: 100.64.3.12
+  | if miss: query wirescale-control for name resolution
+  | returns AAAA: 3fff:ws:0001:0003::12 and A: 100.64.3.12
   v
 Pod receives answer, connects directly via mesh
 ```
@@ -596,128 +1209,55 @@ Pod receives AAAA (native or synthesized)
 
 ---
 
-## 9. Cross-Cluster and External Connectivity
-
-### External Peers (Non-Kubernetes Nodes)
-
-Wirescale supports connecting external machines (bare metal servers, VMs,
-developer laptops) to the mesh via the `WirescaleExternalPeer` CRD:
-
-```yaml
-apiVersion: wirescale.io/v1alpha1
-kind: WirescaleExternalPeer
-metadata:
-  name: office-server
-spec:
-  publicKey: "YWJjZGVm..."
-  endpoint: "[3fff:office::1]:51820"
-  allowedIPs:
-    - "fd00:ws:ext:1::/64"     # External peer's subnet
-    - "100.64.200.0/24"        # External peer's IPv4 range
-  # Optional: advertise routes FROM the external peer into the mesh
-  advertisedRoutes:
-    - "192.168.1.0/24"         # Office LAN (subnet router mode)
-```
-
-The controller distributes external peer configs to all relevant nodes.
-External peers run a lightweight `wirescale-join` agent that handles
-key exchange and route setup without requiring Kubernetes.
-
-### Subnet Router Mode
-
-Any node (or external peer) can advertise additional routes into the mesh,
-like Tailscale's subnet router:
-
-```yaml
-apiVersion: wirescale.io/v1alpha1
-kind: WirescaleNode
-metadata:
-  name: node-with-legacy-lan
-spec:
-  # ... normal fields ...
-  advertisedRoutes:
-    - "10.0.0.0/8"     # Legacy corporate network
-    - "172.16.0.0/12"  # Another internal range
-```
-
-All mesh nodes learn these routes and can reach the advertised subnets
-through the advertising node's WireGuard tunnel.
-
-### Exit Node Mode
-
-A node can be designated as an exit node for internet-bound traffic:
-
-```yaml
-apiVersion: wirescale.io/v1alpha1
-kind: WirescaleNode
-metadata:
-  name: egress-node
-spec:
-  exitNode: true   # Advertise 0.0.0.0/0 and ::/0
-```
-
-Pods can be configured (via annotation or policy) to route all non-mesh
-traffic through the exit node. This is useful for:
-- Centralizing egress through a node with both IPv4 and IPv6 connectivity
-- Egress filtering/auditing at a single point
-- Providing IPv4 internet access when most nodes are IPv6-only
-
-### Multi-Cluster Mesh
-
-Two Wirescale clusters can be linked by exchanging `WirescaleExternalPeer`
-CRDs pointing at each other's gateway nodes:
-
-```
-Cluster A                          Cluster B
-fd00:ws:a::/48                     fd00:ws:b::/48
-  |                                  |
-  +-- gateway-a (WirescaleNode)      +-- gateway-b (WirescaleNode)
-  |     exitNode: false              |     exitNode: false
-  |     advertisedRoutes:            |     advertisedRoutes:
-  |       - fd00:ws:a::/48           |       - fd00:ws:b::/48
-  |       - 100.64.0.0/16           |       - 100.64.128.0/16
-  |                                  |
-  +------ WireGuard tunnel ----------+
-```
-
-Pod in Cluster A can reach pods in Cluster B by their IPv6 or IPv4 mesh
-addresses. DNS integration makes cross-cluster resolution seamless:
-`api.backend.cluster-b.ws.cluster.internal`.
-
----
-
 ## 10. Security Model
 
 ### Encryption
 
 - **Inter-node pod traffic:** WireGuard (ChaCha20-Poly1305, Curve25519, BLAKE2s)
 - **Intra-node pod traffic:** Unencrypted (kernel namespace isolation is sufficient)
-- **Control plane (CRD operations):** Kubernetes API TLS + RBAC
-- **Key material:** Private keys never leave node memory. Public keys in CRDs.
+- **Agent-to-control:** gRPC over mTLS (kubelet certs or projected SA tokens)
+- **Control-to-control (cross-cluster):** Mutual TLS with CA certificates
+  validated by the global directory
+- **Control-to-directory:** gRPC over mTLS (cluster CA certificates)
+- **Key material:** Private keys MUST never leave node memory. Public keys are
+  registered with control and written to the node's own CRD.
 
 ### Identity and Authentication
 
-Nodes authenticate to the mesh by proving ownership of their WireGuard
-private key. The CRD serves as the key registry (analogous to Tailscale's
-coordination server). Only nodes with valid kubeconfig can register CRDs.
+**Intra-cluster:** Nodes authenticate to the mesh via wirescale-control:
+1. Agent presents kubelet client certificate or projected ServiceAccount token
+2. Control validates identity against the Kubernetes API
+3. Control issues short-lived peer authorization tokens
+4. Peer authorization tokens bind a specific node pair and expire after TTL
 
-For external peers, authentication is bootstrapped via:
+**Cross-cluster:** Cluster controllers authenticate to each other via:
+1. Controller presents its cluster CA certificate to the remote controller
+2. Remote controller validates the CA against the global directory's trusted
+   CA list
+3. Cross-cluster peer authorization tokens bind a specific cluster pair and
+   node pair, with bounded TTL
+
+**External peers:** Authentication is bootstrapped via:
 1. Pre-shared auth token (one-time registration)
 2. Admin approves the `WirescaleExternalPeer` CRD
-3. Key exchange completes through the CRD
+3. External peer connects to wirescale-control with the approved credentials
+4. Subsequent peer discovery uses the same control-mediated flow
 
 ### Network Policy
 
 Wirescale enforces policies at two levels:
 
 **Level 1: WireGuard AllowedIPs (L3)**
-Each node's WireGuard config only permits traffic from/to known pod CIDRs.
-Traffic from unknown sources is silently dropped by WireGuard.
+Each peer's WireGuard config only permits traffic from/to the peer's
+allocated pod CIDRs. Traffic from unknown sources is silently dropped by
+WireGuard.
 
 **Level 2: eBPF/nftables per-pod policy (L3/L4)**
-The agent programs per-pod firewall rules based on:
-- Kubernetes `NetworkPolicy` objects (standard API)
-- `WirescalePolicy` CRDs (extended, identity-aware policies)
+The agent programs per-pod firewall rules based on policies pushed from
+wirescale-control. Policy rules are scoped to local pods only -- each
+node receives the minimal set of rules needed for enforcement. See
+[SECURITY.md](SECURITY.md) for the full policy language and enforcement
+architecture.
 
 ```yaml
 apiVersion: wirescale.io/v1alpha1
@@ -741,17 +1281,27 @@ spec:
   # Also allow traffic from external peer "office-server"
   fromExternal:
     - peerName: office-server
+  # Cross-cluster policy: allow from pods in remote cluster
+  fromClusters:
+    - clusterName: "cluster-2"
+      podSelector:
+        matchLabels:
+          app: frontend
 ```
 
 ### Threat Model
 
 | Threat | Mitigation |
 |--------|------------|
-| Eavesdropping on inter-node traffic | WireGuard encryption (always on) |
-| Unauthorized node joining mesh | Must create CRD via authenticated kube API |
-| Compromised node | Revoke by deleting WirescaleNode CRD; all peers drop the peer immediately |
-| Control plane compromise | Attacker can disrupt topology but cannot decrypt data plane traffic (no private keys in CRDs) |
-| Key compromise on a single node | Rotate: agent generates new key, updates CRD. Old key immediately invalid for all peers. |
+| Eavesdropping on inter-node traffic | WireGuard encryption (always on for inter-node traffic) |
+| Unauthorized node joining mesh | Must authenticate to wirescale-control via mTLS; control validates against Kubernetes API |
+| Compromised node | Revoke by deleting WirescaleNode CRD; control rejects all peer requests for the revoked node; active peers on other nodes are torn down |
+| Control plane compromise | Attacker can disrupt peer discovery but cannot decrypt data plane traffic (no private keys in control). Existing peers persist. |
+| Key compromise on a single node | Rotate: agent generates new key, updates CRD and control. Control pushes key-update to active peers. Old key immediately invalid. |
+| Cross-cluster impersonation | Controllers use mutual TLS with CA certificates validated by the global directory; peer authorization tokens are cluster-scoped and node-scoped |
+| DoS on wirescale-control | Existing peers and cached identities persist. New peer establishment degrades gracefully. Control is HA (3+ replicas). |
+| DoS on wirescale-directory | Existing cross-cluster peers persist. Cached cluster info on controllers persists (TTL-based). Only new cross-cluster peer establishment to previously-unknown clusters is affected. |
+| Global directory compromise | Attacker can inject false cluster registrations. Mitigation: directory entries require mutual authentication; controllers SHOULD pin known cluster CA certificates. |
 
 ---
 
@@ -767,33 +1317,75 @@ kind: WirescaleMesh
 metadata:
   name: default
 spec:
-  # IPv6 pod CIDR (ULA range for the mesh)
-  podCIDRv6: "fd00:ws::/48"
+  # Cluster identity
+  clusterID: "cluster-1"
+  # Cluster's allocated prefix (from global directory or manual config)
+  clusterPrefix: "3fff:ws:0001::/32"
   # IPv4 pod CIDR (CGNAT range, translated via CLAT)
   podCIDRv4: "100.64.0.0/10"
   # Service CIDRs
-  serviceCIDRv6: "fd00:ws:svc::/108"
+  serviceCIDRv6: "3fff:ws:0001:ffff::/108"
   serviceCIDRv4: "100.64.255.0/24"  # optional
   # NAT64 prefix
   nat64Prefix: "64:ff9b::/96"
-  # Mesh topology mode
-  topology: full          # "full" | "location-aware"
   # WireGuard listen port
   listenPort: 51820
   # DNS domain for mesh names
-  dnsDomain: "ws.local"
+  dnsDomain: "ws.cluster.internal"
   # MTU override (0 = auto-detect)
   mtu: 0
+  # Control plane configuration
+  controlPlane:
+    # Address of wirescale-control gRPC service
+    endpoint: "wirescale-control.wirescale-system.svc:9443"
+    # TLS mode for agent-to-control connections
+    tlsMode: mtls          # "mtls" | "token"
+    # Control plane replicas (informational)
+    replicas: 3
+  # Global directory configuration
+  directory:
+    # Address of wirescale-directory gRPC service
+    endpoint: "directory.wirescale-global.example.com:9445"
+    # CA certificate for directory TLS
+    caCertRef:
+      name: directory-ca
+      key: ca.crt
+  # Signaling gateway nodes
+  gateways:
+    # Nodes designated as signaling gateways (label selector)
+    nodeSelector:
+      matchLabels:
+        wirescale.io/gateway: "true"
+    # Number of desired gateway nodes
+    replicas: 3
+  # Peer lifecycle policy
+  peerPolicy:
+    # Seconds of idle time before a WireGuard peer is garbage-collected
+    idleTimeout: 300
+    # Maximum queued packets during peer establishment
+    establishQueueSize: 64
+    # Peer authorization token TTL (seconds)
+    peerTokenTTL: 300
+  # Identity cache settings
+  identityCache:
+    # TTL for cached identity entries on each agent (seconds)
+    ttl: 60
+    # Maximum number of cached identity entries per agent
+    maxEntries: 10000
 status:
   nodeCount: 12
   healthyNodes: 12
+  controlPlaneReady: true
+  directoryConnected: true
   allocatedv6Blocks: 12
   allocatedv4Blocks: 12
+  registeredClusters: 5      # known remote clusters
+  gatewayNodes: 3
 ```
 
 ### WirescaleNode (cluster-scoped, one per node)
 
-Per-node mesh state. Created by the agent, enriched by the controller.
+Per-node mesh state. Created by the agent, enriched by wirescale-control.
 
 ```yaml
 apiVersion: wirescale.io/v1alpha1
@@ -808,19 +1400,23 @@ spec:
   # Set by agent at boot
   publicKey: "YWJjZGVm..."
   endpoint: "[3fff::3]:51820"
-  # Set by controller (IPAM)
-  podCIDRv6: "fd00:ws:3::/64"
+  # Set by control (IPAM)
+  podCIDRv6: "3fff:ws:0001:0003::/64"
   podCIDRv4: "100.64.3.0/24"
   # Optional: subnet router / exit node
   advertisedRoutes: []
   exitNode: false
+  # Optional: designate as signaling gateway
+  gateway: false
 status:
   # Updated by agent
   ready: true
-  peerCount: 11
+  controlPlaneConnected: true
+  activePeers: 23
+  crossClusterPeers: 2       # active peers to remote clusters
   lastHandshake: "2026-03-02T10:00:00Z"
   wireguardInterface: "wg0"
-  natType: "full-cone"     # Detected NAT type
+  natType: "full-cone"        # Detected NAT type
   bytesTransferred:
     tx: 1073741824
     rx: 2147483648
@@ -839,7 +1435,7 @@ spec:
   publicKey: "eHl6MTIz..."
   endpoint: "[3fff:home::1]:51820"
   allowedIPs:
-    - "fd00:ws:ext:1::1/128"
+    - "3fff:ws:ext:1::1/128"
     - "100.64.200.1/32"
   advertisedRoutes: []
   # Pre-auth key for initial registration (one-time)
@@ -872,6 +1468,11 @@ spec:
               app: frontend
         - externalPeer:
             name: office-server
+        - clusterPeer:
+            clusterName: "cluster-2"
+            podSelector:
+              matchLabels:
+                app: frontend
       ports:
         - protocol: TCP
           port: 443
@@ -886,6 +1487,37 @@ spec:
           port: 443
 ```
 
+### WirescaleCluster (directory-scoped)
+
+Stored in the global directory, represents a registered cluster.
+
+```yaml
+apiVersion: wirescale.io/v1alpha1
+kind: WirescaleCluster
+metadata:
+  name: cluster-1
+spec:
+  clusterID: "cluster-1"
+  prefix: "3fff:ws:0001::/32"
+  controllerEndpoint: "control.cluster-1.example.com:9443"
+  gateways:
+    - endpoint: "[3fff:gw:0001::1]:51820"
+    - endpoint: "[3fff:gw:0001::2]:51820"
+    - endpoint: "[3fff:gw:0001::3]:51820"
+  caCert: |
+    -----BEGIN CERTIFICATE-----
+    ...
+    -----END CERTIFICATE-----
+  metadata:
+    region: "us-west-2"
+    provider: "aws"
+status:
+  registered: "2026-01-15T00:00:00Z"
+  lastHeartbeat: "2026-03-02T10:00:00Z"
+  healthy: true
+  nodeCount: 5000
+```
+
 ---
 
 ## 12. Packet Flow Walkthrough
@@ -893,44 +1525,76 @@ spec:
 ### Case 1: Pod-to-Pod, Same Node
 
 ```
-Pod A (fd00:ws:1::5) -> Pod B (fd00:ws:1::7)
+Pod A (3fff:ws:0001:0001::5) -> Pod B (3fff:ws:0001:0001::7)
   eth0 -> veth -> host bridge/routing -> veth -> eth0
   (no WireGuard, no translation, direct kernel path)
 ```
 
-### Case 2: Pod-to-Pod, Different Nodes (IPv6)
+### Case 2: Pod-to-Pod, Different Nodes, Same Cluster (IPv6, Warm Path)
+
+When the WireGuard peer is already established (the common case after first
+contact):
 
 ```
-Pod A on node-1 (fd00:ws:1::5) -> Pod B on node-2 (fd00:ws:2::7)
+Pod A on node-1 (3fff:ws:0001:0001::5) -> Pod B on node-2 (3fff:ws:0001:0002::7)
 
 Pod A: eth0 -> veth -> host
-Host node-1: route fd00:ws:2::/64 dev wg0
+Host node-1: route 3fff:ws:0001:0002::/64 dev wg0
   -> wg0: encrypt with node-2's public key
   -> UDP to [3fff::2]:51820
 
 Network: IPv6 UDP packet transit
 
 Host node-2: UDP :51820 -> wg0 decrypt
-  -> verify src fd00:ws:1::5 in AllowedIPs for node-1 peer
-  -> route fd00:ws:2::7 -> veth -> Pod B eth0
+  -> verify src 3fff:ws:0001:0001::5 in AllowedIPs for node-1 peer
+  -> route 3fff:ws:0001:0002::7 -> veth -> Pod B eth0
 ```
 
-### Case 3: Pod-to-Pod, Different Nodes (IPv4 via CLAT)
+### Case 3: Pod-to-Pod, Different Nodes, Same Cluster (IPv6, Cold Path)
+
+When no WireGuard peer exists for the destination node (first contact or
+after idle GC):
+
+```
+Pod A on node-1 (3fff:ws:0001:0001::5) -> Pod B on node-2 (3fff:ws:0001:0002::7)
+
+Pod A: eth0 -> veth -> host
+Host node-1: route 3fff:ws:0001:0002::/64 -> no WireGuard peer!
+  1. eBPF queues packet (up to 64 packets buffered)
+  2. Agent sends PeerRequest to wirescale-control:
+       "I need peer info for the node owning 3fff:ws:0001:0002::/64"
+  3. Control authenticates node-1, checks authorization
+  4. Control returns: {pubkey, endpoint=[3fff::2]:51820, allowedIPs, TTL=300s}
+  5. Agent configures WireGuard peer:
+       wg set wg0 peer <pubkey> \
+         allowed-ips 3fff:ws:0001:0002::/64,100.64.2.0/24 \
+         endpoint [3fff::2]:51820
+  6. Agent programs route: 3fff:ws:0001:0002::/64 dev wg0
+  7. Queued packets drain through new peer
+  8. Total cold-path delay: ~15-30ms (acceptable for TCP SYN)
+
+Subsequent packets: warm path (Case 2), zero additional overhead.
+
+After 300s idle: agent removes peer. Next packet re-triggers this flow.
+```
+
+### Case 4: Pod-to-Pod, Different Nodes (IPv4 via CLAT)
 
 ```
 Pod A on node-1: app connects to 100.64.2.7 (Pod B's IPv4)
 
 Pod A: IPv4 packet -> clat0 TUN
-  -> CLAT xlat: src fd00:ws:1::5, dst fd00:ws:2::7
+  -> CLAT xlat: src 3fff:ws:0001:0001::5, dst 3fff:ws:0001:0002::7
   -> eth0 -> veth -> host
-Host node-1: route fd00:ws:2::/64 dev wg0
+Host node-1: route 3fff:ws:0001:0002::/64 dev wg0
+  -> (on-demand peer setup if needed, see Case 3)
   -> wg0: encrypt, send to node-2
 
 Host node-2: wg0 decrypt -> route to Pod B veth
 Pod B: eth0 receives IPv6 -> clat0 TUN xlat -> app sees IPv4
 ```
 
-### Case 4: Pod to External IPv4 (via DNS64 + NAT64)
+### Case 5: Pod to External IPv4 (via DNS64 + NAT64)
 
 ```
 Pod A: getaddrinfo("ipv4only.example.com")
@@ -948,12 +1612,67 @@ Host node-1: route 64:ff9b::/96 -> nat64 interface
 Return: IPv4 -> nat64 eBPF xlat -> IPv6 -> route to Pod A
 ```
 
-### Case 5: External Peer to Pod
+### Case 6: Cross-Cluster Pod-to-Pod (Cold Path)
 
 ```
-Dev laptop (fd00:ws:ext:1::1) -> Pod B (fd00:ws:2::7)
+Pod A in cluster-1 (3fff:ws:0001:0001::5) ->
+  Pod B in cluster-2 (3fff:ws:0002:0002::7)
+
+Pod A: eth0 -> veth -> host
+Host node-A-1: no specific peer for 3fff:ws:0002:0002::/64
+  route 3fff:ws:0002::/32 (aggregate) -> signaling gateway
+
+  1. Agent intercepts aggregate-route packet (cache miss)
+  2. Agent -> wirescale-control (cluster-1):
+       "resolve 3fff:ws:0002:0002::/64"
+  3. Control (cluster-1) -> directory (cache miss):
+       "where is cluster 2?"
+  4. Directory -> control:
+       {cluster_2_controller: "control.c2.example.com:9443",
+        cluster_2_CA: "..."}
+  5. Control (cluster-1) -> control (cluster-2) via mTLS:
+       "resolve host 0002, cluster-1 cert attached"
+  6. Control (cluster-2) authenticates, returns:
+       {node_B_endpoint: [3fff:c2::2]:51820, pubkey: "...", allowedIPs: ...}
+  7. Control (cluster-1) -> agent: peer info for node-B-2
+  8. Agent establishes direct WireGuard tunnel to node-B-2
+  9. Agent installs specific route:
+       3fff:ws:0002:0002::/64 dev wg0 peer=node-B-2
+       (overrides aggregate 3fff:ws:0002::/32 for this /64)
+  10. Queued packets drain through direct tunnel
+  11. Total cold-path delay: ~30-65ms
+
+Subsequent packets: direct WireGuard tunnel (warm path).
+Gateway is NOT in the data path.
+```
+
+### Case 7: Cross-Cluster Pod-to-Pod (Warm Path)
+
+```
+Pod A in cluster-1 -> Pod B in cluster-2
+  (direct WireGuard tunnel already established from Case 6)
+
+Pod A: eth0 -> veth -> host
+Host node-A-1: route 3fff:ws:0002:0002::/64 dev wg0 peer=node-B-2
+  -> wg0: encrypt with node-B-2's public key
+  -> UDP to [3fff:c2::2]:51820
+
+Network: IPv6 UDP packet transit (inter-cluster)
+
+Host node-B-2: wg0 decrypt -> route to Pod B
+
+(identical to intra-cluster warm path, zero gateway overhead)
+```
+
+### Case 8: External Peer to Pod
+
+```
+Dev laptop (3fff:ws:ext:1::1) -> Pod B (3fff:ws:0001:0002::7)
 
 Laptop: wirescale-join agent
+  -> queries wirescale-control for peer info to reach 3fff:ws:0001:0002::/64
+  -> control authenticates laptop (approved WirescaleExternalPeer)
+  -> returns peer info for node-2
   -> wg0: encrypt with node-2's public key
   -> UDP to [3fff::2]:51820
 
@@ -966,15 +1685,19 @@ Node-2: wg0 decrypt -> verify AllowedIPs -> route to Pod B
 
 | Feature | Wirescale | Tailscale K8s Operator | Cilium WireGuard | Calico WireGuard | Kilo |
 |---------|-----------|----------------------|------------------|------------------|------|
-| Primary goal | Full CNI + IPv6-only support | Expose/connect services to tailnet | Transparent encryption for existing CNI | Transparent encryption for Calico | Multi-site WG overlay |
+| Primary goal | Full CNI + IPv6-only + hyperscale | Expose/connect services to tailnet | Transparent encryption for existing CNI | Transparent encryption for Calico | Multi-site WG overlay |
 | CNI plugin | Yes (standalone) | No (uses existing) | No (is Cilium) | No (is Calico) | Optional |
 | IPv6-only cluster support | First-class target | N/A | Version/mode dependent | Version/mode dependent | Topology dependent |
 | NAT64/DNS64 | Built-in | No | No | No | No |
 | CLAT per-pod | Yes | No | No | No | No |
-| Mesh scope | Full cluster + external | Service-level proxies | Node-to-node | Node-to-node | Cross-site |
-| External peers | Yes (CRD-based) | Yes (tailnet) | No | No | Yes (Peer CRD) |
-| Control plane | In-cluster (CRDs) | Tailscale SaaS | Cilium agent | Calico Felix | Kubernetes API |
-| Identity model | WG keys via CRD | Tailscale identity | CiliumNode annotation | Node annotation | Node annotation |
+| Mesh topology | On-demand peering | Service-level proxies | Full mesh (node-to-node) | Full mesh (node-to-node) | Zone-based leaders |
+| Scale model | O(active_peers) per node | N/A | O(N) peers per node | O(N) peers per node | O(zones) |
+| Cross-cluster | Three-tier hierarchy, on-demand | Tailscale mesh | ClusterMesh (full sync) | Federation | Manual peering |
+| Cross-cluster state | O(clusters) aggregate routes | N/A | O(all_nodes) across clusters | Full sync | Manual config |
+| External peers | Yes (control-mediated) | Yes (tailnet) | No | No | Yes (Peer CRD) |
+| Control plane | Three-tier (directory + control + agent) | Tailscale SaaS | Cilium agent | Calico Felix | Kubernetes API |
+| Identity model | Control-issued tokens + WG keys | Tailscale identity | CiliumNode annotation | Node annotation | Node annotation |
+| Data-path gateways | No (signaling-only) | N/A | Yes (ClusterMesh) | Yes | Yes (zone leaders) |
 
 ### Why Not Just Use Tailscale K8s Operator?
 
@@ -986,24 +1709,41 @@ a Tailscale account (or headscale) for the coordination server.
 
 Wirescale is a ground-up CNI that uses the same principles (WireGuard mesh,
 key coordination, identity-aware routing) but applies them at the cluster
-network fabric level, with IPv6-only as the primary design target.
+network fabric level, with IPv6-only as the primary design target and
+hyperscale as a first-class architectural constraint.
+
+### Why Not ClusterMesh (Cilium)?
+
+Cilium's ClusterMesh replicates etcd state across clusters, creating
+O(all_nodes) state on every node in every cluster. This works for small
+federations (2-5 clusters, hundreds of nodes each) but does not scale to
+hundreds of clusters with tens of thousands of nodes each. Wirescale's
+three-tier hierarchy keeps cross-cluster state at O(clusters) per node and
+resolves individual nodes on demand.
 
 ---
 
 ## 14. Implementation Phases
 
-### Phase 1: Core Mesh (MVP)
+### Phase 1: Control Plane and Core Mesh
 
-- [ ] CRD definitions (WirescaleMesh, WirescaleNode)
+- [ ] CRD definitions (WirescaleMesh, WirescaleNode, WirescalePolicy)
+- [ ] wirescale-control: gRPC service with mTLS authentication
+- [ ] wirescale-control: peer broker (on-demand peer info responses)
+- [ ] wirescale-control: IPAM allocation (node /64 and /24 assignment)
 - [ ] CNI plugin binary (veth pair, IPv6 address assignment)
-- [ ] Agent DaemonSet (WireGuard interface, peer management, key exchange)
-- [ ] Controller Deployment (IPAM allocation, mesh topology)
+- [ ] Agent DaemonSet (WireGuard interface, key generation)
+- [ ] Agent: on-demand peer establishment via control
+- [ ] Agent: peer idle GC (configurable timeout)
 - [ ] Basic health checking and status reporting
 
-**Result:** Encrypted IPv6 pod-to-pod mesh across nodes.
+**Result:** Encrypted IPv6 pod-to-pod mesh with on-demand peering and central
+control. No full-mesh scaling limitation.
 
-### Phase 2: IPv4 Compatibility
+### Phase 2: Identity and IPv4 Compatibility
 
+- [ ] wirescale-control: identity service (pod IP -> identity resolution)
+- [ ] Agent: identity cache (TTL-based, query on miss)
 - [ ] CLAT engine in agent (per-pod IPv4 via TUN)
 - [ ] NAT64 engine in agent (eBPF-based translation)
 - [ ] CoreDNS dns64 plugin configuration
@@ -1011,35 +1751,62 @@ network fabric level, with IPv6-only as the primary design target.
 - [ ] IPv4 service VIP support
 
 **Result:** Pods can use IPv4 transparently on an IPv6-only underlay.
+Identity resolution enables policy enforcement by workload identity.
 
 ### Phase 3: Policy and Security
 
+- [ ] wirescale-control: policy service (per-node policy compilation and push)
+- [ ] Agent: gRPC policy stream subscription
 - [ ] Kubernetes NetworkPolicy enforcement (eBPF or nftables)
 - [ ] WirescalePolicy CRD and controller
-- [ ] Key rotation support
-- [ ] Audit logging
+- [ ] Key rotation support (control-mediated push to active peers)
+- [ ] Audit logging (see [SECURITY.md](SECURITY.md))
 
-**Result:** Zero-trust network with granular policy control.
+**Result:** Zero-trust network with granular policy control. Each node
+enforces only the policies relevant to its local pods.
 
 ### Phase 4: External Connectivity
 
-- [ ] WirescaleExternalPeer CRD and controller
-- [ ] `wirescale-join` CLI for external peers
-- [ ] Subnet router mode
+- [ ] WirescaleExternalPeer CRD and control integration
+- [ ] `wirescale-join` CLI for external peers (authenticates to control)
+- [ ] Subnet router mode (advertised routes via control)
 - [ ] Exit node mode
 - [ ] MagicDNS for mesh name resolution
+- [ ] Cross-cluster DNS resolution
 
-**Result:** Full Tailscale-like mesh spanning cluster and external nodes.
+**Result:** Full Tailscale-like mesh spanning cluster and external nodes,
+with all peers mediated through wirescale-control.
 
-### Phase 5: Multi-Cluster and Scale
+### Phase 5: Three-Tier Hierarchy and Hyperscale
 
-- [ ] Multi-cluster mesh (gateway peering)
-- [ ] Location-aware topology (zone-based leader election)
+- [ ] wirescale-directory: cluster registry with Raft consensus
+- [ ] wirescale-directory: cross-cluster CA management
+- [ ] wirescale-directory: prefix allocation and validation
+- [ ] wirescale-control: directory registration and heartbeat
+- [ ] wirescale-control: cross-cluster proxy (local control -> directory ->
+      remote control -> response)
+- [ ] Agent: aggregate route programming for remote clusters
+- [ ] Agent: cross-cluster peer establishment via signaling gateway
+- [ ] Signaling gateway nodes (signal-only, not data path)
+- [ ] WirescaleCluster CRD (directory-scoped)
+- [ ] Cross-cluster WirescalePolicy support (clusterPeer selectors)
+
+**Result:** Federated multi-cluster mesh with O(clusters) state per node.
+Hundreds of clusters, hundreds of thousands of total hosts.
+
+### Phase 6: Performance and Hardening
+
 - [ ] NAT traversal / DERP-like relay for nodes behind NAT
-- [ ] Performance optimization (eBPF fast path, batch processing)
-- [ ] Metrics and observability (Prometheus, WireGuard handshake stats)
+- [ ] Performance optimization (eBPF fast path, batch processing,
+      see [PERFORMANCE.md](PERFORMANCE.md))
+- [ ] Metrics and observability (Prometheus, WireGuard handshake stats,
+      control plane latency histograms, directory health)
+- [ ] Load testing: 10K+ nodes per cluster, 100+ clusters
+- [ ] Chaos testing: directory failure, control failure, gateway failure,
+      network partition between clusters
 
-**Result:** Production-grade network operator for large-scale deployments.
+**Result:** Production-grade network operator for hyperscale deployments
+with federated cross-cluster connectivity and proven resilience.
 
 ---
 
@@ -1055,14 +1822,21 @@ network fabric level, with IPv6-only as the primary design target.
 | NAT64/CLAT | eBPF TC programs + TUN devices |
 | DNS | CoreDNS dns64 plugin + custom in-mesh resolver |
 | Networking | netlink (vishvananda/netlink), nftables |
+| Control plane RPC | gRPC with mTLS (grpc-go) |
+| Control plane HA | Leader election (controller-runtime) + active-active for reads |
+| Global directory | Raft consensus (etcd, hashicorp/raft, or similar) |
+| Cross-cluster auth | x509 certificates, mutual TLS |
 
 ## Appendix B: Port and Protocol Requirements
 
 | Port | Protocol | Direction | Purpose |
 |------|----------|-----------|---------|
-| 51820 | UDP | Node-to-node | WireGuard mesh traffic |
+| 51820 | UDP | Node-to-node | WireGuard mesh traffic (intra- and cross-cluster) |
+| 9443 | TCP | Agent-to-control | gRPC (peer broker, identity, policy) |
+| 9444 | TCP | Control-to-control | gRPC cross-cluster proxy (peer resolution) |
+| 9445 | TCP | Control-to-directory | gRPC (cluster registration, lookup) |
 | 53 | UDP/TCP | Pod-to-CoreDNS | DNS resolution |
-| 443 (svc) / 6443 (common control-plane endpoint) | TCP | Agent-to-API | Kubernetes API (CRD operations) |
+| 443 / 6443 | TCP | Control-to-API | Kubernetes API (CRD operations) |
 
 ## Appendix C: Kernel Requirements
 
@@ -1074,3 +1848,16 @@ For the target data plane in this document:
 - Nodes MUST have IP forwarding enabled (`net.ipv6.conf.all.forwarding = 1`).
 - Nodes SHOULD provide eBPF support (for NAT64 and policy enforcement).
 - Nodes MUST provide TUN/TAP support (for CLAT).
+
+## Appendix D: Scaling Characteristics
+
+| Metric | Single Cluster (10K nodes) | Federation (100 clusters x 10K nodes) |
+|--------|---------------------------|---------------------------------------|
+| Routes per node | ~50 active /64 + default | ~50 active /64 + ~100 aggregate /32 |
+| WireGuard peers per node | ~50 active | ~50 active (including cross-cluster) |
+| Identity cache per node | ~500 entries (TTL 60s) | ~500 entries (TTL 60s) |
+| Directory state (total) | N/A (single cluster) | ~100 cluster entries |
+| Controller state (per cluster) | ~10K nodes, ~1M pods | ~10K nodes, ~1M pods |
+| Cross-cluster resolution latency | N/A | ~30-65ms (cold), 0ms (warm) |
+| Pod churn impact on routes | Zero (pods do not affect routes) | Zero |
+| Host churn impact on routes | O(1) within cluster | O(1) within cluster |

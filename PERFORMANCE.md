@@ -1,7 +1,9 @@
 # Wirescale: Line-Rate Performance Engineering
 
 > How Wirescale achieves wire-speed IPv4/IPv6 throughput on an IPv6-only
-> underlay with WireGuard encryption and NAT64/CLAT translation.
+> underlay with WireGuard encryption, NAT64/CLAT translation, and hyperscale
+> state efficiency through hierarchical prefix aggregation and on-demand
+> peering.
 >
 > Status: performance design and target guidance. Numeric values without a
 > benchmark citation should be treated as estimates/targets, not guaranteed
@@ -18,10 +20,17 @@
 2. [WireGuard at Line Rate](#2-wireguard-at-line-rate)
 3. [eBPF NAT64/CLAT Fast Path](#3-ebpf-nat64clat-fast-path)
 4. [Packet Pipeline Architecture](#4-packet-pipeline-architecture)
-5. [Kernel Tuning](#5-kernel-tuning)
-6. [Hardware Acceleration](#6-hardware-acceleration)
-7. [Benchmarks and Targets](#7-benchmarks-and-targets)
-8. [MTU Strategy](#8-mtu-strategy)
+5. [On-Demand Peering Performance](#5-on-demand-peering-performance)
+6. [Three-Tier Control Plane Performance](#6-three-tier-control-plane-performance)
+7. [State Scaling Analysis](#7-state-scaling-analysis)
+8. [Hierarchical Prefix Aggregation and Forwarding](#8-hierarchical-prefix-aggregation-and-forwarding)
+9. [Cross-Cluster Performance](#9-cross-cluster-performance)
+10. [Signaling Gateway Performance](#10-signaling-gateway-performance)
+11. [Control Plane Scalability](#11-control-plane-scalability)
+12. [Kernel Tuning](#12-kernel-tuning)
+13. [Hardware Acceleration](#13-hardware-acceleration)
+14. [Benchmarks and Targets](#14-benchmarks-and-targets)
+15. [MTU Strategy](#15-mtu-strategy)
 
 ---
 
@@ -129,13 +138,17 @@ status depends on release).
 
 ### Multi-Tunnel Scaling
 
-For clusters with many nodes, the mesh naturally creates multiple WireGuard
-peers per node. Encryption and packet processing work can distribute across
-multiple cores, subject to kernel scheduler behavior and workload mix.
+With on-demand peering (see [Section 5](#5-on-demand-peering-performance)),
+each node maintains WireGuard peers only for active connections -- typically
+10-50 active peers rather than N-1 in a full mesh. Encryption and packet
+processing work distributes across multiple cores, subject to kernel
+scheduler behavior and workload mix.
 
-On a node with 16 peers (16 remote nodes) and 32 available cores:
+On a node with active peers (typically 10-50) and 32 available cores:
 - TX/RX work can spread across many cores
 - Aggregate throughput can increase substantially with threaded NAPI
+- On-demand peering reduces the number of concurrent tunnels, which
+  concentrates crypto work on fewer cores but also reduces total CPU usage
 - Use local benchmarks to determine realistic ceilings
 
 For single-peer scenarios (e.g., a two-node cluster), the single-core
@@ -382,11 +395,678 @@ clat0 TUN -> Pod B app sees IPv4
 translation happens at the pod boundary, not at the tunnel boundary. The
 mesh never sees IPv4 packets.
 
+### Warm Path vs. Cold Path (On-Demand Peering)
+
+With on-demand peering (see [Section 5](#5-on-demand-peering-performance)),
+the packet pipeline has two modes depending on whether a WireGuard peer
+already exists for the destination.
+
+**Warm path (cached peer exists):** Identical to the fast paths shown above.
+The packet hits eBPF, enters WireGuard, and goes to wire. There is zero
+additional overhead compared to a full mesh -- the same GRO/GSO amortization
+applies, and the same throughput targets hold.
+
+**Cold path (first packet to new peer):** See the detailed cold-path
+breakdown in [Section 5](#5-on-demand-peering-performance) for intra-cluster
+and [Section 9](#9-cross-cluster-performance) for cross-cluster resolution
+chains.
+
 ---
 
-## 5. Kernel Tuning
+## 5. On-Demand Peering Performance
 
-The wirescale-agent applies these sysctls automatically on startup.
+On-demand peering eliminates O(N^2) state by having nodes maintain WireGuard
+peers only for active connections. This is the key architectural change that
+enables hyperscale operation. See [ARCHITECTURE.md](ARCHITECTURE.md) for
+the design rationale and [SECURITY.md](SECURITY.md) for the identity and
+authorization model.
+
+### Warm Path (Cached Peer Exists)
+
+When a WireGuard peer already exists for the destination /64 prefix, the
+data path is identical to a full-mesh topology:
+
+- Packet hits eBPF at egress, enters WireGuard, goes to wire
+- Zero additional overhead compared to full mesh
+- Same GRO/GSO amortization, same throughput targets
+- Same per-packet latency as measured in
+  [Section 14](#14-benchmarks-and-targets)
+
+The warm path is the steady-state path. In typical workloads where traffic
+follows power-law distributions, the vast majority of packets traverse
+the warm path.
+
+### Cold Path: Intra-Cluster (First Packet to New Peer)
+
+When a packet arrives at egress and no WireGuard peer exists for the
+destination /64 prefix, the agent MUST establish the peer before the packet
+can be transmitted. For intra-cluster destinations, the resolution chain
+involves only the local cluster controller:
+
+```
+Intra-cluster cold path:
+  1. Egress eBPF detects missing peer           ~microseconds
+  2. Agent → local wirescale-control via gRPC    ~5-10 ms
+  3. Agent configures WireGuard peer             ~1-2 ms
+  4. WireGuard handshake (1 RTT, same DC)        ~0.1-1 ms
+  Total:                                         ~7-15 ms
+```
+
+| Step | Operation | Latency |
+|------|-----------|---------|
+| 1 | Egress eBPF detects missing peer | ~microseconds |
+| 2 | Agent queries wirescale-control via gRPC | ~5-10 ms |
+| 3 | Agent configures WireGuard peer | ~1-2 ms |
+| 4 | WireGuard handshake (1 RTT) | ~0.1 ms (same-DC), ~50 ms (cross-site) |
+| **Total** | **Same-DC cold path** | **~7-15 ms** |
+| **Total** | **Cross-site (same cluster)** | **~55-70 ms** |
+
+**TCP interaction:** The first TCP SYN is queued during peer setup. The TCP
+retransmit timer (default ~1s) provides ample budget for the cold-path
+establishment latency. The SYN-ACK returns over the now-established warm
+path. Application-visible latency is limited to the cold-path setup time
+on the first connection only.
+
+**UDP interaction:** For UDP traffic, the first packet(s) MAY be queued or
+dropped during peer setup depending on agent buffer capacity. Protocols
+that tolerate packet loss (DNS, QUIC) recover naturally. For latency-
+sensitive UDP flows, applications SHOULD pre-warm the path by sending a
+probe packet.
+
+### Cold Path: Cross-Cluster (Signaling Resolution Chain)
+
+Cross-cluster cold paths traverse the full three-tier hierarchy. The
+signaling gateway handles initial resolution only -- it is NOT in the
+steady-state data path:
+
+```
+Cross-cluster cold path:
+  1. Packet matches aggregate route → hits agent (cache miss)    ~microseconds
+  2. Agent → local wirescale-control                             ~5-10 ms
+  3. Controller → wirescale-directory (global)                   ~5-10 ms
+  4. Controller → remote cluster wirescale-control               ~10-30 ms
+  5. Agent configures WireGuard peer                             ~1-2 ms
+  6. WireGuard handshake (1 RTT, cross-site)                     ~10-100 ms
+  Total:                                                         ~30-150 ms
+```
+
+| Step | Operation | Latency |
+|------|-----------|---------|
+| 1 | Packet matches aggregate route, agent cache miss | ~microseconds |
+| 2 | Agent → local wirescale-control | ~5-10 ms |
+| 3 | Local controller → wirescale-directory | ~5-10 ms |
+| 4 | Local controller → remote cluster controller | ~10-30 ms (varies by distance) |
+| 5 | Agent configures WireGuard peer | ~1-2 ms |
+| 6 | WireGuard handshake (cross-site RTT) | ~10-100 ms |
+| **Total** | **Cross-cluster cold path** | **~30-150 ms** |
+
+After the cold path completes, the WireGuard tunnel operates directly
+between the source and destination nodes. All subsequent packets take the
+warm path with zero signaling overhead. The signaling gateway and
+directory are never touched again for this peer pair.
+
+### Peer Garbage Collection
+
+The agent runs periodic garbage collection to remove idle peers and reclaim
+state:
+
+- GC cycle: every 30 seconds
+- Idle detection: `wg show wg0 dump` provides last-handshake timestamp
+  per peer
+- Peers idle longer than `peer_idle_timeout` (default 5 minutes) are
+  removed via `wg set wg0 peer <key> remove`
+- GC cost: O(active_peers) per cycle, ~1 ms for 100 peers
+- GC overhead is negligible compared to packet processing
+
+**Hysteresis:** The agent SHOULD implement hysteresis to avoid thrashing
+on peers near the idle threshold. A peer that receives traffic during the
+GC decision window MUST NOT be removed.
+
+### Cold Path Recovery and Caching
+
+After a cross-cluster cold path completes, the agent caches the peer
+resolution result locally. If the peer is garbage-collected and later
+needed again, the agent SHOULD use cached resolution data (subject to
+TTL) to skip the full signaling chain. This reduces repeat cold-path
+latency to approximately the intra-cluster level:
+
+| Scenario | First Cold Path | Cached Cold Path |
+|----------|----------------|-----------------|
+| Intra-cluster | ~7-15 ms | ~7-15 ms (same) |
+| Cross-cluster | ~30-150 ms | ~7-15 ms (cache hit) |
+
+---
+
+## 6. Three-Tier Control Plane Performance
+
+Wirescale uses a three-tier control hierarchy that separates global
+directory functions from per-cluster control and per-node agent state.
+This hierarchy ensures that control plane load scales with local cluster
+size and active flow count, not with global fleet size. See
+[ARCHITECTURE.md](ARCHITECTURE.md) for the full design and
+[SECURITY.md](SECURITY.md) for the authentication and authorization model.
+
+### Tier 1: Global Directory (`wirescale-directory`)
+
+The global directory maintains O(clusters) state -- it maps cluster IDs
+to gateway endpoints and certificate authorities. It does NOT handle
+per-node or per-pod state.
+
+| Property | Value |
+|----------|-------|
+| State size | O(clusters) -- typically < 1000 entries |
+| Query rate (steady state) | Low -- only on cross-cluster cache misses |
+| Query rate (burst) | ~100-500 queries/sec during large-scale cold starts |
+| Latency target | < 10 ms p99 |
+| Availability | 3-5 replicas across regions, Raft or etcd-backed |
+| Bandwidth | Negligible -- metadata only, no bulk data |
+
+Because the directory handles only cluster-level metadata, a single
+3-replica deployment can serve a fleet of 1000+ clusters. The directory
+is NOT in any hot path -- it is consulted only during cross-cluster
+peer resolution cache misses.
+
+### Tier 2: Cluster Controller (`wirescale-control`)
+
+Each cluster runs its own wirescale-control instances. The controller
+knows about local nodes and pods and handles identity resolution, peer
+brokering, and policy distribution within the cluster.
+
+| Operation | Latency Target | Throughput Target |
+|-----------|---------------|-------------------|
+| Peer lookup (by /64 prefix) | < 10 ms p99 | 10K queries/sec per replica |
+| Identity lookup (by IP) | < 10 ms p99 | 50K queries/sec per replica |
+| Policy pull (per node) | < 100 ms p99 | 1K pulls/sec per replica |
+| Node registration | < 50 ms p99 | 100/sec per replica |
+| Cross-cluster resolution (via directory) | < 50 ms p99 | 1K queries/sec per replica |
+
+**Horizontal scaling:** wirescale-control is stateless -- it reads from
+the Kubernetes API server and maintains a local watch cache. Replicas
+scale horizontally with no coordination overhead:
+
+- 3 replicas handle ~30K peer lookups/sec
+- With 10K nodes, each establishing ~5 new peers/sec during normal churn:
+  50K lookups/sec total, requiring ~5 replicas
+- Each replica SHOULD be sized for ~10K queries/sec with < 10 ms p99
+  latency
+
+### Tier 3: Node Agent (`wirescale-agent`)
+
+The node agent maintains minimal state: only active WireGuard peers and
+a pull-based identity/policy cache. It does NOT watch cluster-wide
+resources.
+
+| Property | Value |
+|----------|-------|
+| WireGuard peers | ~10-50 active (on-demand) |
+| Identity cache | ~1K entries (active flows only) |
+| Policy map | Local pods only |
+| CRD watches | O(1) -- own node resources only |
+| gRPC connections | 1-3 persistent to wirescale-control replicas |
+| Memory overhead | < 50 MB regardless of cluster/fleet size |
+
+**Pull-based model:** The agent queries wirescale-control on demand
+(cache miss) rather than receiving pushed updates for every change in
+the cluster. This eliminates the O(N) watch bandwidth that full-mesh
+architectures require.
+
+### Agent-to-Control Communication
+
+The agent communicates with wirescale-control over gRPC with mTLS. The
+connection SHOULD be persistent (HTTP/2 multiplexing) to avoid TLS
+handshake overhead on every query:
+
+- Connection establishment: ~10-20 ms (one-time, at agent startup)
+- Per-query overhead on existing connection: ~1-2 ms (serialization +
+  network RTT within the cluster)
+- The agent SHOULD maintain a connection pool to multiple control replicas
+  for failover
+
+### Identity Cache Performance
+
+The agent maintains a local identity cache to avoid redundant control plane
+queries. Because traffic patterns follow power-law distributions, a small
+cache captures most active flows:
+
+- Typical cache hit ratio: > 95%
+- At 95% hit ratio with 10K nodes x 1K new flows/sec = 500 cache
+  misses/sec cluster-wide
+- wirescale-control handles 500 identity lookups/sec easily with 1 replica
+- Cache entries SHOULD be refreshed on a TTL basis (default 60s) and
+  invalidated on demand when the agent receives policy update notifications
+  for its own pods
+
+---
+
+## 7. State Scaling Analysis
+
+The transition from full-mesh to on-demand peering with hierarchical
+prefix aggregation fundamentally changes how per-node resource usage
+scales. See [ROUTABLE-PREFIX.md](ROUTABLE-PREFIX.md) for the addressing
+model and [ARCHITECTURE.md](ARCHITECTURE.md) for the three-tier
+hierarchy.
+
+### The Core Insight: O(1) Per-Node State Relative to Fleet Size
+
+In the full-mesh model, every node holds O(total_hosts) routing state
+and O(total_pods) identity state. This collapses at scale. With
+on-demand peering and hierarchical prefix aggregation, per-node state
+is determined by three factors:
+
+1. **Local cluster size** -- O(local_hosts) intra-cluster /64 routes
+2. **Number of remote clusters** -- O(clusters) aggregate routes
+3. **Active flow count** -- O(active_flows) identity cache entries
+
+Total per-node state: **O(local_hosts + clusters)**, which is
+independent of global fleet size.
+
+### Per-Node Resource Comparison
+
+| Metric | Full Mesh (Broken) | On-Demand Peering (Hyperscale) |
+|--------|-------------------|-------------------------------|
+| WireGuard peers per node | N-1 | ~10-50 active |
+| Routes per node | O(all_hosts) | O(local_hosts + clusters) |
+| Identity cache per node | O(all_pods) | O(active_flows) ~1K entries |
+| Policy map per node | Grows with cluster | Local pods only |
+| CRD watches per node | O(N) events/sec | O(1) own node only |
+| Cross-cluster routing | O(remote_hosts) per cluster | O(remote_clusters) |
+| Memory per WireGuard peer | ~400 bytes | ~400 bytes (same) |
+| Total WG memory (10K nodes, 1 cluster) | ~4 MB/node | ~4-20 KB/node |
+| Total WG memory (100K nodes, 10 clusters) | ~40 MB/node | ~4-20 KB/node (unchanged) |
+| Total WG memory (1M nodes, 100 clusters) | ~400 MB/node | ~4-20 KB/node (unchanged) |
+| Identity cache memory | ~10 MB/node (100K pods) | ~100 KB/node (~1K entries) |
+
+### State Scaling at Hyperscale
+
+The following table shows how per-node state remains bounded as fleet
+size grows across clusters:
+
+| Scale | Nodes | Clusters | Routes/Node | Identity Cache/Node | FIB Entries |
+|-------|-------|----------|-------------|--------------------|----|
+| Single cluster | 10K | 1 | 10K /64s | ~1K active | 10K |
+| Multi-cluster | 10K × 10 | 10 | 10K + 9 aggregates | ~1K active | ~10K |
+| Hyperscale | 10K × 100 | 100 | 10K + 99 aggregates | ~1K active | ~10K |
+| Mega-scale | 10K × 1000 | 1000 | 10K + 999 aggregates | ~1K active | ~11K |
+
+**Key insight: per-node state grows with local cluster size + number of
+clusters, NOT with global fleet size.** At 10M nodes across 1000 clusters,
+each node still has ~11K routes and ~1K identity cache entries -- the same
+order of magnitude as a single 10K-node cluster.
+
+### Why This Matters: Memory and CPU
+
+| Fleet Size | Full Mesh Memory/Node | Hyperscale Memory/Node | Reduction |
+|-----------|----------------------|----------------------|-----------|
+| 10K nodes, 1 cluster | ~14 MB | ~120 KB | 117x |
+| 100K nodes, 10 clusters | ~140 MB | ~120 KB | 1,167x |
+| 1M nodes, 100 clusters | ~1.4 GB | ~120 KB | 11,667x |
+| 10M nodes, 1000 clusters | ~14 GB | ~130 KB | 107,692x |
+
+Full-mesh memory estimates include WireGuard peer state (~400 bytes/peer),
+identity cache (~100 bytes/entry), and FIB entries (~64 bytes/route).
+Hyperscale estimates use ~50 active peers, ~1K identity cache entries,
+and ~11K FIB entries.
+
+### Control Plane Event Rate Comparison
+
+| Event Type | Full Mesh (per node) | On-Demand (per node) |
+|-----------|---------------------|---------------------|
+| CRD watch events | O(N) events/sec | O(1) own-node events/sec |
+| Identity updates | O(pod_churn) fleet-wide | O(active_flow_churn) local |
+| Route updates | O(host_churn) fleet-wide | O(local_host_churn + cluster_add/remove) |
+| Policy updates | O(policy_churn) fleet-wide | O(local_pod_policy_churn) |
+
+At 100K nodes with 1% hourly churn, full-mesh produces ~280 events/sec/node
+of background watch traffic. On-demand peering produces ~0.003 events/sec/node
+(own-node changes only). This is a 5 orders of magnitude reduction.
+
+---
+
+## 8. Hierarchical Prefix Aggregation and Forwarding
+
+The /64-per-host addressing model (see
+[ROUTABLE-PREFIX.md](ROUTABLE-PREFIX.md)) combined with contiguous per-cluster
+prefix allocation enables hierarchical route aggregation that keeps FIB size
+bounded regardless of fleet scale.
+
+### Prefix Allocation Hierarchy
+
+```
+Global allocation (ULA or GUA):
+  Fleet:    fd00:ws::/32        (ULA) or 3fff:1::/32    (GUA)
+    |
+    +-- Cluster A: fd00:ws:0::/48                        (/48 per cluster)
+    |     +-- Host 1: fd00:ws:0:1::/64                   (/64 per host)
+    |     +-- Host 2: fd00:ws:0:2::/64
+    |     +-- ...
+    |     +-- Host N: fd00:ws:0:N::/64
+    |
+    +-- Cluster B: fd00:ws:1::/48
+    |     +-- Host 1: fd00:ws:1:1::/64
+    |     +-- ...
+    |
+    +-- Cluster C: fd00:ws:2::/48
+          +-- ...
+```
+
+Each cluster receives a contiguous prefix (/48 for ULA, /48 for GUA).
+Within a cluster, each host receives a /64 from that prefix. This
+hierarchical allocation enables single-entry aggregate routes for
+cross-cluster traffic.
+
+### Intra-Cluster Routing Table
+
+Within a cluster, each node maintains O(local_hosts) /64 routes:
+
+| Cluster Size | /64 Route Entries | FIB Lookup Depth |
+|-------------|------------------|------------------|
+| 100 hosts | 100 | ~7 |
+| 1K hosts | 1K | ~10 |
+| 10K hosts | 10K | ~14 |
+| 50K hosts | 50K | ~16 |
+
+These routes point to the WireGuard interface with the appropriate peer.
+Pod-level /128 routes exist only on the local host for intra-node delivery.
+
+### Cross-Cluster Aggregate Routes
+
+For traffic destined to remote clusters, each node installs one aggregate
+route per remote cluster prefix:
+
+```
+# Intra-cluster: 10K individual /64 routes
+fd00:ws:0:1::/64 dev wg0 peer <host-1-key>
+fd00:ws:0:2::/64 dev wg0 peer <host-2-key>
+...
+fd00:ws:0:2710::/64 dev wg0 peer <host-10000-key>
+
+# Cross-cluster: one aggregate per remote cluster
+fd00:ws:1::/48 dev wg0 metric 100    # → Cluster B
+fd00:ws:2::/48 dev wg0 metric 100    # → Cluster C
+fd00:ws:3::/48 dev wg0 metric 100    # → Cluster D
+...
+```
+
+When a packet matches an aggregate route and no specific /64 peer exists,
+the agent intercepts it and triggers the cross-cluster cold path
+(see [Section 5](#5-on-demand-peering-performance)).
+
+### Total FIB Size at Scale
+
+| Scale | Local /64s | Cluster Aggregates | Total FIB Entries |
+|-------|-----------|-------------------|------------------|
+| 10K nodes, 1 cluster | 10K | 0 | 10K |
+| 10K nodes, 10 clusters | 10K | 9 | ~10K |
+| 10K nodes, 100 clusters | 10K | 99 | ~10K |
+| 10K nodes, 1000 clusters | 10K | 999 | ~11K |
+| 50K nodes, 100 clusters | 50K | 99 | ~50K |
+
+The key property: **adding remote clusters adds one FIB entry per cluster,
+not one entry per remote host.** 1000 remote clusters with 10K nodes each
+(10M total remote nodes) adds only 1000 FIB entries.
+
+### Kernel FIB Lookup Performance
+
+The kernel FIB uses a longest-prefix-match trie. Lookup cost is
+O(log N) where N is the number of prefix entries:
+
+| FIB Size | Prefix Comparisons per Lookup | Lookup Cost |
+|----------|-------------------------------|-------------|
+| 1K | ~10 | ~20-30 ns |
+| 10K | ~14 | ~25-40 ns |
+| 50K | ~16 | ~30-45 ns |
+| 100K | ~17 | ~35-50 ns |
+
+FIB lookup remains trivial even at 50K local hosts. At ~20-40 ns per
+lookup (see [Section 1](#1-performance-budget)), prefix-based forwarding
+adds negligible overhead to the packet pipeline.
+
+### Comparison with Per-Pod Routing
+
+Per-pod routing (as used by some CNIs) inserts a /128 route for every pod
+in the cluster. At scale:
+
+- 1M pods = 1M FIB entries, deeper trie, slower lookups
+- Route update churn: O(pod_churn) events/sec across all nodes
+- Each route update triggers FIB rebalancing
+
+With hierarchical prefix aggregation:
+- 10K hosts + 100 clusters = ~10K FIB entries regardless of pod count
+- Route update churn: O(host_churn + cluster_churn) -- orders of magnitude
+  less than pod churn
+- Pod creation/deletion does NOT affect the FIB on any node (local or
+  remote)
+
+---
+
+## 9. Cross-Cluster Performance
+
+Wirescale supports cross-cluster communication through the three-tier
+control hierarchy with signaling gateways. The performance characteristics
+differ from same-cluster communication in cold-path latency only -- the
+steady-state data path is identical.
+
+### Cross-Cluster Cold Path (Detailed)
+
+The full cross-cluster resolution chain, step by step:
+
+```
+Pod A (Cluster X) → Pod B (Cluster Y):
+
+1. Pod A sends to fd00:ws:Y:N::P (matches aggregate route fd00:ws:Y::/48)
+   Agent intercepts: no WireGuard peer for destination /64           ~μs
+
+2. Agent → local wirescale-control (Cluster X)
+   "Resolve fd00:ws:Y:N::/64 -- which host, which cluster?"         ~5-10 ms
+   Controller sees prefix belongs to Cluster Y's allocation.
+
+3. Controller (Cluster X) → wirescale-directory
+   "What is the gateway endpoint and CA for Cluster Y?"              ~5-10 ms
+   Directory returns: gateway_endpoint, cluster_ca, auth_token
+
+4. Controller (Cluster X) → Controller (Cluster Y)
+   "Resolve fd00:ws:Y:N::/64 to host endpoint and public key"       ~10-30 ms
+   Remote controller returns: host_endpoint, wireguard_pubkey,
+   allowed_ips, identity_metadata
+
+5. Agent configures WireGuard peer with remote host's details         ~1-2 ms
+
+6. WireGuard initiator handshake (1 RTT to remote host)              ~10-100 ms
+   Direct tunnel established between source and destination nodes.
+
+7. Queued packet transmitted. All subsequent packets use warm path.
+
+Total first-packet latency: ~30-150 ms (varies by geographic distance)
+```
+
+### Steady-State Cross-Cluster Performance
+
+After peer establishment, cross-cluster encrypted performance is identical
+to same-cluster encrypted performance at the same physical distance.
+WireGuard does not distinguish between same-cluster and cross-cluster
+peers -- the crypto overhead is the same.
+
+**Critical property: the signaling gateway is NOT in the data path.**
+After the initial resolution, the WireGuard tunnel runs directly between
+the two nodes. This means:
+
+- No throughput bottleneck at the gateway
+- No added latency in steady state
+- No single point of failure for established flows
+- No bandwidth overhead proportional to cross-cluster traffic volume
+
+### Cross-Cluster Identity Resolution
+
+Cross-cluster identity lookups go through the three-tier resolution path:
+
+- First lookup: ~30-50 ms (full chain through directory)
+- Cached lookup: ~5-10 ms (local controller has cached remote mapping)
+- Identity cache TTL applies across cluster boundaries
+- At typical cache hit ratios (> 95%), full-chain lookups are rare in
+  steady state
+- The agent SHOULD pre-fetch identities for known cross-cluster
+  communication patterns during peer establishment
+
+### Cross-Cluster Latency Comparison
+
+| Scenario | Cold Path (First Packet) | Warm Path (Steady State) |
+|----------|------------------------|-------------------------|
+| Intra-cluster, same DC | ~7-15 ms | Wire latency only (~0.1 ms) |
+| Intra-cluster, cross-site | ~55-70 ms | Wire latency only (~1-50 ms) |
+| Cross-cluster, same region | ~30-60 ms | Wire latency only (~1-10 ms) |
+| Cross-cluster, cross-region | ~60-150 ms | Wire latency only (~10-100 ms) |
+
+The warm-path latency is determined entirely by physical network distance
+and WireGuard crypto overhead (~5-10 μs). The control plane adds zero
+latency to established flows.
+
+---
+
+## 10. Signaling Gateway Performance
+
+The signaling gateway handles cross-cluster peer resolution requests. It
+is a control-plane component only -- it never touches data-plane packets.
+
+### Signaling Gateway Is NOT a Data-Path Component
+
+This distinction is critical for understanding the performance model:
+
+| Property | Traditional VPN Gateway | Wirescale Signaling Gateway |
+|----------|----------------------|---------------------------|
+| Data path | All cross-cluster traffic flows through | Never in data path |
+| Throughput limit | Gateway bandwidth caps cross-cluster | No throughput limit |
+| Latency impact | Added hop on every packet | Zero after initial resolution |
+| Scaling model | Scale with traffic volume | Scale with new-flow rate only |
+| Failure impact | All cross-cluster traffic drops | Only new connections affected |
+
+### Signaling Load Model
+
+The gateway handles signaling traffic only: cross-cluster peer resolution
+requests and responses. The load is proportional to the rate of new
+cross-cluster connections, NOT to the volume of cross-cluster traffic.
+
+| Metric | Estimate |
+|--------|---------|
+| Signaling message size | ~500 bytes (pubkey + endpoint + metadata) |
+| Cold-path resolutions/sec (steady state) | ~10-100 per cluster |
+| Cold-path resolutions/sec (burst, e.g. failover) | ~1K-10K per cluster |
+| Bandwidth (steady state) | < 100 KB/s |
+| Bandwidth (burst) | < 5 MB/s |
+| CPU per resolution | < 0.1 ms (metadata lookup + auth check) |
+
+### Signaling Gateway Sizing
+
+| Fleet Scale | Clusters | Peak Resolutions/sec | Recommended Replicas |
+|-----------|---------|---------------------|---------------------|
+| Small | 5-10 | ~500 | 2-3 |
+| Medium | 10-50 | ~5K | 3-5 |
+| Large | 50-200 | ~20K | 5-10 |
+| Hyperscale | 200-1000 | ~100K | 10-20 |
+
+The gateway scales horizontally. Each replica handles ~10K resolutions/sec.
+State is minimal (O(clusters) directory entries) and can be replicated
+across all instances.
+
+### Failure Modes
+
+| Failure | Impact | Recovery |
+|---------|--------|----------|
+| Gateway replica fails | Load redistributes to remaining replicas | Automatic via load balancer |
+| All gateways fail | New cross-cluster connections fail | Existing tunnels continue working |
+| Gateway slow (> 100 ms) | Cross-cluster cold path degrades | Circuit breaker; cached resolutions still work |
+
+Existing WireGuard tunnels are unaffected by gateway failures because the
+gateway is not in the data path. Only new cross-cluster peer establishments
+require the gateway.
+
+---
+
+## 11. Control Plane Scalability
+
+This section analyzes the scalability limits of each tier in the control
+hierarchy and identifies the bottlenecks at each scale point.
+
+### Global Directory Scalability
+
+The global directory (wirescale-directory) is the simplest component to
+scale because it maintains minimal state:
+
+| Property | Value |
+|----------|-------|
+| State per cluster | ~1 KB (endpoint, CA cert, metadata) |
+| Total state (1000 clusters) | ~1 MB |
+| Read:write ratio | ~1000:1 (reads dominate) |
+| Write events | Cluster add/remove, gateway endpoint change |
+| Consistency model | Eventually consistent (TTL-based refresh) |
+
+The directory SHOULD be backed by a replicated key-value store (etcd or
+similar). At 1 MB of total state, the entire directory fits in memory on
+every replica. Query latency is bounded by network RTT, not by lookup
+cost.
+
+**Scaling limit:** The directory is effectively unbounded -- 10K clusters
+would still be < 10 MB of state. The bottleneck shifts to human
+operational complexity long before the directory becomes a technical
+constraint.
+
+### Cluster Controller Scalability
+
+The cluster controller (wirescale-control) is the most heavily loaded
+component in the hierarchy. Its scalability is determined by:
+
+1. **Kubernetes API server watch efficiency** -- each replica watches
+   node, pod, and identity CRDs for the local cluster
+2. **Query rate from agents** -- proportional to new-flow rate across
+   all nodes
+3. **Cross-cluster resolution forwarding** -- queries proxied through
+   to remote clusters
+
+| Cluster Size | Agent Query Rate | Controller Replicas | API Server Load |
+|-------------|-----------------|--------------------|----|
+| 1K nodes | ~5K queries/sec | 1-2 | Light |
+| 5K nodes | ~25K queries/sec | 3-5 | Moderate |
+| 10K nodes | ~50K queries/sec | 5-10 | Significant |
+| 50K nodes | ~250K queries/sec | 25-50 | Heavy (shard API server) |
+
+**Scaling limit:** At 50K+ nodes per cluster, the Kubernetes API server
+itself becomes the bottleneck for watch efficiency. Clusters SHOULD be
+kept at 10K nodes or fewer, with cross-cluster federation used to scale
+beyond that.
+
+### Node Agent Scalability
+
+The node agent has the simplest scalability story because its resource
+usage is bounded by active flow count, not cluster or fleet size:
+
+| Metric | 1K-Node Cluster | 10K-Node Cluster | 10M-Node Fleet |
+|--------|----------------|-----------------|----------------|
+| WireGuard peers | ~10-50 | ~10-50 | ~10-50 |
+| Identity cache | ~1K entries | ~1K entries | ~1K entries |
+| FIB entries | ~1K | ~10K | ~10K + ~1K aggregates |
+| Memory | ~20 MB | ~30 MB | ~30 MB |
+| CPU (control plane) | < 1% | < 1% | < 1% |
+
+**Scaling limit:** The agent is effectively O(1) relative to fleet size.
+Its resource usage is determined entirely by local workload communication
+patterns.
+
+### End-to-End Control Plane Latency Budget
+
+| Path | Component Chain | Total Latency Target |
+|------|---------------|---------------------|
+| Intra-cluster peer setup | Agent → Controller → Agent | < 15 ms p99 |
+| Cross-cluster peer setup | Agent → Controller → Directory → Remote Controller → Agent | < 150 ms p99 |
+| Identity resolution (cached) | Agent local cache | < 1 ms p99 |
+| Identity resolution (miss) | Agent → Controller | < 10 ms p99 |
+| Policy refresh | Agent → Controller | < 100 ms p99 |
+
+---
+
+## 12. Kernel Tuning
+
+The wirescale-agent applies these sysctls automatically on startup. These
+settings are valid for both intra-cluster and cross-cluster peering
+topologies.
 
 ### Network Buffers
 
@@ -464,7 +1144,7 @@ ethtool -N eth0 rx-flow-hash udp6 sdfn
 
 ---
 
-## 6. Hardware Acceleration
+## 13. Hardware Acceleration
 
 ### Tier 1: Available Now
 
@@ -516,7 +1196,7 @@ ethtool -N eth0 rx-flow-hash udp6 sdfn
 
 ---
 
-## 7. Benchmarks and Targets
+## 14. Benchmarks and Targets
 
 ### Baseline: Unencrypted IPv6 (Ceiling)
 
@@ -563,9 +1243,59 @@ ChaCha20 throughput:
 This is a kernel architectural limitation. The Netdev 0x18 "WireGuard
 Inline" proposal addresses it but has not been upstreamed.
 
+### Target: Cold-Path Latency
+
+| Scenario | Target p50 | Target p99 |
+|----------|-----------|-----------|
+| Intra-cluster, same-DC | < 10 ms | < 15 ms |
+| Intra-cluster, cross-site | < 60 ms | < 100 ms |
+| Cross-cluster, same region | < 50 ms | < 80 ms |
+| Cross-cluster, cross-region | < 100 ms | < 150 ms |
+| Cached cross-cluster (GC'd peer) | < 10 ms | < 15 ms |
+| Peer GC cycle (100 active peers) | < 1 ms | < 5 ms |
+
+### Target: Control Plane Latency
+
+| Operation | Target p50 | Target p99 |
+|-----------|-----------|-----------|
+| Peer lookup (intra-cluster) | < 5 ms | < 10 ms |
+| Peer lookup (cross-cluster, cold) | < 30 ms | < 50 ms |
+| Identity lookup (cached) | < 0.1 ms | < 1 ms |
+| Identity lookup (miss) | < 5 ms | < 10 ms |
+| Policy pull (per node) | < 50 ms | < 100 ms |
+| Node registration | < 25 ms | < 50 ms |
+| Directory query | < 5 ms | < 10 ms |
+| Identity cache hit ratio | > 95% | > 90% (cold start) |
+
+### Target: State Efficiency at Scale
+
+| Scale | WG Memory/Node | Identity Cache/Node | FIB Entries/Node |
+|-------|---------------|--------------------|-----------------|
+| 1K nodes, 1 cluster | < 20 KB | < 100 KB | ~1K |
+| 10K nodes, 1 cluster | < 20 KB | < 100 KB | ~10K |
+| 10K × 10 clusters | < 20 KB | < 100 KB | ~10K |
+| 10K × 100 clusters | < 20 KB | < 100 KB | ~10K |
+| 10K × 1000 clusters | < 20 KB | < 100 KB | ~11K |
+
+Per-node WireGuard memory and identity cache MUST remain bounded
+independent of fleet size. FIB entries scale with local host count plus
+cluster count, not with total hosts or pod count (see
+[Section 8](#8-hierarchical-prefix-aggregation-and-forwarding)).
+
+### Target: Signaling Gateway Performance
+
+| Metric | Target |
+|--------|--------|
+| Resolution latency (p50) | < 20 ms |
+| Resolution latency (p99) | < 50 ms |
+| Resolution throughput (per replica) | > 10K/sec |
+| Steady-state bandwidth | < 100 KB/s per cluster |
+| Burst bandwidth (failover) | < 5 MB/s per cluster |
+| Data-plane overhead | Zero (not in path) |
+
 ---
 
-## 8. MTU Strategy
+## 15. MTU Strategy
 
 MTU misconfiguration is a common cause of WireGuard underperformance.
 Incorrect MTU causes either fragmentation (CPU-expensive) or path MTU
@@ -624,9 +1354,18 @@ benefits can compound:
 Target behavior: wirescale-agent auto-detects physical MTU and configures wg0
 and pod MTUs accordingly.
 
+### MTU for Cross-Cluster Tunnels
+
+Cross-cluster tunnels MAY traverse paths with different physical MTUs
+than intra-cluster tunnels. The agent SHOULD:
+
+1. Use PMTUD (Path MTU Discovery) for cross-cluster WireGuard endpoints
+2. Set the inner MTU conservatively (based on minimum known path MTU)
+3. Fall back to 1420 inner MTU if PMTUD is unavailable
+
 ---
 
-## Appendix: Monitoring Performance
+## Appendix A: Monitoring Performance
 
 ### WireGuard Handshake and Transfer Stats
 
@@ -675,3 +1414,30 @@ kubectl exec -it netperf-client -- iperf3 -c <pod-ipv4> -t 30
 # IPv4 via NAT64 to external
 kubectl exec -it netperf-client -- iperf3 -c <external-ipv4> -t 30
 ```
+
+### Control Plane Monitoring
+
+```bash
+# Agent cache statistics
+curl -s localhost:9091/metrics | grep wirescale_cache
+
+# Controller query rate and latency
+curl -s localhost:9092/metrics | grep wirescale_control_query
+
+# Directory resolution rate
+curl -s localhost:9093/metrics | grep wirescale_directory
+
+# Cross-cluster cold-path latency histogram
+curl -s localhost:9091/metrics | grep wirescale_cold_path_duration
+```
+
+---
+
+## Appendix B: Companion Documents
+
+| Document | Coverage |
+|----------|---------|
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Three-tier hierarchy, component design, CRDs, packet flows |
+| [SECURITY.md](SECURITY.md) | Identity model, mTLS, policy enforcement, eBPF security maps |
+| [ROUTABLE-PREFIX.md](ROUTABLE-PREFIX.md) | /64-per-host addressing, BGP integration, GUA allocation |
+| [CILIUM-INTEGRATION.md](CILIUM-INTEGRATION.md) | Architecture comparison with Cilium CNI |
