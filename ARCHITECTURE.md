@@ -3,6 +3,12 @@
 > A WireGuard-based network operator for Kubernetes that provides seamless
 > IPv4 and IPv6 connectivity in IPv6-only clusters, inspired by Tailscale's
 > control/data plane separation and mesh networking model.
+>
+> Status: design document. Unless explicitly linked to implementation artifacts,
+> behavior described here should be treated as target architecture.
+>
+> Normative language: MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are to be
+> interpreted as described in RFC 2119 and RFC 8174 when shown in all caps.
 
 **See also:**
 - [PERFORMANCE.md](PERFORMANCE.md) -- Line-rate performance engineering
@@ -48,17 +54,21 @@ IPv6-only infrastructure. However:
 
 ### What We Want
 
-A single operator that gives every pod in an IPv6-only Kubernetes cluster:
+A conformant Wirescale deployment SHOULD satisfy the following goals for pods
+in an IPv6-only Kubernetes cluster:
 
-1. **Native IPv6 connectivity** -- first-class, no translation
-2. **Transparent IPv4 connectivity** -- pods speak IPv4 naturally; the
-   network handles translation to/from the IPv6 underlay
-3. **Encrypted pod-to-pod mesh** -- all inter-node traffic encrypted via
-   WireGuard with zero application changes
-4. **Tailscale-like simplicity** -- a control plane that distributes keys,
-   routes, and policy; a data plane that "just works"
-5. **External mesh capability** -- connect pods to services outside the
-   cluster (other clusters, bare-metal, cloud VMs) through the same mesh
+1. **Native IPv6 connectivity** -- the data plane MUST support first-class IPv6
+   pod connectivity without translation in native paths.
+2. **Transparent IPv4 connectivity** -- the platform MUST provide an IPv4
+   compatibility path so pods can use IPv4 socket semantics over an IPv6
+   underlay.
+3. **Encrypted pod-to-pod mesh** -- in full-mesh mode, inter-node traffic MUST
+   be encrypted with WireGuard; location-aware mode MAY use native intra-zone
+   routing by policy.
+4. **Control/data simplicity** -- the architecture SHOULD keep control-plane
+   distribution (keys/routes/policy) separate from data-plane forwarding.
+5. **External mesh capability** -- deployments MAY extend the mesh to external
+   services (other clusters, bare-metal, cloud VMs).
 
 ---
 
@@ -71,8 +81,8 @@ A single operator that gives every pod in an IPv6-only Kubernetes cluster:
 | **Key-per-node, not key-per-pod** | Matches the WireGuard model and avoids O(n^2) key distribution. Pods on the same node share a tunnel. Same-node traffic is unencrypted (already isolated by kernel namespaces). |
 | **CRD-driven configuration** | All mesh state (peers, routes, policies) is expressed as Kubernetes Custom Resources. The cluster API server IS the coordination database. |
 | **CNI-complementary, not CNI-replacing** | Wirescale can operate as a standalone CNI or as an overlay on top of an existing CNI (like Flannel or kubenet) for the intra-node path. |
-| **No external dependencies** | No need for etcd, Consul, or an external coordination server. The Kubernetes API is the single source of truth. |
-| **Graceful degradation** | If the controller is down, existing mesh connections persist (cached WireGuard config). New nodes wait until the controller recovers. |
+| **No additional external dependencies** | No extra coordination system beyond the Kubernetes control plane. The Kubernetes API is the source of truth for Wirescale state. |
+| **Graceful degradation** | If the controller is down, existing mesh connections SHOULD persist (cached WireGuard config). New nodes MAY wait until the controller recovers. |
 
 ---
 
@@ -235,10 +245,10 @@ mesh management is handled by the agent.
 ### IPv6 Addressing (Primary)
 
 ```
-Cluster pod CIDR:     fd00:ws::/48        (ULA, configurable)
-Per-node allocation:  fd00:ws:N::/64      (N = node index)
-Pod address:          fd00:ws:N::P/128    (P = pod index within node)
-Service CIDR:         fd00:ws:svc::/108
+Cluster pod CIDR:     fd12:3456:7800::/48        (ULA, configurable)
+Per-node allocation:  fd12:3456:7800:N::/64      (N = node index)
+Pod address:          fd12:3456:7800:N::P/128    (P = pod index within node)
+Service CIDR:         fd12:3456:78ff::/108
 ```
 
 All pod-to-pod, pod-to-service, and pod-to-external communication uses IPv6
@@ -259,7 +269,7 @@ These IPv4 addresses exist only within the WireGuard mesh. They are never
 exposed on the physical network. The mapping is:
 
 ```
-Pod IPv4: 100.64.N.P  <-->  Pod IPv6: fd00:ws:N::P
+Pod IPv4: 100.64.N.P  <-->  Pod IPv6: fd12:3456:7800:N::P
 ```
 
 This deterministic mapping enables stateless translation between the two
@@ -321,7 +331,7 @@ Zone A (3 nodes)              Zone B (4 nodes)
 
 ```
 Node boot:
-  1. Generate Ed25519 keypair (WireGuard)
+  1. Generate Curve25519 (X25519) keypair (WireGuard)
   2. Private key: memory-only (never written to disk/CRD)
   3. Public key: written to WirescaleNode CRD
 
@@ -347,13 +357,13 @@ PrivateKey = <generated-at-boot>
 [Peer]
 PublicKey = <from WirescaleNode CRD>
 Endpoint = [3fff::2]:51820
-AllowedIPs = fd00:ws:2::/64, 100.64.2.0/24
+AllowedIPs = fd12:3456:7800:2::/64, 100.64.2.0/24
 
 # Peer: node-worker-3
 [Peer]
 PublicKey = <from WirescaleNode CRD>
 Endpoint = [3fff::3]:51820
-AllowedIPs = fd00:ws:3::/64, 100.64.3.0/24
+AllowedIPs = fd12:3456:7800:3::/64, 100.64.3.0/24
 ```
 
 The `AllowedIPs` for each peer covers both the IPv6 and IPv4 pod CIDRs of
@@ -364,8 +374,8 @@ families through the same tunnel.
 
 ```
 Physical interface MTU:  1500 (typical)
-WireGuard overhead:      60 bytes (20 IPv6 + 8 UDP + 32 WG header)
-                         (80 bytes if outer header is IPv6: 40 IPv6 + 8 UDP + 32 WG)
+WireGuard overhead:      60 bytes (20 IPv4 + 8 UDP + 32 WG data header/tag)
+                         80 bytes with IPv6 outer header (40 IPv6 + 8 UDP + 32 WG)
 Pod interface MTU:       1420 (1500 - 80)
 TCP MSS clamping:        1380 (1420 - 40 for IPv6 TCP header)
 ```
@@ -388,7 +398,7 @@ socket APIs.
 
 ```
 Pod network namespace:
-  eth0:   fd00:ws:1::5/128    (primary, IPv6)
+  eth0:   fd12:3456:7800:1::5/128    (primary, IPv6)
   clat0:  100.64.1.5/32       (CLAT, IPv4)
 
   IPv4 default route -> clat0
@@ -404,14 +414,15 @@ App sends IPv4 packet to 93.184.216.34 (example.com)
    clat0 TUN interface (in pod netns)
          |
    Stateless SIIT translation (RFC 7915):
-     src: 100.64.1.5        -> fd00:ws:1::5
+     src: 100.64.1.5        -> fd12:3456:7800:1::5
      dst: 93.184.216.34     -> 64:ff9b::93.184.216.34
          |
          v
    eth0 (IPv6 packet exits pod)
          |
-   host routing: 64:ff9b::/96 -> wg0 (if dest in mesh)
-                                  or nat64 iface (if external)
+   host routing:
+     - In-mesh IPv4 compatibility traffic -> deterministic pod mapping over wg0
+     - External IPv4 destinations -> 64:ff9b::/96 via nat64 interface
 ```
 
 The CLAT translation is stateless and deterministic. The reverse mapping
@@ -458,7 +469,8 @@ CoreDNS is configured with the `dns64` plugin:
     }
     dns64 {
         prefix 64:ff9b::/96
-        translate_all   # Synthesize even when AAAA exists (optional)
+        # translate_all is optional and disabled by default
+        # translate_all
     }
     forward . /etc/resolv.conf
     cache 30
@@ -474,7 +486,8 @@ When a pod queries `example.com` and only an A record exists:
 3. Pod connects to `64:ff9b::5db8:d822` over IPv6
 4. NAT64 engine translates to IPv4 at the node boundary
 
-When an AAAA record exists, it is returned directly -- no translation needed.
+When an AAAA record exists, it is returned directly unless `translate_all` is
+explicitly enabled.
 
 ### 7.4 Complete IPv4 Flow (Pod to External IPv4 Host)
 
@@ -534,29 +547,29 @@ Pod A (100.64.1.5) -> connect to Pod B (100.64.2.7)
 Every pod in the mesh is resolvable by name, like Tailscale's MagicDNS:
 
 ```
-<pod-name>.<namespace>.ws.local          -> fd00:ws:N::P (AAAA)
-<pod-name>.<namespace>.ws.local          -> 100.64.N.P   (A)
-<service-name>.<namespace>.svc.ws.local  -> service VIP
+<pod-name>.<namespace>.ws.cluster.internal          -> fd12:3456:7800:N::P (AAAA)
+<pod-name>.<namespace>.ws.cluster.internal          -> 100.64.N.P          (A)
+<service-name>.<namespace>.svc.ws.cluster.internal  -> service VIP
 ```
 
 The wirescale-agent runs a lightweight DNS sidecar that:
 1. Watches Pod objects for IP assignments
 2. Maintains an in-memory name-to-IP map
-3. Serves DNS queries for `*.ws.local` domain
+3. Serves DNS queries for `*.ws.cluster.internal` domain
 4. Forwards all other queries to CoreDNS (which handles `dns64`)
 
-This is push-based, like Tailscale -- no TTL-based caching needed. When a
-pod moves or restarts, the DNS entry updates within seconds via the watch.
+This is push-based, like Tailscale, which reduces stale records. DNS clients
+still honor TTL semantics for cached responses.
 
 ### DNS Query Flow
 
 ```
-Pod makes DNS query for "api.backend.ws.local"
+Pod makes DNS query for "api.backend.ws.cluster.internal"
   |
   v
 CoreDNS (cluster DNS)
   |
-  | matches ws.local -> forward to wirescale DNS
+  | matches ws.cluster.internal -> forward to wirescale DNS
   v
 wirescale-agent DNS
   |
@@ -667,7 +680,7 @@ fd00:ws:a::/48                     fd00:ws:b::/48
 
 Pod in Cluster A can reach pods in Cluster B by their IPv6 or IPv4 mesh
 addresses. DNS integration makes cross-cluster resolution seamless:
-`api.backend.cluster-b.ws.local`.
+`api.backend.cluster-b.ws.cluster.internal`.
 
 ---
 
@@ -953,7 +966,7 @@ Node-2: wg0 decrypt -> verify AllowedIPs -> route to Pod B
 |---------|-----------|----------------------|------------------|------------------|------|
 | Primary goal | Full CNI + IPv6-only support | Expose/connect services to tailnet | Transparent encryption for existing CNI | Transparent encryption for Calico | Multi-site WG overlay |
 | CNI plugin | Yes (standalone) | No (uses existing) | No (is Cilium) | No (is Calico) | Optional |
-| IPv6-only cluster support | First-class | N/A | Dual-stack only | Dual-stack only | Dual-stack only |
+| IPv6-only cluster support | First-class target | N/A | Version/mode dependent | Version/mode dependent | Topology dependent |
 | NAT64/DNS64 | Built-in | No | No | No | No |
 | CLAT per-pod | Yes | No | No | No | No |
 | Mesh scope | Full cluster + external | Service-level proxies | Node-to-node | Node-to-node | Cross-site |
@@ -1047,12 +1060,15 @@ network fabric level, with IPv6-only as the primary design target.
 |------|----------|-----------|---------|
 | 51820 | UDP | Node-to-node | WireGuard mesh traffic |
 | 53 | UDP/TCP | Pod-to-CoreDNS | DNS resolution |
-| 443 | TCP | Agent-to-API | Kubernetes API (CRD operations) |
+| 443 (svc) / 6443 (common control-plane endpoint) | TCP | Agent-to-API | Kubernetes API (CRD operations) |
 
 ## Appendix C: Kernel Requirements
 
-- Linux >= 5.6 (native WireGuard module) or wireguard-go fallback
-- IPv6 enabled (`net.ipv6.conf.all.disable_ipv6 = 0`)
-- IP forwarding (`net.ipv6.conf.all.forwarding = 1`)
-- eBPF support (for NAT64 and policy enforcement)
-- TUN/TAP support (for CLAT)
+For the target data plane in this document:
+
+- Nodes MUST run Linux >= 5.6 (native WireGuard module) or provide a validated
+  fallback path.
+- Nodes MUST have IPv6 enabled (`net.ipv6.conf.all.disable_ipv6 = 0`).
+- Nodes MUST have IP forwarding enabled (`net.ipv6.conf.all.forwarding = 1`).
+- Nodes SHOULD provide eBPF support (for NAT64 and policy enforcement).
+- Nodes MUST provide TUN/TAP support (for CLAT).

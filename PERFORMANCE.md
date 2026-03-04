@@ -2,6 +2,13 @@
 
 > How Wirescale achieves wire-speed IPv4/IPv6 throughput on an IPv6-only
 > underlay with WireGuard encryption and NAT64/CLAT translation.
+>
+> Status: performance design and target guidance. Numeric values without a
+> benchmark citation should be treated as estimates/targets, not guaranteed
+> production measurements.
+>
+> Normative language: MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are to be
+> interpreted as described in RFC 2119 and RFC 8174 when shown in all caps.
 
 ---
 
@@ -95,13 +102,14 @@ With Big TCP GSO (512KB, ~340:1):
   2,388 superpackets/sec × 300 ns/packet = 0.7 ms of CPU/sec = trivial
 ```
 
-The CPU spends nearly zero time on encryption overhead when GSO is working.
-The bottleneck shifts to memory bandwidth and PCIe.
+When GSO is working well, encryption overhead can drop substantially and the
+bottleneck often shifts toward memory bandwidth and PCIe.
 
 ### Threaded NAPI: Unlocking Multi-Core
 
-Vanilla kernel WireGuard uses a single NAPI instance per interface, which
-serializes all RX processing onto one CPU. At ~180 kpps this core saturates.
+On older kernels, WireGuard RX processing can bottleneck in a single poll
+context. Newer kernels improve this behavior; validate against your target
+kernel before assuming single-core limits.
 
 **Wirescale enables threaded NAPI on every `wg0` interface:**
 
@@ -116,19 +124,19 @@ that the scheduler can migrate across cores.
 - 16 tunnels, 32 cores, standard NAPI: ~13 Gbps
 - 16 tunnels, 32 cores, threaded NAPI: **~48 Gbps** (3.7x)
 
-The wirescale-agent enables threaded NAPI automatically at boot.
+Target behavior: wirescale-agent enables threaded NAPI at boot (implementation
+status depends on release).
 
 ### Multi-Tunnel Scaling
 
 For clusters with many nodes, the mesh naturally creates multiple WireGuard
-peers per node. Each peer's encryption worker is pinned to a different CPU
-core by the kernel. With N peers, encryption work distributes across up to
-N cores.
+peers per node. Encryption and packet processing work can distribute across
+multiple cores, subject to kernel scheduler behavior and workload mix.
 
 On a node with 16 peers (16 remote nodes) and 32 available cores:
-- Each peer's TX encryption runs on a dedicated core
-- RX decryption uses padata to fan out across all cores
-- Aggregate throughput: **up to 48 Gbps** (threaded NAPI)
+- TX/RX work can spread across many cores
+- Aggregate throughput can increase substantially with threaded NAPI
+- Use local benchmarks to determine realistic ceilings
 
 For single-peer scenarios (e.g., a two-node cluster), the single-core
 encryption limit applies (~3-10 Gbps depending on CPU). The Netdev 0x18
@@ -137,7 +145,7 @@ single-peer encryption.
 
 ### Bypass Conntrack
 
-If nf_conntrack is loaded, every packet traverses the conntrack hash table.
+If packets traverse conntrack hooks, they incur conntrack lookup cost.
 For WireGuard traffic that doesn't need NAT on the outer UDP:
 
 ```bash
@@ -163,9 +171,9 @@ flow, saving ~100 ns per packet.
 
 ### Why TC eBPF, Not XDP
 
-XDP runs at the NIC driver level before sk_buff allocation -- it is the
-fastest eBPF hook point. However, **XDP cannot be used for NAT64
-translation on WireGuard interfaces** for three reasons:
+XDP runs at the NIC driver level before sk_buff allocation and is typically
+the fastest eBPF hook point. For this design, translation is done in TC on
+virtual/tunnel paths for three reasons:
 
 1. WireGuard's `wg0` is a virtual L3 device with no Ethernet header. XDP
    programs that parse `struct ethhdr` will fault.
@@ -176,9 +184,9 @@ translation on WireGuard interfaces** for three reasons:
    WireGuard driver doesn't guarantee. TC's `bpf_skb_change_proto()`
    handles this correctly.
 
-**TC eBPF (clsact qdisc) on `wg0` is the correct and optimal hook.**
-It fires immediately after WireGuard decrypts the inner packet -- one
-eBPF program call, one redirect, no additional kernel stack traversal.
+**TC eBPF (clsact qdisc) on the `nat64` interface is the canonical hook in this
+document.** It keeps translation logic on one explicit path and avoids
+virtual-device XDP caveats.
 
 ### Where XDP IS Used
 
@@ -190,14 +198,14 @@ XDP runs on the **physical NIC** (`eth0`) for:
 This protects the WireGuard crypto path from being overwhelmed by junk
 traffic at up to 26 Mpps per core.
 
-### NAT64 eBPF Program (TC on wg0 Ingress)
+### NAT64 eBPF Program (TC on nat64 Interface Ingress)
 
-The NAT64 translation program attaches to `wg0`'s TC ingress hook. It
-intercepts packets destined for `64:ff9b::/96` (the NAT64 prefix) after
-WireGuard decrypts them:
+The NAT64 translation program attaches to the `nat64` interface TC ingress
+hook. Host routing sends packets destined for `64:ff9b::/96` to this
+interface:
 
 ```
-wg0 receives decrypted IPv6 packet
+nat64 interface receives IPv6 packet
   |
   | TC ingress eBPF fires
   v
@@ -308,8 +316,8 @@ Wire (IPv4 packet, source = node's IPv4)
 ```
 
 **Total eBPF programs in path: 2** (CLAT on veth + NAT64 on nat64 iface)
-**Total kernel stack traversals: 1** (routing decision)
-**Total copies: 0 extra** (all in-place sk_buff manipulation)
+**Kernel stack traversals:** minimal in this design (validate with tracing)
+**Copy behavior:** optimized for in-place sk_buff manipulation where possible
 
 ### Complete Fast Path (Pod-to-Pod Cross-Node, IPv6 Native)
 
@@ -423,7 +431,7 @@ net.ipv6.conf.default.forwarding = 1
 ### BPF JIT
 
 ```bash
-# eBPF JIT compilation -- mandatory for performance
+# eBPF JIT compilation -- strongly recommended for production datapaths
 net.core.bpf_jit_enable = 1
 ```
 
@@ -445,8 +453,9 @@ for q in /sys/class/net/eth0/queues/rx-*/rps_flow_cnt; do
 done
 ```
 
-For NICs with hardware RSS (Intel E810, Mellanox ConnectX), configure the
-RSS hash to include the inner WireGuard flow where supported:
+For NICs with hardware RSS (Intel E810, Mellanox ConnectX), configure RSS for
+outer UDP WireGuard tuples by default; document vendor-specific inner-flow
+hashing separately if supported:
 
 ```bash
 ethtool -N eth0 rx-flow-hash udp4 sdfn    # src/dst IP + src/dst port
@@ -558,7 +567,7 @@ Inline" proposal addresses it but has not been upstreamed.
 
 ## 8. MTU Strategy
 
-MTU misconfiguration is the #1 cause of WireGuard underperformance.
+MTU misconfiguration is a common cause of WireGuard underperformance.
 Incorrect MTU causes either fragmentation (CPU-expensive) or path MTU
 black holes (connections hang).
 
@@ -568,28 +577,29 @@ black holes (connections hang).
 WireGuard outer header (over IPv6 underlay):
   IPv6 header:       40 bytes
   UDP header:         8 bytes
-  WireGuard header:   4 bytes (type + reserved)
-  WireGuard counter:  4 bytes
+  WireGuard data hdr:16 bytes (type/reserved + receiver index + counter)
   Poly1305 tag:      16 bytes
   ─────────────────────────
-  Total overhead:    72 bytes
-
-Inner packet MTU = Physical MTU - 72
+  Total overhead:    80 bytes
 ```
+
+For IPv6-underlay WireGuard paths in this architecture:
+- Inner packet MTU MUST be `Physical MTU - 80`.
+- Pod MTU SHOULD reserve additional safety margin for extension headers.
 
 ### Configuration
 
 | Physical MTU | Inner MTU (wg0) | Pod MTU (eth0) | TCP MSS |
 |-------------|----------------|---------------|---------|
-| 1500 | 1428 | 1420 (safety margin) | 1380 (IPv6 TCP) / 1360 (IPv4 via CLAT) |
-| 9000 (jumbo) | 8928 | 8920 | 8880 / 8860 |
+| 1500 | 1420 | 1412 (safety margin) | 1372 (IPv6 TCP) / 1352 (IPv4 via CLAT) |
+| 9000 (jumbo) | 8920 | 8912 | 8872 / 8852 |
 
-The pod MTU is set 8 bytes below the WireGuard inner MTU as a safety
-margin for IPv6 extension headers and CLAT overhead.
+The pod MTU SHOULD be set 8 bytes below the WireGuard inner MTU as a safety
+margin for extension headers and translation overhead.
 
 ### MSS Clamping
 
-The wirescale-agent programs MSS clamping to prevent TCP connections from
+Target behavior: wirescale-agent SHOULD program MSS clamping to prevent TCP connections from
 sending oversized segments:
 
 ```
@@ -603,16 +613,16 @@ table inet wirescale_mss {
 
 ### Jumbo Frame Recommendation
 
-For clusters with jumbo frame support, **MTU 9000 is strongly
-recommended.** The benefits compound:
+For clusters with jumbo frame support, **MTU 9000 is often beneficial.** The
+benefits can compound:
 
 1. Fewer packets per unit of data = less per-packet overhead
 2. GRO/GSO can build larger superpackets = better amortization
 3. Less CPU time in packet processing = more headroom for encryption
 4. ~15-25% throughput improvement at 10G, more at higher speeds
 
-The wirescale-agent auto-detects the physical MTU and configures wg0 and
-pod MTUs accordingly.
+Target behavior: wirescale-agent auto-detects physical MTU and configures wg0
+and pod MTUs accordingly.
 
 ---
 
