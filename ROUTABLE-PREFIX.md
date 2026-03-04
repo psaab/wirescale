@@ -6,6 +6,9 @@
 >
 > Status: design document for routable-prefix mode. Treat statements as target
 > architecture unless explicitly tied to implementation artifacts.
+>
+> Normative language: MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are to be
+> interpreted as described in RFC 2119 and RFC 8174 when shown in all caps.
 
 ---
 
@@ -635,6 +638,12 @@ When this baseline is enabled:
 - Inbound from the internet: **blocked** by default
 - Outbound from pods: **allowed** by default (can be restricted per-policy)
 
+Operational requirement:
+- Production deployments with internet-routable pod prefixes MUST enforce
+  explicit ingress policy before exposing workloads externally.
+- Platform defaults SHOULD include cluster-wide deny-baseline policy and
+  narrowly scoped allow rules.
+
 ### Ingress Firewall (eBPF on Physical NIC)
 
 In addition to per-pod policy on veths, the agent installs an XDP program
@@ -789,6 +798,11 @@ AllowedIPs = 3fff:0b::/48
 In a gateway-transit variant of `cross-site` mode, worker nodes may not need
 their own cross-site WireGuard peering. In a distributed variant, workers run
 `wg0` and peer directly with remote-site gateways.
+
+Mode requirement:
+- A deployment MUST choose one cross-site encryption topology per environment
+  (`gateway-transit` or `distributed`) and document packet-flow assumptions
+  accordingly.
 
 ### Hybrid: GUA Site + ULA Remote
 

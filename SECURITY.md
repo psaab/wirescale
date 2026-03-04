@@ -6,6 +6,9 @@
 >
 > Status: security design and implementation plan. Unless explicitly marked as
 > implemented, controls in this document should be treated as target behavior.
+>
+> Normative language: MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are to be
+> interpreted as described in RFC 2119 and RFC 8174 when shown in all caps.
 
 ---
 
@@ -48,6 +51,14 @@ Wirescale follows the zero-trust model:
   plane (CRDs, controller) only sees public keys and metadata. Private keys
   never leave node memory. A compromised API server cannot decrypt mesh
   traffic.
+
+Normative baseline for this design:
+- Inter-node data-plane traffic MUST be encrypted in full-mesh mode.
+- Workload communication SHOULD default to deny and require explicit allow.
+- Private WireGuard keys MUST remain node-local and MUST NOT be persisted in
+  control-plane resources.
+- Control-plane updates SHOULD be validated against node ownership and policy
+  invariants before enforcement.
 
 ### Layered Defense
 

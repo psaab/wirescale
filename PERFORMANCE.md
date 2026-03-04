@@ -6,6 +6,9 @@
 > Status: performance design and target guidance. Numeric values without a
 > benchmark citation should be treated as estimates/targets, not guaranteed
 > production measurements.
+>
+> Normative language: MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are to be
+> interpreted as described in RFC 2119 and RFC 8174 when shown in all caps.
 
 ---
 
@@ -578,9 +581,11 @@ WireGuard outer header (over IPv6 underlay):
   Poly1305 tag:      16 bytes
   ─────────────────────────
   Total overhead:    80 bytes
-
-Inner packet MTU = Physical MTU - 80
 ```
+
+For IPv6-underlay WireGuard paths in this architecture:
+- Inner packet MTU MUST be `Physical MTU - 80`.
+- Pod MTU SHOULD reserve additional safety margin for extension headers.
 
 ### Configuration
 
@@ -589,12 +594,12 @@ Inner packet MTU = Physical MTU - 80
 | 1500 | 1420 | 1412 (safety margin) | 1372 (IPv6 TCP) / 1352 (IPv4 via CLAT) |
 | 9000 (jumbo) | 8920 | 8912 | 8872 / 8852 |
 
-The pod MTU can be set 8 bytes below the WireGuard inner MTU as a safety
+The pod MTU SHOULD be set 8 bytes below the WireGuard inner MTU as a safety
 margin for extension headers and translation overhead.
 
 ### MSS Clamping
 
-Target behavior: wirescale-agent programs MSS clamping to prevent TCP connections from
+Target behavior: wirescale-agent SHOULD program MSS clamping to prevent TCP connections from
 sending oversized segments:
 
 ```

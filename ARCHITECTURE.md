@@ -6,6 +6,9 @@
 >
 > Status: design document. Unless explicitly linked to implementation artifacts,
 > behavior described here should be treated as target architecture.
+>
+> Normative language: MUST, MUST NOT, SHOULD, SHOULD NOT, and MAY are to be
+> interpreted as described in RFC 2119 and RFC 8174 when shown in all caps.
 
 **See also:**
 - [PERFORMANCE.md](PERFORMANCE.md) -- Line-rate performance engineering
@@ -51,18 +54,21 @@ IPv6-only infrastructure. However:
 
 ### What We Want
 
-A single operator that gives every pod in an IPv6-only Kubernetes cluster:
+A conformant Wirescale deployment SHOULD satisfy the following goals for pods
+in an IPv6-only Kubernetes cluster:
 
-1. **Native IPv6 connectivity** -- first-class, no translation
-2. **Transparent IPv4 connectivity** -- pods speak IPv4 naturally; the
-   network handles translation to/from the IPv6 underlay
-3. **Encrypted pod-to-pod mesh** -- all inter-node traffic encrypted via
-   WireGuard with zero application changes in full-mesh mode (location-aware
-   mode may use native intra-zone routing by policy)
-4. **Tailscale-like simplicity** -- a control plane that distributes keys,
-   routes, and policy; a data plane that "just works"
-5. **External mesh capability** -- connect pods to services outside the
-   cluster (other clusters, bare-metal, cloud VMs) through the same mesh
+1. **Native IPv6 connectivity** -- the data plane MUST support first-class IPv6
+   pod connectivity without translation in native paths.
+2. **Transparent IPv4 connectivity** -- the platform MUST provide an IPv4
+   compatibility path so pods can use IPv4 socket semantics over an IPv6
+   underlay.
+3. **Encrypted pod-to-pod mesh** -- in full-mesh mode, inter-node traffic MUST
+   be encrypted with WireGuard; location-aware mode MAY use native intra-zone
+   routing by policy.
+4. **Control/data simplicity** -- the architecture SHOULD keep control-plane
+   distribution (keys/routes/policy) separate from data-plane forwarding.
+5. **External mesh capability** -- deployments MAY extend the mesh to external
+   services (other clusters, bare-metal, cloud VMs).
 
 ---
 
@@ -76,7 +82,7 @@ A single operator that gives every pod in an IPv6-only Kubernetes cluster:
 | **CRD-driven configuration** | All mesh state (peers, routes, policies) is expressed as Kubernetes Custom Resources. The cluster API server IS the coordination database. |
 | **CNI-complementary, not CNI-replacing** | Wirescale can operate as a standalone CNI or as an overlay on top of an existing CNI (like Flannel or kubenet) for the intra-node path. |
 | **No additional external dependencies** | No extra coordination system beyond the Kubernetes control plane. The Kubernetes API is the source of truth for Wirescale state. |
-| **Graceful degradation** | If the controller is down, existing mesh connections persist (cached WireGuard config). New nodes wait until the controller recovers. |
+| **Graceful degradation** | If the controller is down, existing mesh connections SHOULD persist (cached WireGuard config). New nodes MAY wait until the controller recovers. |
 
 ---
 
@@ -1058,8 +1064,11 @@ network fabric level, with IPv6-only as the primary design target.
 
 ## Appendix C: Kernel Requirements
 
-- Linux >= 5.6 (native WireGuard module) or wireguard-go fallback
-- IPv6 enabled (`net.ipv6.conf.all.disable_ipv6 = 0`)
-- IP forwarding (`net.ipv6.conf.all.forwarding = 1`)
-- eBPF support (for NAT64 and policy enforcement)
-- TUN/TAP support (for CLAT)
+For the target data plane in this document:
+
+- Nodes MUST run Linux >= 5.6 (native WireGuard module) or provide a validated
+  fallback path.
+- Nodes MUST have IPv6 enabled (`net.ipv6.conf.all.disable_ipv6 = 0`).
+- Nodes MUST have IP forwarding enabled (`net.ipv6.conf.all.forwarding = 1`).
+- Nodes SHOULD provide eBPF support (for NAT64 and policy enforcement).
+- Nodes MUST provide TUN/TAP support (for CLAT).
