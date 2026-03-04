@@ -3,6 +3,9 @@
 > Zero-trust network security with identity-aware dynamic access control,
 > inspired by Tailscale's ACL model and adapted for Kubernetes-native
 > policy enforcement.
+>
+> Status: security design and implementation plan. Unless explicitly marked as
+> implemented, controls in this document should be treated as target behavior.
 
 ---
 
@@ -30,18 +33,18 @@
 Traditional network security draws a perimeter and trusts everything inside.
 Wirescale follows the zero-trust model:
 
-- **Every inter-node packet is encrypted** -- WireGuard provides
+- **Target: every inter-node packet is encrypted** -- WireGuard provides
   authenticated encryption (ChaCha20-Poly1305) for all traffic leaving a
   node. There is no "trusted zone."
-- **Identity is cryptographic, not network-based** -- a pod's identity
+- **Target: identity is cryptographic, not network-based** -- a pod's identity
   derives from its Kubernetes ServiceAccount, namespace, and labels, bound
   to the WireGuard key of the node it runs on. IP addresses are ephemeral
   identifiers, not trust anchors.
-- **Policy is deny-by-default** -- no pod can communicate with another pod
+- **Target: policy is deny-by-default** -- no pod can communicate with another pod
   unless an explicit policy permits it. The default posture is full isolation.
-- **Enforcement is distributed** -- every node enforces policy locally via
+- **Target: enforcement is distributed** -- every node enforces policy locally via
   eBPF. There is no central chokepoint that can be bypassed.
-- **Control plane compromise doesn't expose data plane** -- the control
+- **Conditional: control plane compromise doesn't expose data plane** -- the control
   plane (CRDs, controller) only sees public keys and metadata. Private keys
   never leave node memory. A compromised API server cannot decrypt mesh
   traffic.
@@ -64,7 +67,7 @@ Layer 3: Dynamic Access Control (identity-aware)
          - Time-bounded access grants
          - Automatic policy recomputation on pod lifecycle events
 
-Layer 4: Audit Trail (non-repudiation)
+Layer 4: Audit Trail (attribution and forensics)
          - Connection logging with identity attribution
          - Policy decision logging
          - Key lifecycle events
@@ -159,7 +162,8 @@ Node keypair (generated at boot, ephemeral):
 Trust anchor: Kubernetes RBAC
   - Only authenticated nodes with the wirescale-agent ServiceAccount
     can create/update WirescaleNode CRDs
-  - RBAC policy: agents can only write their own node's CRD
+  - RBAC policy should constrain agents to their own node CRD; if RBAC is
+    broader, admission/controller checks must enforce ownership
   - Controller validates CRD updates (e.g., rejects key changes
     from a different node IP than expected)
 ```
@@ -174,7 +178,7 @@ Pod identity is established by:
   4. wirescale-agent binds: IP <-> (namespace, SA, labels, node)
 
 The binding is authoritative because:
-  - Only kubelet on node-N can create pods with IPs from node-N's CIDR
+  - CNI/IPAM policy must ensure pod IPs from node-N CIDR are only assigned on node-N
   - WireGuard guarantees packets from node-N's CIDR come from node-N
   - Therefore: src IP -> node (WireGuard) -> pod identity (agent)
 ```
@@ -273,7 +277,7 @@ in the agent, for three reasons:
   while others enforce the new one. This is acceptable because:
   - The old policy was already secure (deny-by-default)
   - The new policy only adds or removes allow rules
-  - At no point is a pod "unprotected"
+  - Temporary skew windows are possible and must be monitored/alerted
 - **Generation counter:** Each compiled policy set carries a monotonically
   increasing generation number. Agents report the generation they're
   enforcing. The controller can detect and alert on stale agents.
@@ -287,7 +291,8 @@ in the agent, for three reasons:
 
 ### Kubernetes NetworkPolicy (Native Support)
 
-Wirescale fully implements the standard Kubernetes NetworkPolicy API.
+Wirescale targets full compatibility with the standard Kubernetes
+NetworkPolicy API; implementation status is tracked in Section 12.
 Existing policies work without modification:
 
 ```yaml
@@ -432,7 +437,7 @@ spec:
 #### Default Deny with Explicit Allow
 
 ```yaml
-# Deny all ingress/egress for the namespace (applied first)
+# Namespace deny baseline (order-independent under additive policy semantics)
 apiVersion: wirescale.io/v1alpha1
 kind: WirescalePolicy
 metadata:
@@ -705,13 +710,13 @@ Option B: Emergency revocation
   1. kubectl delete wirescalenode <name>
   2. All agents remove the peer within seconds (watch latency)
   3. Node's private key is useless -- no peer accepts it
-  4. Even cached WireGuard sessions time out (2 min handshake timeout)
+  4. Existing sessions expire on WireGuard timer cadence (on the order of minutes)
 
 Option C: Key rotation (suspected partial compromise)
   1. Agent on the suspect node generates new keypair
   2. Updates WirescaleNode CRD with new public key
   3. All peers update to the new key
-  4. Old key immediately invalid (WireGuard rejects handshakes)
+  4. Old key transitions through a short grace window, then becomes invalid
 ```
 
 ### Admission Webhook (Optional, Hardened Mode)
@@ -757,8 +762,8 @@ Initiator (node A) -> Responder (node B):
 1. A encrypts (A's static pubkey) with B's static pubkey
    B decrypts and learns A's identity
 
-2. B encrypts (B's static pubkey, ephemeral pubkey) with A's static pubkey
-   A decrypts and confirms B's identity
+2. B responds with its ephemeral key and encrypted key confirmation
+   (B's static key is proven via the Noise transcript, not sent as plaintext)
 
 3. Both derive session keys from the shared secret
 
@@ -978,9 +983,9 @@ TIMESTAMP           ACTION  SRC                 DST                 PORT  POLICY
 | T2 | Rogue node joins mesh | Unauthorized access to all pods | Node admission via RBAC + optional webhook attestation |
 | T3 | Compromised node | Full access to pods on that node + mesh traffic | Key revocation (CRD delete); blast radius limited to that node's pods; inter-node traffic from other nodes is still encrypted |
 | T4 | API server compromise | Can modify policies, CRDs | Data plane traffic still encrypted (no private keys in API). Attacker can weaken policies but cannot passively decrypt. |
-| T5 | wirescale-controller compromise | Can weaken policies, redirect traffic | Controller has no private keys. Agents validate CRD consistency. Anomaly detection alerts on mass policy changes. |
+| T5 | wirescale-controller compromise | Can weaken policies, redirect traffic | Controller has no private keys. Agents validate CRD consistency. Anomaly detection should alert on mass policy changes (planned). |
 | T6 | Pod breakout (container escape) | Access to host network namespace | WireGuard encrypts cross-node traffic; attacker can only see traffic to/from pods on the same node. eBPF policies still enforce at the veth level. |
-| T7 | DNS poisoning | Traffic misdirection | MagicDNS responses are signed by the control plane. External DNS validated by DNSSEC where available. NAT64 prefix is hardcoded, not DNS-dependent. |
+| T7 | DNS poisoning | Traffic misdirection | Harden resolver path and DNS integrity checks (design target). NAT64 prefix mapping remains deterministic when used. |
 | T8 | DDoS against WireGuard endpoint | Service disruption | Rate limiting on handshake processing (WireGuard built-in cookie mechanism). XDP early drop on physical NIC. |
 | T9 | Key exfiltration from node memory | Impersonation | Keys are ephemeral (auto-rotated). Forward secrecy per-session. Process memory is not persisted. |
 | T10 | Replay attack | Traffic replay | WireGuard uses monotonic counters per session. Replayed packets are rejected. |
@@ -1085,7 +1090,8 @@ rules:
   - apiGroups: [""]
     resources: ["configmaps"]
     verbs: ["get", "watch"]
-    resourceNames: ["wirescale-policy-*"]
+    # resourceNames must be explicit names (wildcards are not supported by RBAC)
+    resourceNames: ["wirescale-policy-worker-1"]
 
 ---
 # wirescale-controller permissions

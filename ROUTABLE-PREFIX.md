@@ -3,6 +3,9 @@
 > What changes when every host in the fleet owns a dedicated /64 from
 > globally routable address space, and how Wirescale adapts its
 > architecture to exploit native IPv6 reachability.
+>
+> Status: design document for routable-prefix mode. Treat statements as target
+> architecture unless explicitly tied to implementation artifacts.
 
 ---
 
@@ -31,21 +34,23 @@
 Every host in the fleet receives a dedicated **/64 prefix** from globally
 routable IPv6 address space (GUA -- Global Unicast Addresses, `2000::/3`).
 Every pod on that host gets an address from the host's /64. These addresses
-are routable on the internet without NAT, without tunnels, without overlays.
+are internet-routable when route advertisement and perimeter policy allow it,
+without NAT, tunnels, or overlays in the same-site native path.
 
 ```
-Site allocation:     3fff:site::/48     (65,536 /64s available)
-  Host worker-1:     3fff:site:0001::/64
-    Pod A:           3fff:site:0001::a/128
-    Pod B:           3fff:site:0001::b/128
-  Host worker-2:     3fff:site:0002::/64
-    Pod C:           3fff:site:0002::1/128
-  Host worker-3:     3fff:site:0003::/64
+Site allocation:     2001:db8:0a00::/48     (65,536 /64s available, documentation prefix)
+  Host worker-1:     2001:db8:0a00:0001::/64
+    Pod A:           2001:db8:0a00:0001::a/128
+    Pod B:           2001:db8:0a00:0001::b/128
+  Host worker-2:     2001:db8:0a00:0002::/64
+    Pod C:           2001:db8:0a00:0002::1/128
+  Host worker-3:     2001:db8:0a00:0003::/64
     ...
 ```
 
-The /64 is the natural unit for IPv6 subnets: SLAAC mandates it, NDP
-assumes it, and switch ASICs optimize for it. A /64 provides 2^64
+The /64 is the natural operational unit for IPv6 subnets: SLAAC on standard
+Ethernet links expects a 64-bit IID, and many production designs optimize
+around /64 boundaries. NDP itself is not /64-exclusive. A /64 provides 2^64
 addresses per host -- more than enough for any conceivable pod density.
 
 ### Why This Matters
@@ -66,13 +71,13 @@ With globally routable pod addresses:
 
 ## 2. What Changes from the Base Architecture
 
-The base ARCHITECTURE.md assumed ULA addresses (`fd00:ws::/48`) with a
+The base ARCHITECTURE.md assumed ULA addresses (`fd12:3456:7800::/48`) with a
 WireGuard overlay providing both reachability and encryption. The /64-per-
 host model fundamentally restructures the data plane:
 
 | Aspect | Base (ULA + WG Overlay) | /64-per-Host (GUA + Native Routing) |
 |--------|------------------------|--------------------------------------|
-| Pod IPv6 addresses | ULA (`fd00:ws:N::P`) | GUA (`3fff:site:N::P`) |
+| Pod IPv6 addresses | ULA (`fd12:3456:7800:N::P`) | GUA (`2001:db8:0a00:N::P`) |
 | Inter-node reachability | WireGuard tunnel | Native IP routing (BGP) |
 | Encryption | Always (WireGuard) | Selective (WireGuard when needed) |
 | Internet reachability | Via NAT64 gateway | Direct (pods are globally routable) |
@@ -112,22 +117,25 @@ UNCHANGED:
 ### Allocation Hierarchy
 
 ```
-RIR/LIR allocation:     3fff::/32          (provider allocation)
-  Site A (DC-East):      3fff:0a::/48       (65,536 /64s)
-    Rack /64s:           3fff:0a:ff00::/56  (256 /64s, one per rack)
-      Rack 1:            3fff:0a:ff01::/64  (shared L2, all hosts in rack)
-      Rack 2:            3fff:0a:ff02::/64
+Documentation prefix:    3fff:0a00::/48      (example only; replace in production)
+  Site A (DC-East):      3fff:0a00::/48      (65,536 /64s)
+    Rack /64s:           3fff:0a00:ff00::/56 (256 /64s, one per rack)
+      Rack 1:            3fff:0a00:ff01::/64 (shared L2, all hosts in rack)
+      Rack 2:            3fff:0a00:ff02::/64
       ...
-    Pod /64s:            3fff:0a:0000::/52  (4,096 /64s, one per host)
-      worker-1:          3fff:0a:0001::/64
-      worker-2:          3fff:0a:0002::/64
+    Pod /64s:            3fff:0a00:0000::/52 (4,096 /64s, one per host)
+      worker-1:          3fff:0a00:0001::/64
+      worker-2:          3fff:0a00:0002::/64
       ...
-      worker-4096:       3fff:0a:1000::/64
-    Services:            3fff:0a:f000::/52  (service VIPs)
+      worker-4096:       3fff:0a00:0fff::/64
+    Services:            3fff:0a00:f000::/52 (service VIPs)
 
-  Site B (DC-West):      3fff:0b::/48
+  Site B (DC-West):      3fff:0b00::/48
     ...
 ```
+
+`3fff::/20` is currently designated for documentation/example usage. Replace
+the example block above with provider-assigned production GUA ranges.
 
 ### Dual-Address Model: Rack /64 + Pod /64
 
@@ -405,7 +413,7 @@ The `encrypt_map` is populated by the agent based on policy:
 |-------------------|----------|--------|
 | Same site /48 | No (default) | Trusted fabric |
 | Remote site /48 | Yes | Cross-site = untrusted transit |
-| External (::/0) | No | Already TLS, no benefit |
+| External (::/0) | Policy-dependent | TLS may protect payload, but transport encryption requirements vary |
 | Specific pod CIDR | Yes | Policy override (sensitive workload) |
 
 ### WireGuard Configuration (Encryption-Only Mode)
@@ -564,22 +572,23 @@ Pod (3fff:0a:0001::a) -> connect to [2607:f8b0:4004::200e]:443 (google.com)
   -> Return traffic routes directly back to pod
 ```
 
-**Zero overhead for IPv6-to-IPv6 communication.** This is the primary
+**No translation overhead for IPv6-to-IPv6 communication.** This is the primary
 performance benefit of globally routable pods.
 
 ### Inbound IPv4 to Pods
 
-For services that need to accept IPv4 connections from the internet, a
-dedicated NAT64 ingress gateway translates inbound IPv4 to the pod's GUA
+For services that need to accept IPv4 connections from the internet, use a
+dedicated IPv4/IPv6 edge translator (for example NAT46/SIIT-DC/reverse proxy)
+to translate inbound IPv4 to the pod's GUA
 IPv6:
 
 ```
-Internet client (93.184.216.1) -> NAT64 gateway IPv4 VIP
-  -> NAT64: embed client IPv4 in 64:ff9b::
+Internet client (93.184.216.1) -> edge gateway IPv4 VIP
+  -> IPv4/IPv6 translation at edge (deployment-specific mechanism)
   -> Forward to pod's GUA IPv6 address
-  -> Pod receives connection from 64:ff9b::5db8:d801
-  -> Pod responds (IPv6 to 64:ff9b:: prefix)
-  -> NAT64 gateway translates back to IPv4
+  -> Pod receives connection from translated IPv6 source per edge policy
+  -> Pod responds (IPv6 return path through edge translator)
+  -> Edge gateway translates back to IPv4
   -> Internet client receives response
 ```
 
@@ -594,16 +603,17 @@ connect directly to the pod's GUA address.
 
 With ULA pods behind a WireGuard overlay, pods are invisible to the
 internet by construction. With GUA pods, **every pod is reachable from
-the internet** unless firewalled. This makes policy enforcement not just
+the internet** unless routing and firewalls block it. This makes policy
+enforcement not just
 important but **mandatory for basic security.**
 
 ### Mandatory Default-Deny
 
-Wirescale in GUA mode **automatically installs a default-deny ingress
-policy** for all pods. This is not optional:
+Recommended baseline in GUA mode: install a cluster-wide default-deny ingress
+policy for all pods:
 
 ```yaml
-# Auto-generated by wirescale-controller at cluster init
+# Example baseline policy (cluster operator applied)
 apiVersion: wirescale.io/v1alpha1
 kind: WirescalePolicy
 metadata:
@@ -619,7 +629,7 @@ spec:
   # No ingress rules = deny all inbound by default
 ```
 
-This means:
+When this baseline is enabled:
 - Pod-to-pod communication within the cluster: **blocked** until explicitly
   allowed by a WirescalePolicy or NetworkPolicy
 - Inbound from the internet: **blocked** by default
@@ -776,9 +786,9 @@ Endpoint = [3fff:0b:ff02::11]:51820  # Site B rack 2 address
 AllowedIPs = 3fff:0b::/48
 ```
 
-Worker nodes don't need WireGuard at all (in `cross-site` encryption
-mode). Cross-site traffic is routed via BGP to the local gateway, which
-encrypts and forwards.
+In a gateway-transit variant of `cross-site` mode, worker nodes may not need
+their own cross-site WireGuard peering. In a distributed variant, workers run
+`wg0` and peer directly with remote-site gateways.
 
 ### Hybrid: GUA Site + ULA Remote
 
@@ -1021,7 +1031,7 @@ Routing: Cloud provider fabric (ENI prefix delegation on AWS,
          /96 from subnet on GCP, or custom routes via cloud API)
 Encryption: always or cross-VPC (cloud fabric may not be trusted)
 IPv4: Dual-stack via cloud provider + NAT64 for gaps
-MTU: 1500 (cloud MTU limitation) or 8996 (jumbo in AWS)
+MTU: 1500 (common cloud default) or up to 9001 on AWS ENA (environment-dependent)
 
 Note: Not all clouds support /64-per-host. AWS gives /80 per ENI.
       GCP gives /96 per NIC. Wirescale adapts to whatever prefix
