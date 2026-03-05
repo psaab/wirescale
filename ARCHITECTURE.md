@@ -149,7 +149,7 @@ flat mesh designs.
 |                                                                         |
 |  Maps: cluster_id -> {                                                  |
 |    gateway_endpoints,                                                   |
-|    prefix_allocation,   (e.g., 3fff:1d:0001::/32)                       |
+|    prefix_allocation,   (e.g., 3fff:1234:0001::/48)                       |
 |    cluster_CA_cert,                                                     |
 |    controller_endpoint,                                                 |
 |    metadata                                                             |
@@ -342,7 +342,7 @@ gRPC over mTLS.
 
 **Peer Broker** -- on-demand peer discovery:
 - When node-A needs encrypted traffic to node-B, it queries control:
-  "I need the peer info for the node owning prefix `3fff:1d:0001:002a::/64`"
+  "I need the peer info for the node owning prefix `3fff:1234:0001:002a::/64`"
 - Control authenticates the request, checks authorization, and returns:
   `{publicKey, endpoint, allowedIPs, token, TTL}`
 - Node-A configures a WireGuard peer with the returned parameters.
@@ -351,7 +351,7 @@ gRPC over mTLS.
   MUST re-validate before TTL expiry or on next cache miss.
 
 **Identity Service** -- pod identity resolution:
-- Agents query control to resolve: "Who owns IP `3fff:1d:0001:0003::7`?"
+- Agents query control to resolve: "Who owns IP `3fff:1234:0001:0003::7`?"
 - Control returns: `{namespace, serviceAccount, labels, nodeName}`
 - Agents cache identity responses locally (default TTL 60s).
 - Control is the only component that subscribes to global Pod events
@@ -410,7 +410,7 @@ On startup:
 6. Program kernel routes:
    - Intra-cluster: /64 routes for active local peers (on demand)
    - Cross-cluster: aggregate routes for each known remote cluster,
-     pointing to local signaling gateway
+     pointing to `ws-resolve0` dummy interface for agent interception
 7. Create `nat64` interface for NAT64 translation
 8. Start CLAT engine for per-pod IPv4 address provision
 
@@ -421,6 +421,10 @@ The agent MUST NOT watch all `WirescaleNode` CRDs. It watches only its own
 ```
 Packet destined for remote pod arrives at egress path:
   1. eBPF checks encrypt_map -> encryption required for destination /64
+     - ULA overlay mode: default entry encrypts ALL traffic (encrypt 0::/0)
+     - Routable-prefix mode: per-destination entries populated by policy
+       (see ROUTABLE-PREFIX.md Section 6). Traffic to destinations with no
+       encrypt_map entry is forwarded via native routing, unencrypted.
   2. If WireGuard peer exists for destination /64:
        forward through wg0 (warm path, zero additional latency)
   3. If no WireGuard peer for destination /64:
@@ -436,17 +440,26 @@ Packet destined for remote pod arrives at egress path:
        - Track last handshake time per peer
        - If no traffic for peer_idle_timeout (default 300s): remove peer
        - Next packet to that destination re-triggers step 3 (cache-miss path)
+       Note: the idle timeout SHOULD be set higher than the longest expected
+       application-level keep-alive interval. TCP keep-alive traffic resets
+       the idle timer, so connections with keep-alives shorter than the
+       timeout are unaffected.
 ```
 
 **Cross-cluster aggregate route handling:**
 When a packet matches an aggregate route for a remote cluster (no specific
 /64 peer route exists yet):
-1. The packet is intercepted by the agent (or forwarded to the signaling
-   gateway first, which hands it to the agent)
-2. The agent queries wirescale-control for the specific remote node
-3. A direct WireGuard tunnel is established to the remote node
-4. A specific /64 route is installed, overriding the aggregate route
-5. All subsequent traffic flows directly -- the gateway is bypassed
+1. The aggregate route's next-hop is a local dummy interface (`ws-resolve0`)
+   that the agent's eBPF program intercepts. The signaling gateway is never
+   in the data forwarding path, even for the first packet.
+2. The agent queues the packet (same bounded buffer as step 3 above) and
+   queries wirescale-control for the specific remote node
+3. Control proxies the request through the directory to the remote cluster's
+   controller, which returns the target node's endpoint and public key
+4. A direct WireGuard tunnel is established to the remote node
+5. A specific /64 route is installed, overriding the aggregate route
+6. Queued packets drain through the new tunnel. All subsequent traffic flows
+   directly -- the gateway is bypassed
 
 **Identity cache:**
 The agent maintains a local TTL-based cache of pod identities. On cache miss,
@@ -501,11 +514,11 @@ into per-cluster prefixes, which are further subdivided into per-host prefixes.
 This enables route aggregation at cluster boundaries.
 
 ```
-Federation prefix:   3fff:1d::/20              (configurable, from RFC 9637 space)
+Organization prefix: 3fff:1234::/32              (from RFC 9637 documentation space)
                      |
   +------------------+------------------+
   |                                     |
-Cluster 1:           3fff:1d:0001::/32  Cluster 2:           3fff:1d:0002::/32
+Cluster 1:           3fff:1234:0001::/48  Cluster 2:           3fff:1234:0002::/48
   |                                       |
   +------+------+                         +------+------+
   |      |      |                         |      |      |
@@ -514,25 +527,27 @@ Host 1  Host 2  Host N                  Host 1  Host 2  Host N
  /64     /64     /64                     /64     /64     /64
 ```
 
-**Federation level:**
-- The global directory allocates a `/32` (or configurable prefix length) per
-  cluster from the federation's address space.
-- Example: federation uses `3fff:1d::/20`, Cluster 1 gets `3fff:1d:0001::/32`,
-  Cluster 2 gets `3fff:1d:0002::/32`.
-- This allows up to 4096 clusters per `/20` (12 bits of cluster space in a /32).
+**Organization level:**
+- The global directory allocates a `/48` per cluster from the organization's
+  `/32` address space.
+- Example: organization uses `3fff:1234::/32`, Cluster 1 gets `3fff:1234:0001::/48`,
+  Cluster 2 gets `3fff:1234:0002::/48`.
+- This allows up to 65,536 clusters per `/32` (16 bits of cluster space).
+- `3fff::/20` is designated for documentation/example usage (RFC 9637).
+  Production deployments use real GUA allocations.
 
 **Cluster level:**
-- Each cluster's `/32` provides 32 bits of host space (2^32 possible /64
-  allocations) -- far more than any single cluster would need.
+- Each cluster's `/48` provides 16 bits of host space (65,536 possible /64
+  allocations) -- sufficient for even the largest clusters.
 - Each host is allocated a `/64` from its cluster's prefix.
-- Example: Cluster 1, Host 42 = `3fff:1d:0001:002a::/64`
+- Example: Cluster 1, Host 42 = `3fff:1234:0001:002a::/64`
 - Pods on Host 42 receive /128 addresses from that /64.
 
 **Routing implications:**
 - Intra-cluster: O(hosts_in_cluster) /64 routes -- one per host, programmed
   on demand as peers are established.
 - Cross-cluster: O(clusters) aggregate routes -- one per remote cluster,
-  pointing to the local signaling gateway (or directly to known peers).
+  pointing to a local dummy interface (`ws-resolve0`) for agent interception.
 - A node in a 10K-node cluster with 200 remote clusters has at most ~10,200
   route entries (most programmed on demand), compared to hundreds of thousands
   in a flat model.
@@ -540,11 +555,11 @@ Host 1  Host 2  Host N                  Host 1  Host 2  Host N
 ### IPv6 Addressing (Primary)
 
 ```
-Federation prefix:    3fff:1d::/20              (ULA/documentation, configurable)
-Cluster allocation:   3fff:1d:CCCC::/32         (C = cluster index)
-Per-node allocation:  3fff:1d:CCCC:HHHH::/64    (H = host index within cluster)
-Pod address:          3fff:1d:CCCC:HHHH::P/128  (P = pod index within node)
-Service CIDR:         3fff:1d:CCCC:ffff::/108    (per-cluster)
+Organization prefix:  3fff:1234::/32              (RFC 9637 documentation space)
+Cluster allocation:   3fff:1234:CCCC::/48         (C = cluster index)
+Per-node allocation:  3fff:1234:CCCC:HHHH::/64    (H = host index within cluster)
+Pod address:          3fff:1234:CCCC:HHHH::P/128  (P = pod index within node)
+Service CIDR:         3fff:1234:CCCC:ffff::/108    (per-cluster)
 ```
 
 All pod-to-pod, pod-to-service, and pod-to-external communication uses IPv6
@@ -570,11 +585,17 @@ These IPv4 addresses exist only within the WireGuard mesh. They are never
 exposed on the physical network. The mapping is:
 
 ```
-Pod IPv4: 100.64.N.P  <-->  Pod IPv6: 3fff:1d:CCCC:N::P
+Pod IPv4: 100.64.N.P  <-->  Pod IPv6: 3fff:1234:CCCC:N::P
 ```
 
 This deterministic mapping enables stateless translation between the two
-address families within the mesh.
+address families within the mesh. Because the CGNAT IPv4 range lacks bits to
+encode a cluster ID, these IPv4 addresses are **cluster-scoped**: two
+clusters MAY each assign `100.64.1.5`, but those addresses refer to
+different pods. Cross-cluster pod-to-pod communication MUST use IPv6
+addresses. Applications that require cross-cluster IPv4 reachability
+SHOULD use NAT64 (embedding the remote pod's IPv6 address via
+`64:ff9b::/96`) rather than the CLAT address.
 
 ### NAT64 Prefix
 
@@ -591,40 +612,40 @@ embedded in the last 32 bits: `64:ff9b::1.2.3.4`.
 +------------------+-----------------------------+---------------------------+
 | Purpose          | IPv6                        | IPv4                      |
 +------------------+-----------------------------+---------------------------+
-| Federation pfx   | 3fff:1d::/20                | (none)                    |
-| Cluster alloc    | 3fff:1d:CCCC::/32           | (none)                    |
-| Pod addressing   | 3fff:1d:CCCC:N::P/128       | 100.64.N.P/32             |
-| Service VIPs     | 3fff:1d:CCCC:ffff::/108     | 100.64.255.0/24 (opt.)    |
+| Organization pfx | 3fff:1234::/32                | (none)                    |
+| Cluster alloc    | 3fff:1234:CCCC::/48           | (none)                    |
+| Pod addressing   | 3fff:1234:CCCC:N::P/128       | 100.64.N.P/32             |
+| Service VIPs     | 3fff:1234:CCCC:ffff::/108     | 100.64.255.0/24 (opt.)    |
 | WireGuard endpt  | <node phys IPv6>:51820      | (none - IPv6 underlay)    |
 | External v4 dst  | 64:ff9b::<ipv4>/128         | (translated at egress)    |
-| DNS resolver     | 3fff:1d:CCCC::64/128        | 100.100.100.100 (compat)  |
+| DNS resolver     | 3fff:1234:CCCC::64/128        | 100.100.100.100 (compat)  |
 +------------------+-----------------------------+---------------------------+
 ```
 
 ### Aggregate Route Table (Per-Node Example)
 
-A node in Cluster 1 (3fff:1d:0001::/32) with 3 active intra-cluster peers
+A node in Cluster 1 (3fff:1234:0001::/48) with 3 active intra-cluster peers
 and 2 known remote clusters:
 
 ```
 # Intra-cluster: specific /64 routes (on-demand, only for active peers)
-3fff:1d:0001:0005::/64  dev wg0 peer=worker-5    # active peer
-3fff:1d:0001:002a::/64  dev wg0 peer=worker-42   # active peer
-3fff:1d:0001:006b::/64  dev wg0 peer=worker-107  # active peer
+3fff:1234:0001:0005::/64  dev wg0 peer=worker-5    # active peer
+3fff:1234:0001:002a::/64  dev wg0 peer=worker-42   # active peer
+3fff:1234:0001:006b::/64  dev wg0 peer=worker-107  # active peer
 
 # Cross-cluster: aggregate routes (one per remote cluster)
-3fff:1d:0002::/32       via gateway0              # Cluster 2 aggregate
-3fff:1d:0003::/32       via gateway0              # Cluster 3 aggregate
+3fff:1234:0002::/48       dev ws-resolve0           # Cluster 2 aggregate
+3fff:1234:0003::/48       dev ws-resolve0           # Cluster 3 aggregate
 
 # Local
-3fff:1d:0001:0001::/64  dev cni0                  # this node's pods
+3fff:1234:0001:0001::/64  dev cni0                  # this node's pods
 
 # Default
 ::/0                    via <physical-gw>         # underlay default
 ```
 
-When a packet for `3fff:1d:0002:0017::5` arrives, it matches the Cluster 2
-aggregate route and is sent toward the gateway. The agent (or gateway)
+When a packet for `3fff:1234:0002:0017::5` arrives, it matches the Cluster 2
+aggregate route and is intercepted on `ws-resolve0`. The agent
 resolves the specific remote node, establishes a direct WireGuard tunnel,
 and installs a /64 route that overrides the aggregate for subsequent traffic.
 
@@ -750,19 +771,19 @@ PrivateKey = <generated-at-boot>
 [Peer]
 PublicKey = <from wirescale-control PeerResponse>
 Endpoint = [3fff::2a]:51820
-AllowedIPs = 3fff:1d:0001:002a::/64, 100.64.42.0/24
+AllowedIPs = 3fff:1234:0001:002a::/64, 100.64.42.0/24
 
 # Active Peer: worker-107 (established 30s ago, last handshake 5s ago)
 [Peer]
 PublicKey = <from wirescale-control PeerResponse>
 Endpoint = [3fff::6b]:51820
-AllowedIPs = 3fff:1d:0001:006b::/64, 100.64.107.0/24
+AllowedIPs = 3fff:1234:0001:006b::/64, 100.64.107.0/24
 
 # Cross-cluster Peer: cluster-2-node-23 (established 5m ago)
 [Peer]
 PublicKey = <from remote cluster's control via proxy>
 Endpoint = [3fff:e1::17]:51820
-AllowedIPs = 3fff:1d:0002:0017::/64
+AllowedIPs = 3fff:1234:0002:0017::/64
 
 # (only 3 active peers out of 10,000+ nodes across clusters)
 ```
@@ -777,7 +798,7 @@ through the same tunnel.
 - All inter-node pod traffic goes through WireGuard (encryption + routing)
 - On-demand peering: first packet to a new /64 triggers peer setup via control
 - Routes for active peers are programmed dynamically as peers are established
-- Cross-cluster aggregate routes point to local signaling gateway
+- Cross-cluster aggregate routes point to `ws-resolve0` for agent interception
 
 **Routable-prefix mode (see [ROUTABLE-PREFIX.md](ROUTABLE-PREFIX.md)):**
 - Fabric BGP routes /64 prefixes to hosts -- packets reach the right host
@@ -791,8 +812,7 @@ through the same tunnel.
 
 ```
 Physical interface MTU:  1500 (typical)
-WireGuard overhead:      60 bytes (20 IPv4 + 8 UDP + 32 WG data header/tag)
-                         80 bytes with IPv6 outer header (40 IPv6 + 8 UDP + 32 WG)
+WireGuard overhead:      80 bytes (40 IPv6 + 8 UDP + 32 WG data header/tag)
 Pod interface MTU:       1420 (1500 - 80)
 TCP MSS clamping:        1380 (1420 - 40 for IPv6 TCP header)
 ```
@@ -811,16 +831,16 @@ Each cluster designates gateway nodes (typically 2-3 for HA). Gateways handle
 the data path for established flows.
 
 ```
-Cluster 1 (3fff:1d:0001::/32)        Cluster 2 (3fff:1d:0002::/32)
+Cluster 1 (3fff:1234:0001::/48)        Cluster 2 (3fff:1234:0002::/48)
 
 +---------+                           +---------+
 | Node A  |                           | Node B  |
 | (agent) |                           | (agent) |
 +----+----+                           +----+----+
      |                                     |
-     | 1. Packet for 3fff:1d:0002::/32     |
+     | 1. Packet for 3fff:1234:0002::/48     |
      |    hits aggregate route             |
-     |    -> signaling gateway             |
+     |    -> agent intercepts (ws-resolve0)|
      |                                     |
 +----+----+                           +----+----+
 | Gateway |                           | Gateway |
@@ -851,9 +871,9 @@ Cluster 1 (3fff:1d:0001::/32)        Cluster 2 (3fff:1d:0002::/32)
 ```
 Node A (cluster 1) wants to reach Pod on Node B (cluster 2):
 
-  1. Packet matches aggregate route 3fff:1d:0002::/32 -> gateway
-  2. Agent intercepts (or gateway forwards to agent): cache miss
-  3. Agent -> local wirescale-control: "resolve 3fff:1d:0002:002a::/64"
+  1. Packet matches aggregate route 3fff:1234:0002::/48 -> ws-resolve0
+  2. Agent eBPF intercepts on ws-resolve0: cache miss, queues packet
+  3. Agent -> local wirescale-control: "resolve 3fff:1234:0002:002a::/64"
   4. Local control checks cache for cluster 2 info
      a. Cache miss: local control -> global directory: "where is cluster 2?"
      b. Global directory -> local control:
@@ -921,7 +941,7 @@ spec:
   publicKey: "YWJjZGVm..."
   endpoint: "[3fff:0f01::1]:51820"
   allowedIPs:
-    - "3fff:1d:e1:1::/64"      # External peer's subnet
+    - "3fff:1234:e1:1::/64"      # External peer's subnet
     - "100.64.200.0/24"        # External peer's IPv4 range
   # Optional: advertise routes FROM the external peer into the mesh
   advertisedRoutes:
@@ -1000,7 +1020,7 @@ socket APIs.
 
 ```
 Pod network namespace:
-  eth0:   3fff:1d:0001:0001::5/128    (primary, IPv6)
+  eth0:   3fff:1234:0001:0001::5/128    (primary, IPv6)
   clat0:  100.64.1.5/32              (CLAT, IPv4)
 
   IPv4 default route -> clat0
@@ -1016,7 +1036,7 @@ App sends IPv4 packet to 93.184.216.34 (example.com)
    clat0 TUN interface (in pod netns)
          |
    Stateless SIIT translation (RFC 7915):
-     src: 100.64.1.5        -> 3fff:1d:0001:0001::5
+     src: 100.64.1.5        -> 3fff:1234:0001:0001::5
      dst: 93.184.216.34     -> 64:ff9b::93.184.216.34
          |
          v
@@ -1094,12 +1114,12 @@ explicitly enabled.
 ### 8.4 Complete IPv4 Flow (Pod to External IPv4 Host)
 
 ```
-Pod (100.64.1.5 / 3fff:1d:0001:0001::5)
+Pod (100.64.1.5 / 3fff:1234:0001:0001::5)
   |
   | App: connect("93.184.216.34", 80)
   v
 clat0 (CLAT: IPv4 -> IPv6)
-  | src: 3fff:1d:0001:0001::5
+  | src: 3fff:1234:0001:0001::5
   | dst: 64:ff9b::5db8:d822
   v
 eth0 -> veth -> host routing
@@ -1124,11 +1144,11 @@ NAT64. The routing is:
 Pod A on node-1: app connects to 100.64.2.7 (Pod B's IPv4)
   |
   | clat0: translate to IPv6
-  | src: 3fff:1d:0001:0001::5, dst: 3fff:1d:0001:0002::7
+  | src: 3fff:1234:0001:0001::5, dst: 3fff:1234:0001:0002::7
   v
   eth0 -> host routing
   |
-  | route: 3fff:1d:0001:0002::/64 -> wg0
+  | route: 3fff:1234:0001:0002::/64 -> wg0
   | (if no WireGuard peer for node-2: on-demand peer setup via control)
   v
   wg0: encrypt and send to node-2
@@ -1150,7 +1170,7 @@ Pod A on node-1: app connects to 100.64.2.7 (Pod B's IPv4)
 Every pod in the mesh is resolvable by name, like Tailscale's MagicDNS:
 
 ```
-<pod-name>.<namespace>.ws.cluster.internal          -> 3fff:1d:CCCC:N::P (AAAA)
+<pod-name>.<namespace>.ws.cluster.internal          -> 3fff:1234:CCCC:N::P (AAAA)
 <pod-name>.<namespace>.ws.cluster.internal          -> 100.64.N.P        (A)
 <service-name>.<namespace>.svc.ws.cluster.internal  -> service VIP
 ```
@@ -1169,7 +1189,7 @@ which proxies the request to the remote cluster's controller (the same path
 used for cross-cluster peer resolution). This enables:
 
 ```
-<pod-name>.<namespace>.ws.<cluster-name>.internal   -> 3fff:1d:CCCC:N::P (AAAA)
+<pod-name>.<namespace>.ws.<cluster-name>.internal   -> 3fff:1234:CCCC:N::P (AAAA)
 ```
 
 Cross-cluster DNS queries are resolved on demand and cached with TTLs. The
@@ -1189,7 +1209,7 @@ wirescale-agent DNS
   |
   | lookup in-memory map
   | if miss: query wirescale-control for name resolution
-  | returns AAAA: 3fff:1d:0001:0003::12 and A: 100.64.3.12
+  | returns AAAA: 3fff:1234:0001:0003::12 and A: 100.64.3.12
   v
 Pod receives answer, connects directly via mesh
 ```
@@ -1320,11 +1340,11 @@ spec:
   # Cluster identity
   clusterID: "cluster-1"
   # Cluster's allocated prefix (from global directory or manual config)
-  clusterPrefix: "3fff:1d:0001::/32"
+  clusterPrefix: "3fff:1234:0001::/48"
   # IPv4 pod CIDR (CGNAT range, translated via CLAT)
   podCIDRv4: "100.64.0.0/10"
   # Service CIDRs
-  serviceCIDRv6: "3fff:1d:0001:ffff::/108"
+  serviceCIDRv6: "3fff:1234:0001:ffff::/108"
   serviceCIDRv4: "100.64.255.0/24"  # optional
   # NAT64 prefix
   nat64Prefix: "64:ff9b::/96"
@@ -1401,7 +1421,7 @@ spec:
   publicKey: "YWJjZGVm..."
   endpoint: "[3fff::3]:51820"
   # Set by control (IPAM)
-  podCIDRv6: "3fff:1d:0001:0003::/64"
+  podCIDRv6: "3fff:1234:0001:0003::/64"
   podCIDRv4: "100.64.3.0/24"
   # Optional: subnet router / exit node
   advertisedRoutes: []
@@ -1435,7 +1455,7 @@ spec:
   publicKey: "eHl6MTIz..."
   endpoint: "[3fff:0e01::1]:51820"
   allowedIPs:
-    - "3fff:1d:e1:1::1/128"
+    - "3fff:1234:e1:1::1/128"
     - "100.64.200.1/32"
   advertisedRoutes: []
   # Pre-auth key for initial registration (one-time)
@@ -1489,7 +1509,9 @@ spec:
 
 ### WirescaleCluster (directory-scoped)
 
-Stored in the global directory, represents a registered cluster.
+Stored in the global directory as a gRPC/protobuf API object (not a
+Kubernetes CRD). The YAML below illustrates the schema; the directory
+exposes this via its own API, not the Kubernetes API server.
 
 ```yaml
 apiVersion: wirescale.io/v1alpha1
@@ -1498,12 +1520,12 @@ metadata:
   name: cluster-1
 spec:
   clusterID: "cluster-1"
-  prefix: "3fff:1d:0001::/32"
+  prefix: "3fff:1234:0001::/48"
   controllerEndpoint: "control.cluster-1.example.com:9443"
   gateways:
-    - endpoint: "[3fff:aa:0001::1]:51820"
-    - endpoint: "[3fff:aa:0001::2]:51820"
-    - endpoint: "[3fff:aa:0001::3]:51820"
+    - endpoint: "[3fff:1234:0001:0001::1]:51820"
+    - endpoint: "[3fff:1234:0001:0001::2]:51820"
+    - endpoint: "[3fff:1234:0001:0001::3]:51820"
   caCert: |
     -----BEGIN CERTIFICATE-----
     ...
@@ -1525,7 +1547,7 @@ status:
 ### Case 1: Pod-to-Pod, Same Node
 
 ```
-Pod A (3fff:1d:0001:0001::5) -> Pod B (3fff:1d:0001:0001::7)
+Pod A (3fff:1234:0001:0001::5) -> Pod B (3fff:1234:0001:0001::7)
   eth0 -> veth -> host bridge/routing -> veth -> eth0
   (no WireGuard, no translation, direct kernel path)
 ```
@@ -1536,18 +1558,18 @@ When the WireGuard peer is already established (the common case after first
 contact):
 
 ```
-Pod A on node-1 (3fff:1d:0001:0001::5) -> Pod B on node-2 (3fff:1d:0001:0002::7)
+Pod A on node-1 (3fff:1234:0001:0001::5) -> Pod B on node-2 (3fff:1234:0001:0002::7)
 
 Pod A: eth0 -> veth -> host
-Host node-1: route 3fff:1d:0001:0002::/64 dev wg0
+Host node-1: route 3fff:1234:0001:0002::/64 dev wg0
   -> wg0: encrypt with node-2's public key
   -> UDP to [3fff::2]:51820
 
 Network: IPv6 UDP packet transit
 
 Host node-2: UDP :51820 -> wg0 decrypt
-  -> verify src 3fff:1d:0001:0001::5 in AllowedIPs for node-1 peer
-  -> route 3fff:1d:0001:0002::7 -> veth -> Pod B eth0
+  -> verify src 3fff:1234:0001:0001::5 in AllowedIPs for node-1 peer
+  -> route 3fff:1234:0001:0002::7 -> veth -> Pod B eth0
 ```
 
 ### Case 3: Pod-to-Pod, Different Nodes, Same Cluster (IPv6, Cold Path)
@@ -1556,20 +1578,20 @@ When no WireGuard peer exists for the destination node (first contact or
 after idle GC):
 
 ```
-Pod A on node-1 (3fff:1d:0001:0001::5) -> Pod B on node-2 (3fff:1d:0001:0002::7)
+Pod A on node-1 (3fff:1234:0001:0001::5) -> Pod B on node-2 (3fff:1234:0001:0002::7)
 
 Pod A: eth0 -> veth -> host
-Host node-1: route 3fff:1d:0001:0002::/64 -> no WireGuard peer!
+Host node-1: route 3fff:1234:0001:0002::/64 -> no WireGuard peer!
   1. eBPF queues packet (up to 64 packets buffered)
   2. Agent sends PeerRequest to wirescale-control:
-       "I need peer info for the node owning 3fff:1d:0001:0002::/64"
+       "I need peer info for the node owning 3fff:1234:0001:0002::/64"
   3. Control authenticates node-1, checks authorization
   4. Control returns: {pubkey, endpoint=[3fff::2]:51820, allowedIPs, TTL=300s}
   5. Agent configures WireGuard peer:
        wg set wg0 peer <pubkey> \
-         allowed-ips 3fff:1d:0001:0002::/64,100.64.2.0/24 \
+         allowed-ips 3fff:1234:0001:0002::/64,100.64.2.0/24 \
          endpoint [3fff::2]:51820
-  6. Agent programs route: 3fff:1d:0001:0002::/64 dev wg0
+  6. Agent programs route: 3fff:1234:0001:0002::/64 dev wg0
   7. Queued packets drain through new peer
   8. Total cold-path delay: ~15-30ms (acceptable for TCP SYN)
 
@@ -1584,9 +1606,9 @@ After 300s idle: agent removes peer. Next packet re-triggers this flow.
 Pod A on node-1: app connects to 100.64.2.7 (Pod B's IPv4)
 
 Pod A: IPv4 packet -> clat0 TUN
-  -> CLAT xlat: src 3fff:1d:0001:0001::5, dst 3fff:1d:0001:0002::7
+  -> CLAT xlat: src 3fff:1234:0001:0001::5, dst 3fff:1234:0001:0002::7
   -> eth0 -> veth -> host
-Host node-1: route 3fff:1d:0001:0002::/64 dev wg0
+Host node-1: route 3fff:1234:0001:0002::/64 dev wg0
   -> (on-demand peer setup if needed, see Case 3)
   -> wg0: encrypt, send to node-2
 
@@ -1615,16 +1637,16 @@ Return: IPv4 -> nat64 eBPF xlat -> IPv6 -> route to Pod A
 ### Case 6: Cross-Cluster Pod-to-Pod (Cold Path)
 
 ```
-Pod A in cluster-1 (3fff:1d:0001:0001::5) ->
-  Pod B in cluster-2 (3fff:1d:0002:0002::7)
+Pod A in cluster-1 (3fff:1234:0001:0001::5) ->
+  Pod B in cluster-2 (3fff:1234:0002:0002::7)
 
 Pod A: eth0 -> veth -> host
-Host node-A-1: no specific peer for 3fff:1d:0002:0002::/64
-  route 3fff:1d:0002::/32 (aggregate) -> signaling gateway
+Host node-A-1: no specific peer for 3fff:1234:0002:0002::/64
+  route 3fff:1234:0002::/48 (aggregate) -> ws-resolve0
 
-  1. Agent intercepts aggregate-route packet (cache miss)
+  1. Agent eBPF intercepts on ws-resolve0 (cache miss)
   2. Agent -> wirescale-control (cluster-1):
-       "resolve 3fff:1d:0002:0002::/64"
+       "resolve 3fff:1234:0002:0002::/64"
   3. Control (cluster-1) -> directory (cache miss):
        "where is cluster 2?"
   4. Directory -> control:
@@ -1633,12 +1655,12 @@ Host node-A-1: no specific peer for 3fff:1d:0002:0002::/64
   5. Control (cluster-1) -> control (cluster-2) via mTLS:
        "resolve host 0002, cluster-1 cert attached"
   6. Control (cluster-2) authenticates, returns:
-       {node_B_endpoint: [3fff:c2::2]:51820, pubkey: "...", allowedIPs: ...}
+       {node_B_endpoint: [3fff:1234:0002:0002::1]:51820, pubkey: "...", allowedIPs: ...}
   7. Control (cluster-1) -> agent: peer info for node-B-2
   8. Agent establishes direct WireGuard tunnel to node-B-2
   9. Agent installs specific route:
-       3fff:1d:0002:0002::/64 dev wg0 peer=node-B-2
-       (overrides aggregate 3fff:1d:0002::/32 for this /64)
+       3fff:1234:0002:0002::/64 dev wg0 peer=node-B-2
+       (overrides aggregate 3fff:1234:0002::/48 for this /64)
   10. Queued packets drain through direct tunnel
   11. Total cold-path delay: ~30-65ms
 
@@ -1653,9 +1675,9 @@ Pod A in cluster-1 -> Pod B in cluster-2
   (direct WireGuard tunnel already established from Case 6)
 
 Pod A: eth0 -> veth -> host
-Host node-A-1: route 3fff:1d:0002:0002::/64 dev wg0 peer=node-B-2
+Host node-A-1: route 3fff:1234:0002:0002::/64 dev wg0 peer=node-B-2
   -> wg0: encrypt with node-B-2's public key
-  -> UDP to [3fff:c2::2]:51820
+  -> UDP to [3fff:1234:0002:0002::1]:51820
 
 Network: IPv6 UDP packet transit (inter-cluster)
 
@@ -1667,10 +1689,10 @@ Host node-B-2: wg0 decrypt -> route to Pod B
 ### Case 8: External Peer to Pod
 
 ```
-Dev laptop (3fff:1d:e1:1::1) -> Pod B (3fff:1d:0001:0002::7)
+Dev laptop (3fff:1234:e1:1::1) -> Pod B (3fff:1234:0001:0002::7)
 
 Laptop: wirescale-join agent
-  -> queries wirescale-control for peer info to reach 3fff:1d:0001:0002::/64
+  -> queries wirescale-control for peer info to reach 3fff:1234:0001:0002::/64
   -> control authenticates laptop (approved WirescaleExternalPeer)
   -> returns peer info for node-2
   -> wg0: encrypt with node-2's public key
@@ -1687,7 +1709,7 @@ Node-2: wg0 decrypt -> verify AllowedIPs -> route to Pod B
 |---------|-----------|----------------------|------------------|------------------|------|
 | Primary goal | Full CNI + IPv6-only + hyperscale | Expose/connect services to tailnet | Transparent encryption for existing CNI | Transparent encryption for Calico | Multi-site WG overlay |
 | CNI plugin | Yes (standalone) | No (uses existing) | No (is Cilium) | No (is Calico) | Optional |
-| IPv6-only cluster support | First-class target | N/A | Version/mode dependent | Version/mode dependent | Topology dependent |
+| IPv6-only cluster support | First-class target | N/A | Supported (requires configuration) | Supported (requires configuration) | Topology dependent |
 | NAT64/DNS64 | Built-in | No | No | No | No |
 | CLAT per-pod | Yes | No | No | No | No |
 | Mesh topology | On-demand peering | Service-level proxies | Full mesh (node-to-node) | Full mesh (node-to-node) | Zone-based leaders |
