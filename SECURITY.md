@@ -1233,7 +1233,7 @@ Cluster-A wants to reach a pod in Cluster-B:
      - Both sides are now mutually authenticated
 
   4. Cluster-A's controller requests identity/peer info:
-     - "What is the identity of pod at IP 3fff:c2:3::7?"
+     - "What is the identity of pod at IP 3fff:1234:0002:0003::7?"
      - Cluster-B's controller evaluates cross-cluster policy
      - Returns identity info (or denies the request)
 
@@ -1561,7 +1561,7 @@ operations:
   "requestor_cluster": "us-east-1",
   "target_cluster": "eu-west-1",
   "details": {
-    "ip": "3fff:c2:3::7",
+    "ip": "3fff:1234:0002:0003::7",
     "identity": "production/api-sa",
     "resolution_latency_ms": 45,
     "cached": false
