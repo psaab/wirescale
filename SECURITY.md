@@ -922,7 +922,7 @@ model:
 
 ```
 Map 1: identity_cache (LPM trie, per-node)
-  Key:   IP prefix (e.g., fd00:ws:3::7/128)
+  Key:   IP prefix (e.g., fd00:1d:3::7/128)
   Value: {
     identity_id: u32,      // index into identity table
     ttl_expiry: u64,       // ktime_ns when entry becomes stale
@@ -1460,9 +1460,9 @@ provided by the identity system:
 Pod A sends packet to Pod B:
   1. WireGuard guarantees the packet came from node-A
      (cryptographic proof via decryption)
-  2. Node-A guarantees Pod A has IP fd00:ws:1::5
+  2. Node-A guarantees Pod A has IP fd00:1d:1::5
      (only kubelet on node-A can assign this IP)
-  3. wirescale-agent resolves fd00:ws:1::5 = pod "web-xyz"
+  3. wirescale-agent resolves fd00:1d:1::5 = pod "web-xyz"
      with identity (production, web-sa, app=web)
      (from local cache or via control query)
   4. Policy engine checks: is (production, web-sa, app=web) allowed
@@ -1505,7 +1505,7 @@ The `wirescale-agent` reads from the ring buffer and writes structured logs:
   "node": "worker-3",
   "action": "allow",
   "src": {
-    "ip": "fd00:ws:1::5",
+    "ip": "fd00:1d:1::5",
     "pod": "web-frontend-abc",
     "namespace": "production",
     "serviceAccount": "web-sa",
@@ -1514,7 +1514,7 @@ The `wirescale-agent` reads from the ring buffer and writes structured logs:
     "cluster": "us-east-1"
   },
   "dst": {
-    "ip": "fd00:ws:3::12",
+    "ip": "fd00:1d:3::12",
     "pod": "api-server-xyz",
     "namespace": "production",
     "serviceAccount": "api-sa",
@@ -1545,7 +1545,7 @@ operations:
   "target": "worker-3",
   "details": {
     "public_key_fingerprint": "Xk3p...",
-    "allowed_ips": ["fd00:ws:3::/64"],
+    "allowed_ips": ["fd00:1d:3::/64"],
     "authorization_latency_ms": 2
   }
 }
@@ -1757,7 +1757,7 @@ If an attacker can cause control to serve wrong identity for an IP:
   - Identity responses SHOULD be signed by control; agents MAY verify
     signatures before caching
   - Agents can cross-verify: the IP prefix MUST belong to the node CIDR
-    that the WireGuard peer is authorized for. If control says IP fd00:ws:3::7
+    that the WireGuard peer is authorized for. If control says IP fd00:1d:3::7
     belongs to a pod on node-1, but the packet arrived via node-3's
     WireGuard tunnel, the agent MUST reject the mapping.
   - Generation counters detect stale or replayed identity data
