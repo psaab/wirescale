@@ -163,6 +163,29 @@ NOT responsible for (Cilium handles):
   - Host route installation (Cilium CNI)
 ```
 
+**CLAT injection when Cilium owns the pod network namespace:**
+
+Because Cilium manages pod interfaces (lxc/netkit on veths), the
+wirescale-agent MUST NOT modify Cilium-managed interfaces. The CLAT `clat0`
+TUN device is injected into each pod's netns via a **post-start network
+hook** triggered by the wirescale-agent's inotify watch on the CRI socket:
+
+1. The agent watches for new pod sandbox events from the container runtime.
+2. After Cilium's CNI ADD completes and the pod netns is configured, the
+   agent enters the pod's network namespace via `nsenter`.
+3. The agent creates a `clat0` TUN device inside the pod netns, assigns the
+   pod's CLAT IPv4 address (`100.64.N.P`), and adds an IPv4 default route
+   via `clat0`.
+4. The agent attaches a TC eBPF program to the host-side veth (read-only
+   with respect to Cilium state) that performs stateless IPv4-to-IPv6
+   translation on egress.
+5. The agent MUST NOT modify the pod's `eth0`, Cilium's lxc interface, or
+   any Cilium-managed eBPF programs.
+
+This approach requires no init containers or sidecars. The agent operates
+as a post-CNI hook that adds the CLAT overlay without interfering with
+Cilium's interface lifecycle.
+
 ### Three-Tier Architecture Diagram (with Cilium)
 
 ```
