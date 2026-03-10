@@ -29,7 +29,7 @@
   enforcement, and IPv4 compatibility are undefined for host-network pods.
   Common for ingress controllers, monitoring agents, kube-proxy.
   Added: ARCHITECTURE.md Section 11 (identity model, WireGuard data path,
-  CLAT non-applicability, policy enforcement via nftables/Cilium host firewall).
+  CLAT non-applicability, policy enforcement via TC eBPF on eth0/Cilium host firewall).
 
 - [x] **Multicast and NDP through WireGuard**
   IPv6 NDP uses multicast. In ULA overlay mode or `always` encryption,

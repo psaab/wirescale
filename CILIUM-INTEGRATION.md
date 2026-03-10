@@ -26,6 +26,8 @@
   design
 - [CILIUM-SECURITY-GAPS.md](CILIUM-SECURITY-GAPS.md) -- Security isolation
   gaps in Cilium-only deployments and how Wirescale closes them
+- [EGRESS.md](EGRESS.md) -- Internet egress architecture (NPTv6, NAT64,
+  FQDN policy, egress observability)
 
 ---
 
@@ -285,6 +287,10 @@ Tier 3 -- agent -> control:
   TTL cache, NOT CRD watches)
 ```
 
+> **See also:** [EGRESS.md §14](EGRESS.md#14-interaction-with-cilium) defines the
+> egress ownership split when Cilium is the CNI -- Cilium handles intra-cluster
+> policy and L7, Wirescale handles internet egress via NPTv6/NAT64.
+
 ---
 
 ## 4. Intra-Cluster: Cilium's Role Is Unchanged
@@ -367,7 +373,7 @@ GRO/GSO amortization, identical performance.
 | Key storage | CiliumNode annotation |
 | Peer model | Full-mesh (all nodes) |
 | AllowedIPs | Pod /64 per peer |
-| Conntrack bypass | nftables `notrack` on port 51871 |
+| Conntrack bypass | eBPF-only data path (no kernel conntrack loaded) |
 
 ### Intra-Cluster Policy
 
@@ -406,6 +412,10 @@ Hubble replaces Wirescale's custom audit:
 Wirescale's deny-only audit logging MAY continue alongside Hubble for
 environments where Hubble's always-on tracing overhead is unacceptable.
 The two use separate event pipelines and do not conflict.
+
+> **See also:** [EGRESS.md §9.3](EGRESS.md#93-flow-export) describes
+> Hubble-compatible egress flow export so that egress events appear in Hubble
+> alongside Cilium's intra-cluster flows.
 
 ---
 
@@ -670,7 +680,7 @@ difference is management, not mechanism:
 | AllowedIPs | Pod /64 per peer | Pod /64 per peer |
 | GRO/GSO | Kernel-native | Kernel-native (same) |
 | Threaded NAPI | Agent enables | Agent enables |
-| Conntrack bypass | nftables `notrack` on port 51871 | nftables `notrack` on port 51820 |
+| Conntrack bypass | eBPF-only (no netfilter) | eBPF-only (no netfilter) |
 | Scope | Intra-cluster | Cross-cluster (with Cilium deployed) |
 
 Performance is identical for the same traffic path -- same kernel
@@ -741,7 +751,7 @@ for IPv6-only clusters:
 | Property | Wirescale NAT64 | Cilium NAT46x64 |
 |----------|----------------|-----------------|
 | Deployment | Per-node (every node translates) | Gateway (dedicated nodes) |
-| Translation | Stateless SIIT (eBPF) | Stateful conntrack (eBPF) |
+| Translation | Stateless SIIT (eBPF) | Stateful eBPF NAT (BPF conntrack map) |
 | Latency | Local to the node (~50-100 ns) | Extra hop to gateway node |
 | Bottleneck | None (distributed) | Gateway node throughput |
 | Failure mode | Node-local (isolated) | Gateway failure = no IPv4 egress |
@@ -966,7 +976,7 @@ Cilium's hooks.
 |--------|----------------|-----------------|
 | Translation location | Local node | Gateway node |
 | Extra network hops | 0 | 1+ (to gateway) |
-| Translation type | Stateless SIIT | Stateful conntrack |
+| Translation type | Stateless SIIT | Stateful eBPF NAT |
 | Per-packet cost | ~50-100 ns | ~100-200 ns + hop latency |
 | Throughput (10G) | ~8.0 Gbps | Bottlenecked by gateway |
 | Failure impact | Node-local | Cluster-wide IPv4 outage |
@@ -1035,7 +1045,7 @@ compares per-node resource consumption as the deployment grows:
 | **NAT64** | wirescale-agent (per-node) | wirescale-agent (per-node) | Unchanged |
 | **DNS64** | CoreDNS dns64 plugin | CoreDNS dns64 plugin | Unchanged |
 | **XDP ingress firewall** | wirescale-agent on eth0 | wirescale-agent on eth0 | Unchanged |
-| **Conntrack bypass** | nftables notrack (port 51820) | nftables notrack (port 51871) | Port changes |
+| **Conntrack bypass** | eBPF-only (no netfilter) | eBPF-only (no netfilter) | eBPF-only |
 | **Intra-cluster identity** | Pull-based via wirescale-control | Push-based CiliumIdentity CRDs | Replaced |
 | **Cross-cluster identity** | Pull-based via wirescale-control | Pull-based via global directory | Updated (three-tier) |
 | **Policy CRD** | WirescalePolicy | CiliumNetworkPolicy | Replaced |

@@ -23,6 +23,8 @@
   (identity model, policy enforcement, trust boundaries)
 - [CILIUM-INTEGRATION.md](CILIUM-INTEGRATION.md) -- Architecture comparison
   with Cilium as CNI
+- [EGRESS.md](EGRESS.md) -- Internet egress architecture (NPTv6, NAT64,
+  FQDN policy, egress observability)
 
 ---
 
@@ -549,6 +551,12 @@ Because ULA addresses are not globally routable, cross-cluster traffic
 MUST traverse WireGuard tunnels regardless. The aggregate routes point
 to gateway nodes that terminate the tunnels.
 
+> **See also:** [EGRESS.md §3](EGRESS.md#3-nptv6-stateless-ipv6-prefix-translation)
+> describes NPTv6 for ULA-to-GUA translation at egress gateways, enabling
+> internet-bound traffic from ULA clusters without per-flow SNAT state.
+> [§3.4](EGRESS.md#34-gua-mode-clusters) explains that GUA-mode clusters skip
+> NPTv6 entirely since pod addresses are already globally routable.
+
 ### Multi-Cluster at a Single Site
 
 Multiple clusters MAY share a physical site. In this case, intra-site
@@ -1064,7 +1072,7 @@ Pod: connect to 93.184.216.34 (example.com)
   -> DNS64 synthesizes AAAA: 64:ff9b::5db8:d822
   -> Pod sends IPv6 to 64:ff9b::5db8:d822
   -> NAT64 on node: IPv6 -> IPv4
-  -> MASQUERADE with node's IPv4 address
+  -> eBPF SNAT with node's IPv4 address
   -> Internet
 ```
 
@@ -1087,7 +1095,10 @@ Pod (3fff:1234:0001:0001::a) -> connect to [2607:f8b0:4004::200e]:443
 primary performance benefit of globally routable pods.
 
 In ULA mode, outbound IPv6 to the internet requires SNAT at the site
-border because ULA addresses are not globally routable.
+border because ULA addresses are not globally routable. See
+[EGRESS.md §3](EGRESS.md#3-nptv6-stateless-ipv6-prefix-translation) for the
+NPTv6-based egress path that replaces per-flow SNAT with stateless prefix
+translation.
 
 ### Inbound IPv4 to Pods
 
@@ -1519,7 +1530,7 @@ Pod A (3fff:1234:0001:0001::a / 100.64.1.10) -> example.com (93.184.216.34)
   | route: 64:ff9b::/96 -> nat64 interface
   v
   nat64 eBPF: IPv6 -> IPv4
-  | MASQUERADE: src = host's public IPv4
+  | eBPF SNAT: src = host's public IPv4
   | dst = 93.184.216.34
   v
   Physical NIC -> internet (IPv4)

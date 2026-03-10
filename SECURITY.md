@@ -18,6 +18,8 @@
 - [CILIUM-INTEGRATION.md](CILIUM-INTEGRATION.md) -- Architecture comparison with Cilium as CNI
 - [CILIUM-SECURITY-GAPS.md](CILIUM-SECURITY-GAPS.md) -- Security isolation
   gaps in Cilium-only deployments and how Wirescale closes them
+- [EGRESS.md](EGRESS.md) -- Outbound internet access: NPTv6, NAT64,
+  DNS-aware policy, FQDN/SNI/URL filtering, flow observability
 
 ---
 
@@ -819,6 +821,10 @@ spec:
           port: 53
 ```
 
+> **See [EGRESS.md](EGRESS.md) sections 6--7** for the complete egress policy
+> engine, including FQDN allowlists, DNS snooping for IP resolution, SNI
+> filtering, and URL filtering.
+
 #### Default Deny with Explicit Allow
 
 ```yaml
@@ -1119,6 +1125,9 @@ For the full extension header parsing implementation, verifier constraints,
 performance impact analysis, and code examples, see
 [PERFORMANCE.md Section 3](PERFORMANCE.md#3-ebpf-nat64clat-fast-path)
 ("IPv6 Extension Header Parsing in eBPF Programs").
+
+> **See [EGRESS.md](EGRESS.md) section 6.4** for the egress-specific eBPF
+> enforcement pipeline, including FQDN-to-IP map lookups and SNI extraction.
 
 ---
 
@@ -1591,6 +1600,10 @@ External peers (non-Kubernetes nodes) authenticate via:
 
 ## 12. Audit and Observability
 
+> **See [EGRESS.md](EGRESS.md) section 9** for egress-specific flow
+> observability, including per-connection FQDN-attributed logging and
+> outbound threat detection alerts.
+
 ### Connection Logging
 
 The eBPF enforcement program emits audit events via a BPF ring buffer.
@@ -1820,6 +1833,10 @@ TIMESTAMP           ACTION  SRC_CLUSTER  SRC                DST_CLUSTER  DST    
 | T17 | Cluster CA compromise | All nodes/pods in that cluster can be impersonated | Blast radius limited to the compromised cluster. Global directory can revoke the cluster. Other clusters are unaffected. CA rotation procedure restores trust. |
 | T18 | Supply chain attack on agent container image loads malicious eBPF | TC program returns `TC_ACT_OK` unconditionally, bypassing all policy enforcement | Image signing, eBPF hash verification, runtime audit, read-only filesystem |
 | T19 | Pull model concentrates communication metadata at wirescale-control | Complete communication graph observable at a single point | Query log retention limits, access control, optional anonymization |
+
+> **See [EGRESS.md](EGRESS.md) section 10** for threat detection and
+> automated response specific to outbound traffic, including C2 beaconing,
+> DGA detection, data exfiltration, and DNS tunneling.
 
 ### Expanded Threat Analysis
 

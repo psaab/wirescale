@@ -20,6 +20,8 @@
   design (BGP routing, selective encryption, native IPv6 performance)
 - [CILIUM-INTEGRATION.md](CILIUM-INTEGRATION.md) -- Architecture comparison
   with Cilium as CNI (what changes, what Wirescale still provides)
+- [EGRESS.md](EGRESS.md) -- Outbound internet access (NPTv6 egress,
+  NAT64, DNS-aware policy enforcement, FQDN filtering, flow observability)
 
 ---
 
@@ -266,7 +268,7 @@ A per-node daemon with minimal state, responsible for data-plane operations.
 - WireGuard interface management (key generation, peer setup, peer GC)
 - On-demand peering via cluster controller
 - Identity caching (pull-based, TTL-expiring)
-- Policy enforcement (eBPF/nftables for local pods only)
+- Policy enforcement (eBPF for local pods only)
 - NAT64/CLAT translation
 - Route programming
 
@@ -799,8 +801,9 @@ Pod interface MTU:       1420 (1500 - 80)
 TCP MSS clamping:        1380 (1420 - 40 for IPv6 TCP header)
 ```
 
-The agent programs MSS clamping via nftables on the `wg0` interface to
-prevent fragmentation.
+The agent programs MSS clamping via a TC eBPF program on the `wg0` interface
+that rewrites the TCP MSS option in SYN packets using `bpf_skb_store_bytes()`,
+preventing fragmentation.
 
 ### Multicast and Neighbor Discovery Through WireGuard
 
@@ -1066,6 +1069,9 @@ traffic through the exit node. This is useful for:
 - Egress filtering/auditing at a single point
 - Providing IPv4 internet access when most nodes are IPv6-only
 
+See [EGRESS.md](EGRESS.md) for the full egress gateway design, including the
+`WirescaleEgressGateway` CRD, NPTv6 prefix translation, and egress policy engine.
+
 ### NAT Traversal
 
 When direct node-to-node reachability is not available (nodes behind NAT),
@@ -1137,7 +1143,7 @@ wirescale-agent on each node:
     IPv6 dst = 64:ff9b::93.184.216.34
     -> Extract embedded IPv4: 93.184.216.34
     -> Translate to IPv4 packet
-    -> MASQUERADE with node's IPv4 address (if node has one)
+    -> eBPF SNAT with node's IPv4 address (if node has one)
        or forward to a designated NAT64 gateway node
 
   Return path:
@@ -1147,8 +1153,16 @@ wirescale-agent on each node:
 ```
 
 **Implementation:** eBPF programs attached to the `nat64` dummy interface
-perform stateless address translation. Connection tracking is handled by
-Linux conntrack for the MASQUERADE step.
+perform stateless SIIT-DC translation (RFC 7755). Each pod receives a
+deterministic ephemeral port range via per-netns `ip_local_port_range`.
+The translator performs a pure IPv6→IPv4 header swap with no state table —
+the return path identifies the destination pod from the port range alone.
+No kernel conntrack, no stateful NAT, no nftables. See [EGRESS.md §4](EGRESS.md#4-siit-dc-stateless-ipv4-internet-access)
+for the full design.
+
+See [EGRESS.md](EGRESS.md) for the full egress data path, including DNS
+snooping for FQDN-based filtering, the egress policy engine, and flow
+observability for NAT64 traffic.
 
 ### 8.3 DNS64 -- Making It Transparent
 
@@ -1200,7 +1214,7 @@ eth0 -> veth -> host routing
   | route: 64:ff9b::/96 -> nat64
   v
 nat64 interface (eBPF xlat: IPv6 -> IPv4)
-  | src: <node-ipv4>  (MASQUERADE)
+  | src: <node-ipv4>  (eBPF SNAT)
   | dst: 93.184.216.34
   v
 Physical NIC -> Internet -> 93.184.216.34
@@ -1455,6 +1469,9 @@ aggregation, minimal per-node state).
    (e.g., a database primary), use a ClusterIP Service instead of a
    headless Service.  The VIP is allocated from the Service CIDR
    (`3fff:1234:CCCC:ffff::/108`) and is placement-independent.
+
+See [EGRESS.md](EGRESS.md) Section 5 for DNS interception and FQDN resolution
+used in egress policy enforcement, including DNS snooping and IP-to-FQDN mapping.
 
 ---
 
@@ -1914,18 +1931,19 @@ attachment point.
 
 **Standalone Wirescale (no Cilium):**
 
-- The agent MUST enforce policy using nftables rules in the
-  `inet wirescale_host` table, matching on the node's IP and L4 ports.
+- The agent MUST enforce policy using a TC eBPF program attached to
+  `eth0` ingress/egress, matching on the node's IP and L4 ports.
 - Rules MUST be programmed at pod admission time and removed at
-  teardown. Nftables is preferred over eBPF on `eth0` because the
-  physical interface may carry TC programs from other subsystems.
+  teardown. The eBPF program on `eth0` uses the same `policy_map`
+  infrastructure as per-pod veth programs but matches on node IP and
+  L4 ports instead of pod identity.
 
 **With Cilium CNI:**
 
 - Cilium's host firewall attaches TC eBPF to `eth0` and enforces
   `CiliumClusterwideNetworkPolicy` for host-level traffic. Wirescale
   SHOULD defer host-network pod L3/L4 policy to Cilium's host firewall
-  when detected. The agent MUST NOT install conflicting nftables rules.
+  when detected. The agent MUST NOT install conflicting TC programs on `eth0`.
 - Wirescale MUST still enforce WireGuard encryption: inter-node traffic
   from host-network pods MUST traverse `wg0` regardless of whether
   Cilium handles L3/L4 filtering.
@@ -1936,7 +1954,7 @@ attachment point.
 |---------|-------------|------------------|
 | Identity | Pod IP + SA + labels | Node IP + node labels |
 | eBPF attachment | veth (TC hook) | N/A (no veth) |
-| L3/L4 policy | Per-pod eBPF maps | nftables or Cilium host firewall |
+| L3/L4 policy | Per-pod eBPF maps | TC eBPF on eth0 or Cilium host firewall |
 | CLAT | Per-pod `100.64.x.x` | Not applicable |
 | WireGuard path | veth -> host route -> wg0 | host route -> wg0 (direct) |
 | Encryption | Always (inter-node) | Always (inter-node) |
@@ -1991,7 +2009,7 @@ Each peer's WireGuard config only permits traffic from/to the peer's
 allocated pod CIDRs. Traffic from unknown sources is silently dropped by
 WireGuard.
 
-**Level 2: eBPF/nftables per-pod policy (L3/L4)**
+**Level 2: eBPF per-pod policy (L3/L4)**
 The agent programs per-pod firewall rules based on policies pushed from
 wirescale-control. Policy rules are scoped to local pods only -- each
 node receives the minimal set of rules needed for enforcement. See
@@ -2344,7 +2362,7 @@ Pod A: getaddrinfo("ipv4only.example.com")
 Pod A: eth0 -> veth -> host
 Host node-1: route 64:ff9b::/96 -> nat64 interface
   -> eBPF xlat: IPv6 -> IPv4
-  -> src: MASQUERADE with node's IPv4
+  -> src: eBPF SNAT with node's IPv4
   -> dst: 93.184.216.34
   -> physical NIC -> internet
 
@@ -2496,7 +2514,7 @@ Identity resolution enables policy enforcement by workload identity.
 
 - [ ] wirescale-control: policy service (per-node policy compilation and push)
 - [ ] Agent: gRPC policy stream subscription
-- [ ] Kubernetes NetworkPolicy enforcement (eBPF or nftables)
+- [ ] Kubernetes NetworkPolicy enforcement (eBPF)
 - [ ] WirescalePolicy CRD and controller
 - [ ] Key rotation support (control-mediated push to active peers)
 - [ ] Audit logging (see [SECURITY.md](SECURITY.md))
@@ -2560,7 +2578,7 @@ with federated cross-cluster connectivity and proven resilience.
 | eBPF | cilium/ebpf Go library |
 | NAT64/CLAT | eBPF TC programs + TUN devices |
 | DNS | CoreDNS dns64 plugin + custom in-mesh resolver |
-| Networking | netlink (vishvananda/netlink), nftables |
+| Networking | netlink (vishvananda/netlink) |
 | Control plane RPC | gRPC with mTLS (grpc-go) |
 | Control plane HA | Leader election (controller-runtime) + active-active for reads |
 | Global directory | Raft consensus (etcd, hashicorp/raft, or similar) |

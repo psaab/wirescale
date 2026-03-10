@@ -156,27 +156,15 @@ encryption limit applies (~3-10 Gbps depending on CPU). The Netdev 0x18
 "WireGuard Inline" research proposes future kernel patches to parallelize
 single-peer encryption.
 
-### Bypass Conntrack
+### Avoiding Kernel Conntrack
 
-If packets traverse conntrack hooks, they incur conntrack lookup cost.
-For WireGuard traffic that doesn't need NAT on the outer UDP:
-
-```bash
-# The wirescale-agent programs these nftables rules:
-table inet wirescale_raw {
-    chain prerouting {
-        type filter hook prerouting priority raw; policy accept;
-        udp dport 51820 notrack
-    }
-    chain output {
-        type filter hook output priority raw; policy accept;
-        udp sport 51820 notrack
-    }
-}
-```
-
-This eliminates per-packet conntrack lookups for the outer WireGuard UDP
-flow, saving ~100 ns per packet.
+Since Wirescale uses no nftables/iptables rules, the kernel conntrack
+module is never loaded. Without netfilter hooks, packets bypass conntrack
+entirely -- no `notrack` rules needed. If conntrack is loaded by another
+subsystem (e.g., Cilium, kube-proxy), the agent SHOULD unload it or
+configure `net.netfilter.nf_conntrack_max = 0` to minimize overhead. The
+Wirescale data path uses eBPF-only forwarding with its own BPF hash map
+for NAT64 connection state.
 
 ---
 
@@ -240,7 +228,7 @@ bpf_l4_csum_replace() -- TCP/UDP pseudo-header checksum delta
 bpf_redirect(phys_ifindex, 0) -- send out physical NIC
   |
   v
-nftables MASQUERADE -- replace 169.254.64.X with node's IPv4
+SIIT-DC stateless translation -- src becomes node's IPv4 (pod's port range preserved)
   |
   v
 Wire
@@ -248,8 +236,10 @@ Wire
 
 **Performance:** The eBPF translation path is O(1) per packet -- one hash
 map lookup for the address mapping, fixed-cost header rewrite, and a single
-redirect. No conntrack in eBPF; stateful NAT is deferred to the kernel's
-nftables MASQUERADE on the physical interface.
+redirect. SIIT-DC translation (RFC 7755) is fully stateless: each pod owns
+a deterministic ephemeral port range, so the return path identifies the pod
+from the destination port alone. No state table, no kernel conntrack, no
+nftables.
 
 ### CLAT eBPF Program (TC on Pod veth)
 
@@ -385,6 +375,12 @@ The agent SHOULD expose a per-node metric
 the maximum chain depth. A sustained non-zero rate MAY indicate evasion
 attempts or misconfigured middleboxes injecting extension headers.
 
+> **See also:** [EGRESS.md](EGRESS.md) Section 3 adds NPTv6 (stateless
+> prefix translation) to the eBPF translation pipeline for outbound
+> internet traffic. Section 11 of the same document provides the full
+> egress pipeline performance budget (~115 ns per packet), covering
+> policy enforcement, FQDN lookup, rate limiting, and NPTv6 translation.
+
 ---
 
 ## 4. Packet Pipeline Architecture
@@ -411,7 +407,7 @@ nat64 interface:
   bpf_skb_change_proto() + bpf_redirect(eth0)
   |
   v
-nftables MASQUERADE on eth0
+SIIT-DC stateless: src = node IPv4, sport in pod's port range (no state table)
   |
   v
 Physical NIC TX (hardware checksum offload)
@@ -527,6 +523,11 @@ data path is identical to a full-mesh topology:
 The warm path is the steady-state path. In typical workloads where traffic
 follows power-law distributions, the vast majority of packets traverse
 the warm path.
+
+> **See also:** For external (internet-bound) traffic, the egress data
+> path adds policy enforcement and NPTv6/NAT64 translation stages beyond
+> the WireGuard peering layer. See [EGRESS.md](EGRESS.md) for the full
+> egress-specific pipeline and performance characteristics.
 
 ### Cold Path: Intra-Cluster (First Packet to New Peer)
 
@@ -1554,6 +1555,11 @@ Prometheus metric when redirect targets cross NUMA boundaries.
 | eBPF JIT (TC NAT64) | 2-5 Mpps/core | Linux >= 5.0 |
 | NIC hardware GRO/checksum | Frees CPU cycles | All modern NICs |
 
+NPTv6 egress translation uses the same eBPF JIT TC path as NAT64 and
+benefits from identical GRO/GSO amortization. See [EGRESS.md](EGRESS.md)
+Section 3 for the NPTv6 implementation and Section 11 for offload
+interaction.
+
 ### Tier 2: Available with Specialized Hardware
 
 | Technology | Throughput | Requirements |
@@ -1589,7 +1595,7 @@ Prometheus metric when redirect targets cross NUMA boundaries.
 - Threaded NAPI mandatory
 - Jumbo frames (MTU 9000) strongly recommended
 - Consider VPP + QAT for 100G single-tunnel scenarios
-- AF_XDP for NAT64 I/O path if conntrack becomes a bottleneck
+- AF_XDP for NAT64 I/O path for maximum throughput at 100G+
 
 ---
 
@@ -1621,7 +1627,7 @@ Prometheus metric when redirect targets cross NUMA boundaries.
 
 | Link | Target | Additional Cost vs. Pure IPv6 |
 |------|--------|------------------------------|
-| 10G  | 8.0+ Gbps | ~10% overhead (CLAT + NAT64 + MASQUERADE) |
+| 10G  | 8.0+ Gbps | ~10% overhead (CLAT + NAT64 + eBPF SNAT) |
 | 25G  | 16+ Gbps | ~15% overhead |
 
 ### Known Bottleneck: Single-Peer Encryption
