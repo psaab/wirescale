@@ -34,11 +34,13 @@
 7. [Cross-Cluster Connectivity](#7-cross-cluster-connectivity)
 8. [IPv4 in an IPv6-Only World](#8-ipv4-in-an-ipv6-only-world)
 9. [DNS Architecture](#9-dns-architecture)
-10. [Security Model](#10-security-model)
-11. [Custom Resource Definitions](#11-custom-resource-definitions)
-12. [Packet Flow Walkthrough](#12-packet-flow-walkthrough)
-13. [Comparison with Existing Solutions](#13-comparison-with-existing-solutions)
-14. [Implementation Phases](#14-implementation-phases)
+10. [Cross-Cluster Service Discovery and Load Balancing](#10-cross-cluster-service-discovery-and-load-balancing)
+11. [Host-Network Pods](#11-host-network-pods)
+12. [Security Model](#12-security-model)
+13. [Custom Resource Definitions](#13-custom-resource-definitions)
+14. [Packet Flow Walkthrough](#14-packet-flow-walkthrough)
+15. [Comparison with Existing Solutions](#15-comparison-with-existing-solutions)
+16. [Implementation Phases](#16-implementation-phases)
 
 ---
 
@@ -1209,7 +1211,497 @@ Pod receives AAAA (native or synthesized)
 
 ---
 
-## 10. Security Model
+## 10. Cross-Cluster Service Discovery and Load Balancing
+
+Sections 7 and 9 describe how individual pods in one cluster can reach
+individual pods in another via on-demand WireGuard peering and cross-cluster
+DNS. However, Kubernetes workloads overwhelmingly communicate via **Services**,
+not raw pod IPs. Cilium's ClusterMesh provides multi-cluster services through
+full state synchronization -- an approach that does not scale past a handful of
+clusters (see [Section 5 of CILIUM-INTEGRATION.md](CILIUM-INTEGRATION.md#5-multi-cluster-clustermesh-vs-global-directory)).
+This section designs the Wirescale replacement: on-demand, hierarchical
+cross-cluster service discovery and load balancing that maintains O(active_services)
+state per node, not O(all_services_all_clusters).
+
+### 10.1 Cross-Cluster Service Model
+
+A pod in cluster-1 discovers and reaches a Service in cluster-2 through the
+following conceptual flow:
+
+1. **Export:** The service owner in cluster-2 creates a `WirescaleServiceExport`
+   declaring that a local Service is available to remote clusters.
+2. **Register:** The cluster-2 controller registers the exported service with
+   the global directory as a lightweight metadata entry.
+3. **Import:** A consuming cluster (cluster-1) creates a `WirescaleServiceImport`
+   that references the remote service by name and origin cluster.
+4. **Resolve:** When a pod in cluster-1 first attempts to reach the imported
+   service (via DNS or VIP), the local controller resolves endpoints on demand
+   through the hierarchy: local controller -> directory -> remote controller.
+5. **Connect:** The resolved backend endpoints are programmed into the local
+   cluster's load-balancing datapath. WireGuard peers to the remote backend
+   nodes are established on demand (the existing cross-cluster peering flow
+   from Section 7).
+
+A node in cluster-1 MUST NOT learn about services in cluster-2 unless a
+`WirescaleServiceImport` in cluster-1 explicitly references them. There is no
+background synchronization of service catalogs.
+
+### 10.2 WirescaleServiceExport / WirescaleServiceImport CRDs
+
+The CRD design follows the KEP-1645 Multi-Cluster Services API pattern but
+adapts it for the three-tier hierarchy.
+
+**WirescaleServiceExport** (namespace-scoped, in the exporting cluster):
+
+```yaml
+apiVersion: wirescale.io/v1alpha1
+kind: WirescaleServiceExport
+metadata:
+  name: api-server
+  namespace: backend
+spec:
+  serviceRef:
+    name: api-server
+    ports:                              # optional: export a subset of ports
+      - { name: grpc, port: 9090, protocol: TCP }
+  allowedClusters: ["cluster-1", "cluster-3"]   # empty = all federated clusters
+  topology:
+    mode: proximity                     # "proximity" | "global" | "weighted" | "failover"
+  globalName: "api-server.backend"      # optional: override global service name
+status:
+  exported: true
+  registeredInDirectory: true
+  importingClusters:
+    - { clusterID: "cluster-1", lastSync: "2026-03-10T08:00:00Z" }
+```
+
+**WirescaleServiceImport** (namespace-scoped, in the importing cluster):
+
+```yaml
+apiVersion: wirescale.io/v1alpha1
+kind: WirescaleServiceImport
+metadata:
+  name: remote-api-server
+  namespace: backend
+spec:
+  sourceCluster: "cluster-2"
+  serviceRef: { name: api-server, namespace: backend }
+  localServiceName: api-server-cluster2   # local k8s Service created with this name
+  ports:
+    - { name: grpc, port: 9090, protocol: TCP }
+  vip:
+    mode: allocate                        # "allocate" | "global" (see Section 10.4)
+  healthCheck:
+    intervalSeconds: 10
+    timeoutSeconds: 3
+status:
+  imported: true
+  vip: "3fff:1d:0001:ffff::a02"
+  vipv4: "100.64.255.42"
+  endpoints:
+    - { clusterID: "cluster-2", ready: 3, notReady: 0, lastResolved: "2026-03-10T08:00:15Z" }
+```
+
+### 10.3 Resolution via the Control Hierarchy
+
+Service resolution follows the same three-tier, on-demand pattern as
+cross-cluster peer resolution. The directory gains a lightweight service
+registry; controllers handle endpoint resolution.
+
+```
+Pod in cluster-1 resolves "api-server-cluster2.backend.svc.cluster.local"
+  |
+  v
+CoreDNS -> kube-proxy/Cilium service VIP (allocated locally)
+  |
+  v
+First packet hits VIP with no backends programmed (cold path):
+  1. wirescale-agent intercepts (no backend in eBPF/IPVS map)
+  2. Agent -> wirescale-control (cluster-1):
+       "resolve WirescaleServiceImport backend/remote-api-server"
+  3. Control (cluster-1) checks local endpoint cache
+     a. Cache miss: control -> global directory:
+        "service api-server.backend exported by cluster-2?"
+     b. Directory -> control:
+        {cluster_2_controller, endpoint_count: 3, ports: [9090/TCP]}
+     c. Control caches directory response (TTL 300s)
+  4. Control (cluster-1) -> control (cluster-2) via mTLS:
+       "give me endpoints for Service backend/api-server"
+  5. Control (cluster-2) returns:
+       {endpoints: [
+         {ip: "3fff:1d:0002:000a::5", node: "3fff:1d:0002:000a::/64",
+          port: 9090, zone: "us-east-2a"},
+         {ip: "3fff:1d:0002:0014::3", node: "3fff:1d:0002:0014::/64",
+          port: 9090, zone: "us-east-2b"},
+         {ip: "3fff:1d:0002:001e::9", node: "3fff:1d:0002:001e::/64",
+          port: 9090, zone: "us-east-2c"}
+       ], TTL: 30}
+  6. Control (cluster-1) -> agent:
+       endpoint list for the imported service
+  7. Agent programs endpoints into local LB datapath
+       (eBPF map or IPVS, depending on datapath mode)
+  8. Agent triggers on-demand WireGuard peer setup for the
+       selected backend node (standard Section 7 flow)
+  9. Queued packets drain to the selected backend
+```
+
+**Subsequent requests:** The agent holds a cached endpoint list (TTL-based).
+Backend selection and WireGuard peering are warm-path operations. The
+controller refreshes endpoints from the remote cluster before TTL expiry.
+
+**Endpoint TTL:** Remote endpoint lists MUST have a short TTL (default 30s)
+because the importing cluster does not watch remote pod events. The remote
+controller MUST return the current healthy endpoint set at each refresh. If
+the remote controller is unreachable, the agent MUST continue using the
+last-known endpoint list until `staleEndpointTimeout` (default 120s),
+then mark the service as degraded.
+
+### 10.4 Cross-Cluster Service VIPs
+
+Three VIP strategies are supported, selectable per `WirescaleServiceImport`:
+
+| Strategy | VIP Source | Pros | Cons |
+|----------|-----------|------|------|
+| **Local allocation** (default) | Local cluster service CIDR (`3fff:1d:CCCC:ffff::/108`) | No cross-cluster VIP coordination; works with any CNI; kube-proxy/Cilium handles VIP natively | Same service has different VIPs in each importing cluster |
+| **Global VIP** | Federation service CIDR (`3fff:1d:0000:ffff::/108`, reserved) | Same VIP everywhere; enables service migration | Requires directory-level VIP allocation; nodes must recognize the global service CIDR |
+| **Anycast VIP** | Shared prefix announced via BGP from multiple clusters | Clients routed to nearest cluster by network topology | Requires BGP integration; connection pinning challenges |
+
+**Local allocation (default):** `wirescale-control` allocates a VIP from the
+local `serviceCIDRv6` (e.g., `3fff:1d:0001:ffff::/108`) and a corresponding
+IPv4 VIP from `serviceCIDRv4`. A Kubernetes Service is created with
+EndpointSlice entries managed by wirescale-control. kube-proxy or Cilium
+handles the VIP natively -- no changes required.
+
+**Global VIP:** The global directory allocates VIPs from the reserved
+federation service prefix `3fff:1d:0000:ffff::/108`. Every importing cluster
+programs the same VIP. The global CIDR MUST be routed on every node. Useful
+when VIPs are embedded in configuration or when services migrate between
+clusters.
+
+**Example VIP allocation (local mode):**
+
+```
+Cluster-1 imports "api-server" from cluster-2:
+  Local VIP:     3fff:1d:0001:ffff::a02 / 100.64.255.42
+  Backends:      3fff:1d:0002:000a::5:9090
+                 3fff:1d:0002:0014::3:9090
+                 3fff:1d:0002:001e::9:9090
+
+Cluster-3 imports the same service:
+  Local VIP:     3fff:1d:0003:ffff::701 / 100.64.255.33
+  Backends:      (same remote endpoints, different local VIP)
+```
+
+### 10.5 Load Balancing
+
+Traffic distribution across backends in multiple clusters uses a two-level
+scheme: **inter-cluster** (which cluster receives traffic) and
+**intra-cluster** (which endpoint within the chosen cluster).
+
+**Topology-aware inter-cluster selection:**
+
+When a service is available in both the local cluster and remote clusters
+(a service exported from multiple clusters, or a local service augmented
+by remote backends), the load balancer MUST support topology preferences:
+
+| Mode | Behavior |
+|------|----------|
+| `proximity` (default) | Prefer local-cluster backends. Spill to remote clusters only when local backends are insufficient (< `minLocalEndpoints`) or unhealthy. |
+| `global` | Treat all backends across all clusters as a single pool. Weight by endpoint count per cluster. |
+| `weighted` | Explicit per-cluster weights (e.g., cluster-1: 70%, cluster-2: 30%). |
+| `failover` | Use remote backends only when all local backends are unhealthy. |
+
+**Intra-cluster backend selection:** Within a chosen cluster, standard
+load-balancing applies: Maglev consistent hashing (for eBPF/Cilium datapath)
+or round-robin (for IPVS). The agent programs remote backends into the same
+LB map used for local services.
+
+**Session affinity:** When `sessionAffinity: ClientIP` is configured on the
+`WirescaleServiceImport`, the LB MUST pin a given source IP to a consistent
+backend across clusters for the affinity timeout. Maglev hashing naturally
+provides this property.
+
+**Endpoint weighting:** Remote endpoints MAY carry weights reported by the
+exporting cluster's controller. Controllers SHOULD set lower weights for
+endpoints in zones with high latency relative to the importing cluster.
+
+### 10.6 DNS Integration
+
+Cross-cluster services appear in DNS through two complementary mechanisms.
+
+**Mechanism 1: Standard Kubernetes DNS (via local Service, RECOMMENDED)**
+
+Each `WirescaleServiceImport` creates a local Kubernetes Service, so standard
+DNS works without modification:
+
+```
+api-server-cluster2.backend.svc.cluster.local  ->  3fff:1d:0001:ffff::a02
+```
+
+**Mechanism 2: Wirescale mesh DNS (global names)**
+
+For federation-wide names consistent across clusters, the wirescale-agent DNS
+sidecar (from Section 9) resolves names under a dedicated zone:
+
+```
+<service>.<namespace>.svc.ws.<cluster-name>.internal   -> remote service VIP
+<service>.<namespace>.svc.ws.global.internal           -> global VIP (if allocated)
+```
+
+Examples:
+```
+api-server.backend.svc.ws.cluster-2.internal     -> 3fff:1d:0001:ffff::a02
+                                                    (local VIP for cluster-2's export)
+api-server.backend.svc.ws.global.internal        -> 3fff:1d:0000:ffff::42
+                                                    (federation global VIP)
+```
+
+Both zones are resolved by the wirescale-agent DNS sidecar via on-demand
+queries to wirescale-control.
+
+**DNS query flow for cross-cluster service:**
+
+```
+Pod queries "api-server.backend.svc.ws.cluster-2.internal"
+  |
+  v
+CoreDNS: matches ws.*.internal -> forward to wirescale-agent DNS
+  |
+  v
+wirescale-agent DNS:
+  lookup in-memory cache for service VIP
+  if miss: query wirescale-control for imported service resolution
+  return: AAAA 3fff:1d:0001:ffff::a02 / A 100.64.255.42
+  |
+  v
+Pod connects to VIP -> LB selects backend -> WireGuard tunnel to remote node
+```
+
+### 10.7 Health Checking
+
+Backend health is tracked across clusters without requiring direct probe
+connectivity from every importing node to every remote backend.
+
+**Responsibility model:**
+
+| Component | Health-Check Scope |
+|-----------|-------------------|
+| Remote wirescale-control | Tracks readiness of local endpoints via Kubernetes readinessProbe / EndpointSlice status |
+| Remote wirescale-control | Runs optional L4 probe (TCP connect) or L7 probe (HTTP GET) to backends |
+| Local wirescale-control | Receives healthy endpoint list from remote control at each refresh (TTL-based) |
+| Local wirescale-agent | Removes unhealthy backends from LB map when refresh indicates endpoint removal |
+
+**Cross-cluster health propagation:**
+
+```
+cluster-2 (exporting):
+  Pod becomes unready (kubelet readinessProbe fails)
+    -> EndpointSlice updated (endpoint removed)
+    -> wirescale-control updates in-memory service endpoint set
+
+cluster-1 (importing):
+  wirescale-control refreshes endpoints (every TTL interval, default 30s)
+    -> remote control returns updated endpoint list (unhealthy pod excluded)
+    -> local control pushes updated list to subscribed agents
+    -> agents reprogram LB map
+    -> total propagation delay: <= 1 TTL interval (30s default)
+```
+
+**Fast-path health detection:** The local agent MAY detect unresponsive
+remote backends via transport-layer signals (TCP RST, ICMP unreachable,
+WireGuard handshake timeout). On such detection, the agent SHOULD
+immediately remove the backend from its local LB map and notify
+wirescale-control to trigger an out-of-band endpoint refresh.
+
+**Circuit breaking:** When all backends for an imported service are
+unhealthy, the agent MUST return ICMP destination unreachable for new
+connections (rather than black-holing traffic). If `failover` topology mode
+is configured, the agent MUST attempt resolution from the next-priority
+cluster before declaring the service down.
+
+### 10.8 Interaction with Cilium
+
+When Cilium is the intra-cluster CNI, cross-cluster services integrate
+with Cilium's service handling via standard Kubernetes primitives.
+
+**Service and EndpointSlice injection:**
+
+`wirescale-control` creates and manages standard Kubernetes Service and
+EndpointSlice objects for each `WirescaleServiceImport`. Cilium observes
+these through its normal Kubernetes API watches and programs them into
+its eBPF `lb4_services_v2` / `lb6_services_v2` maps. From Cilium's
+perspective, cross-cluster service backends are indistinguishable from
+local backends.
+
+```
+wirescale-control creates:
+  Service:        backend/api-server-cluster2  (ClusterIP: 3fff:1d:0001:ffff::a02)
+  EndpointSlice:  backend/api-server-cluster2-ws-xxxx
+    endpoints:
+      - addresses: ["3fff:1d:0002:000a::5"]
+        conditions: {ready: true}
+        targetRef: null     # no local pod -- external endpoint
+        zone: "us-east-2a"
+      - addresses: ["3fff:1d:0002:0014::3"]
+        conditions: {ready: true}
+
+Cilium sees the Service + EndpointSlice:
+  -> programs eBPF LB maps
+  -> applies CiliumNetworkPolicy if any match the service
+  -> Hubble observes flows to the service normally
+```
+
+**Encryption boundary:** Cilium handles intra-cluster WireGuard. When a
+backend IP falls outside the local cluster's prefix (e.g.,
+`3fff:1d:0002::/32` is not in cluster-1's `3fff:1d:0001::/32`), the packet
+matches a Wirescale aggregate route and exits via the Wirescale cross-cluster
+WireGuard interface (`wg0`). Cilium's `cilium_wg0` does not handle
+cross-cluster peers. The boundary is clean: Cilium encrypts intra-cluster,
+Wirescale encrypts cross-cluster.
+
+**Policy enforcement:** `CiliumNetworkPolicy` rules that reference the
+imported service's VIP or label selectors work normally. For identity-aware
+cross-cluster policy, the Wirescale controller annotates the EndpointSlice
+with a `wirescale.io/source-cluster` label, enabling policies such as:
+
+```yaml
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: allow-from-remote-api
+  namespace: frontend
+spec:
+  endpointSelector:
+    matchLabels:
+      app: web
+  egress:
+    - toServices:
+        - k8sService:
+            serviceName: api-server-cluster2
+            namespace: backend
+      toPorts:
+        - ports:
+            - port: "9090"
+              protocol: TCP
+```
+
+**Standalone Wirescale (no Cilium):** When Wirescale is the only CNI, the
+agent programs cross-cluster service backends directly into eBPF LB maps
+or IPVS. The same `WirescaleServiceImport` CRD drives both modes; only
+the datapath backend differs.
+
+### 10.9 Comparison with Alternatives
+
+| Property | Wirescale Cross-Cluster Services | Cilium ClusterMesh Services | KEP-1645 MCS API |
+|----------|----------------------------------|---------------------------|-------------------|
+| State model | On-demand, O(active_imports) per node | Full sync, O(all_services_all_clusters) | Implementation-dependent |
+| Service discovery | Pull-based via control hierarchy | Push-based via etcd sync | API-defined, impl varies |
+| VIP allocation | Local, global, or anycast | Shared global (annotation) | Not specified |
+| Load balancing | Topology-aware, weighted, failover | Round-robin across merged backends | Not specified |
+| Health checking | Delegated to exporting cluster, TTL refresh | Merged EndpointSlice sync | Not specified |
+| First-flow latency | ~30-65ms (endpoint resolve + WG peer) | 0ms (pre-synced) | Implementation-dependent |
+| Scale limit | O(clusters) directory + O(active_imports) per node | O(clusters x services) full sync | Implementation-dependent |
+| Cilium compatibility | Native (Service + EndpointSlice) | Native | Requires MCS controller |
+| DNS | Standard k8s DNS + optional ws.* zone | clusterset.local zone | svcname.ns.svc.clusterset.local |
+
+---
+
+## 11. Host-Network Pods
+
+Pods running with `hostNetwork: true` bypass the CNI entirely -- no veth
+pair, no per-pod eBPF attachment point, no CLAT translation layer. This
+section specifies how Wirescale handles them.
+
+### Identity Model
+
+A host-network pod shares the node's IP addresses, so its network
+identity is indistinguishable from the node's identity at L3/L4:
+
+- A host-network pod MUST inherit the node's Wirescale identity (the
+  WireGuard public key and node certificate). It MUST NOT receive a
+  separate pod-level identity.
+- When wirescale-control resolves the source identity for traffic from
+  a host-network pod, it MUST return the node identity. The agent MUST
+  tag such traffic with node-level labels (e.g., `node=worker-07`,
+  `role=infra`) rather than pod-level labels.
+- If multiple host-network pods bind distinct ports, policy rules MAY
+  use L4 port matching to distinguish them. Operators SHOULD NOT rely
+  on port-based identity for security-critical decisions.
+
+### WireGuard Data Path
+
+Traffic from host-network pods originates in the host network namespace,
+where `wg0` already resides. The data path is simpler than for regular
+pods:
+
+```
+Host-network pod sends to fd00:1d:2::7 (remote pod):
+  |  Packet originates in host netns (no veth traversal)
+  v
+Host routing table: fd00:1d:2::/64 dev wg0 -> WireGuard encrypt
+  v
+Physical NIC (eth0): encrypted UDP to remote node
+```
+
+- Outbound traffic MUST traverse `wg0` for remote destinations,
+  following the same routing rules as host-originated traffic. No
+  special forwarding configuration is required.
+- Inbound traffic arrives through `wg0` (from remote mesh peers) and
+  is delivered to the host stack directly.
+
+### CLAT: Not Applicable
+
+Host-network pods use the host's full network stack, including any IPv4
+addresses on the node's physical interfaces. CLAT translation (mapping
+per-pod `100.64.x.x` to ULA `fd00:1d:N::P`) does not apply:
+
+- The agent MUST NOT install CLAT rules for host-network pods.
+- Host-network pods needing IPv4-only external services MUST use the
+  node's NAT64 path (`64:ff9b::/96`) or native IPv4 connectivity.
+
+### Policy Enforcement
+
+Regular pods have eBPF programs attached to their veth interfaces.
+Host-network pods have no veth, so enforcement MUST use a different
+attachment point.
+
+**Standalone Wirescale (no Cilium):**
+
+- The agent MUST enforce policy using nftables rules in the
+  `inet wirescale_host` table, matching on the node's IP and L4 ports.
+- Rules MUST be programmed at pod admission time and removed at
+  teardown. Nftables is preferred over eBPF on `eth0` because the
+  physical interface may carry TC programs from other subsystems.
+
+**With Cilium CNI:**
+
+- Cilium's host firewall attaches TC eBPF to `eth0` and enforces
+  `CiliumClusterwideNetworkPolicy` for host-level traffic. Wirescale
+  SHOULD defer host-network pod L3/L4 policy to Cilium's host firewall
+  when detected. The agent MUST NOT install conflicting nftables rules.
+- Wirescale MUST still enforce WireGuard encryption: inter-node traffic
+  from host-network pods MUST traverse `wg0` regardless of whether
+  Cilium handles L3/L4 filtering.
+
+### Operator Guidance
+
+| Concern | Regular Pod | Host-Network Pod |
+|---------|-------------|------------------|
+| Identity | Pod IP + SA + labels | Node IP + node labels |
+| eBPF attachment | veth (TC hook) | N/A (no veth) |
+| L3/L4 policy | Per-pod eBPF maps | nftables or Cilium host firewall |
+| CLAT | Per-pod `100.64.x.x` | Not applicable |
+| WireGuard path | veth -> host route -> wg0 | host route -> wg0 (direct) |
+| Encryption | Always (inter-node) | Always (inter-node) |
+
+Operators SHOULD minimize the use of `hostNetwork: true` pods. Each
+host-network pod widens the node's attack surface because it shares the
+node's identity and network namespace. Where possible, use regular pods
+with explicit `hostPort` mappings instead.
+
+---
+
+## 12. Security Model
 
 ### Encryption
 
@@ -1305,7 +1797,7 @@ spec:
 
 ---
 
-## 11. Custom Resource Definitions
+## 13. Custom Resource Definitions
 
 ### WirescaleMesh (cluster-scoped, singleton)
 
@@ -1520,7 +2012,7 @@ status:
 
 ---
 
-## 12. Packet Flow Walkthrough
+## 14. Packet Flow Walkthrough
 
 ### Case 1: Pod-to-Pod, Same Node
 
@@ -1681,7 +2173,7 @@ Node-2: wg0 decrypt -> verify AllowedIPs -> route to Pod B
 
 ---
 
-## 13. Comparison with Existing Solutions
+## 15. Comparison with Existing Solutions
 
 | Feature | Wirescale | Tailscale K8s Operator | Cilium WireGuard | Calico WireGuard | Kilo |
 |---------|-----------|----------------------|------------------|------------------|------|
@@ -1723,7 +2215,7 @@ resolves individual nodes on demand.
 
 ---
 
-## 14. Implementation Phases
+## 16. Implementation Phases
 
 ### Phase 1: Control Plane and Core Mesh
 

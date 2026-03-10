@@ -535,6 +535,107 @@ latency to approximately the intra-cluster level:
 | Intra-cluster | ~7-15 ms | ~7-15 ms (same) |
 | Cross-cluster | ~30-150 ms | ~7-15 ms (cache hit) |
 
+### Thundering Herd / Cold Start Mitigation
+
+When a large deployment restarts -- node pool replacement, cluster upgrade,
+or mass pod rescheduling -- thousands of agents simultaneously query
+wirescale-control for peer resolution and identity lookups. Without
+mitigation, this thundering herd can overwhelm the control plane and
+cascade into TCP SYN retry exhaustion.
+
+#### Agent-Side Mitigations
+
+**Jittered startup delay.** Each agent MUST delay its first gRPC
+connection by a random interval drawn from `[0, startup_jitter_max]`
+(default: 5s for <= 1K nodes, 15s for <= 10K nodes; configurable via
+the `WirescaleAgent` CRD). During the jitter window the agent MUST
+still configure `wg0` and install routes from any persisted peer cache
+(see Pre-Warming below). Only the control-plane connection is deferred.
+
+**Exponential backoff on cache misses.** When the agent's cache is cold,
+the first packets to many destinations trigger simultaneous cache misses.
+The agent MUST rate-limit outbound queries to wirescale-control:
+
+- Initial query rate cap: 50 queries/sec per agent.
+- On repeated failures (HTTP 429 or gRPC RESOURCE_EXHAUSTED), the agent
+  MUST apply exponential backoff: base interval 100 ms, multiplier 2x,
+  maximum interval 10 seconds.
+- Queries MUST be batched where possible -- a single gRPC call SHOULD
+  resolve up to 100 identity or peer lookups.
+
+**Circuit breaker.** If wirescale-control returns errors for more than
+50% of requests in a 10-second sliding window, the agent MUST open its
+circuit breaker:
+
+- While open, the agent MUST NOT send new queries. It MUST serve traffic
+  using whatever cached state exists (stale entries with extended TTL).
+- The agent MUST attempt a single probe query every 5 seconds.
+- After 3 consecutive successful probes, the circuit breaker closes and
+  normal querying resumes.
+
+#### Control-Side Mitigations
+
+**Request prioritization.** Wirescale-control MUST prioritize requests
+during cold-start bursts:
+
+| Priority | Request Type | Rationale |
+|----------|-------------|-----------|
+| 1 (highest) | Intra-cluster peer lookups | Local traffic is most latency-sensitive |
+| 2 | Identity lookups for active flows | Required for policy enforcement |
+| 3 | Cross-cluster peer resolution | Can tolerate higher latency |
+| 4 (lowest) | Bulk policy pulls | Can be deferred until burst subsides |
+
+**Per-node rate limiting.** Wirescale-control MUST enforce per-node rate
+limits (default: 200 queries/sec per node, 10K queries/sec aggregate per
+replica). Excess requests MUST receive gRPC `RESOURCE_EXHAUSTED`, which
+triggers the agent's exponential backoff.
+
+#### Pre-Warming: Persisted Peer Cache
+
+To minimize cold-start latency, the agent SHOULD persist a snapshot of
+its peer and identity cache to local disk:
+
+- **Snapshot frequency:** Every 60 seconds and on graceful shutdown.
+- **Snapshot contents:** WireGuard peer public keys, endpoints, allowed
+  CIDRs, and identity cache entries with remaining TTLs.
+- **Snapshot location:** `/var/lib/wirescale/peer-cache.json` (or a
+  configurable path).
+- **Recovery behavior:** On startup, the agent MUST load the snapshot
+  and install WireGuard peers and routes immediately, before contacting
+  wirescale-control. Cached entries MUST be marked stale and refreshed
+  within `stale_refresh_window` (default: 30 seconds).
+- **Staleness bound:** If a cached entry is older than `max_stale_age`
+  (default: 10 minutes), the agent MUST discard it rather than install
+  a potentially-invalid peer.
+
+Pre-warming reduces cold-start resolution from full cold-path latency
+(~7-15 ms intra-cluster, ~30-150 ms cross-cluster) to near-zero for
+previously-active peers.
+
+#### TCP SYN Retry Budget Interaction
+
+During mass cold start, application pods send TCP SYNs to destinations
+whose WireGuard peers do not yet exist. The SYN is queued in the agent's
+buffer while the cold path resolves. If resolution takes too long, TCP
+retransmit timers fire:
+
+| TCP Retry | Time Since SYN | Risk |
+|-----------|---------------|------|
+| SYN+0     | 0 ms          | Queued in agent buffer |
+| Retry 1   | ~1,000 ms     | Cold path SHOULD complete (7-150 ms) |
+| Retry 2   | ~3,000 ms     | Only if control is overloaded |
+| Retry 3   | ~7,000 ms     | Circuit breaker likely open |
+
+- The agent's packet queue MUST hold at least the first SYN for each
+  destination (default buffer: 64 packets per pending peer).
+- With pre-warming and jittered startup, cold-path latency SHOULD
+  remain within the first TCP retransmit window (1 second) for the
+  vast majority of flows.
+- If cold-path resolution exceeds 3 seconds, the agent MUST log a
+  warning and emit a `wirescale_cold_path_timeout_total` metric.
+  Applications will see elevated latency but MUST NOT see failures
+  unless the cold path exceeds the application's connect timeout.
+
 ---
 
 ## 6. Three-Tier Control Plane Performance

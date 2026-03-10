@@ -36,7 +36,8 @@
 11. [Mutual Authentication](#11-mutual-authentication)
 12. [Audit and Observability](#12-audit-and-observability)
 13. [Threat Model and Mitigations](#13-threat-model-and-mitigations)
-14. [Implementation Details](#14-implementation-details)
+14. [BPF Map Access Control](#14-bpf-map-access-control)
+15. [Implementation Details](#15-implementation-details)
 
 ---
 
@@ -1723,6 +1724,8 @@ TIMESTAMP           ACTION  SRC_CLUSTER  SRC                DST_CLUSTER  DST    
 | T15 | Global directory compromise (T-DIRECTORY) | Fraudulent cluster entries, cross-cluster MITM | Certificate pinning for known clusters. Out-of-band CA verification. Audit logging on all directory operations. Intra-cluster operations unaffected. See expanded analysis below. |
 | T16 | Cross-cluster identity forgery | Remote cluster serves fake identity | Dual-side policy enforcement (both clusters must allow). Short TTL on cross-cluster cache. Controller validates remote identity against known prefix allocation. |
 | T17 | Cluster CA compromise | All nodes/pods in that cluster can be impersonated | Blast radius limited to the compromised cluster. Global directory can revoke the cluster. Other clusters are unaffected. CA rotation procedure restores trust. |
+| T18 | Supply chain attack on agent container image loads malicious eBPF | TC program returns `TC_ACT_OK` unconditionally, bypassing all policy enforcement | Image signing, eBPF hash verification, runtime audit, read-only filesystem |
+| T19 | Pull model concentrates communication metadata at wirescale-control | Complete communication graph observable at a single point | Query log retention limits, access control, optional anonymization |
 
 ### Expanded Threat Analysis
 
@@ -1806,6 +1809,87 @@ If an attacker gains control of the global directory:
   - Recovery: restore directory from backup (small data set), re-verify
     all cluster CA entries
 
+**T18: Compromised Agent Loading Malicious eBPF (Supply Chain)**
+
+**Threat vector:** An attacker compromises the `wirescale-agent`
+container image in the build pipeline or registry. The modified agent
+loads a TC eBPF program that returns `TC_ACT_OK` for all packets,
+effectively disabling deny-by-default enforcement. Because the eBPF
+program runs in kernel context and is attached to every pod veth, this
+is a silent, total policy bypass on every node running the compromised
+image.
+
+**Impact:** All identity-based access control is nullified. Any pod can
+communicate with any other pod, including cross-namespace and
+cross-cluster flows that policy would otherwise deny. The attack is
+invisible to pod-level monitoring because packets are never dropped.
+
+**Mitigations:**
+
+- **Image signing:** Agent container images MUST be signed using
+  cosign/Sigstore. Kubernetes admission controllers (e.g., Kyverno,
+  Gatekeeper) MUST verify signatures before allowing agent DaemonSet
+  updates. Unsigned or incorrectly signed images MUST be rejected.
+
+- **eBPF program hash verification:** The agent MUST compute a SHA-256
+  hash of the compiled eBPF ELF object before loading it via
+  `bpf(BPF_PROG_LOAD)`. This hash MUST be compared against a known-good
+  hash embedded in the agent binary or distributed via a signed
+  ConfigMap. A mismatch MUST prevent program loading and MUST generate
+  a critical alert.
+
+- **Runtime BPF program audit:** A cluster-level audit job SHOULD
+  periodically run `bpftool prog show` on each node and compare the
+  `xlated` program hash against the expected value. Divergence MUST
+  trigger an alert and MAY trigger automatic node cordon.
+
+- **Read-only agent filesystem:** The agent container MUST run with a
+  read-only root filesystem (`readOnlyRootFilesystem: true`). The eBPF
+  ELF objects MUST be embedded in the container image, not downloaded
+  at runtime. This prevents an attacker who gains write access to the
+  agent's filesystem from replacing the eBPF program on disk.
+
+- **Least-privilege loading:** Only the agent process MUST hold
+  `CAP_BPF` and `CAP_NET_ADMIN`. These capabilities MUST NOT be
+  granted to any other container in the agent pod.
+
+**T19: Metadata Leakage from Pull-Based Resolution Model**
+
+**Threat:** In the pull-based architecture, every agent queries
+`wirescale-control` to resolve identities and authorize peers on demand.
+This means `wirescale-control` observes every unique peer resolution
+request and can reconstruct the complete node-to-node (and, by
+extension, pod-to-pod) communication graph for the cluster. An attacker
+who compromises control's query logs -- or an insider with access to
+control's observability stack -- gains a full picture of which workloads
+communicate with which others.
+
+**Comparison to push model:** In a push-based architecture (e.g., CRD
+watches with distributed identity tables), metadata is diffused across
+many watch streams and no single component sees all communication pairs.
+The pull model trades this diffusion for operational simplicity and
+minimal per-node state, but concentrates metadata at the controller.
+
+**Mitigations:**
+
+- **Query log retention limits:** `wirescale-control` MUST enforce a
+  configurable maximum retention period for identity and peer query
+  logs (default SHOULD be 24 hours). Logs older than the retention
+  window MUST be purged automatically.
+- **Access control on control logs:** Query logs MUST be treated as
+  sensitive data. Access MUST be restricted to cluster administrators
+  via RBAC. Log export pipelines SHOULD enforce the same access
+  controls as the originating logs.
+- **Optional query anonymization:** Operators MAY enable batch query
+  mode, where agents accumulate multiple identity resolution requests
+  and submit them in a single batch at randomized intervals. This
+  reduces the temporal precision of the communication graph observable
+  at control, at the cost of increased first-packet latency for
+  cache misses.
+- **Audit of log access:** Access to `wirescale-control` query logs
+  SHOULD itself be audit-logged, providing a record of who viewed
+  the communication graph metadata.
+
 ### Defense in Depth Stack
 
 ```
@@ -1863,7 +1947,71 @@ Attack surface reduced by:
 
 ---
 
-## 14. Implementation Details
+## 14. BPF Map Access Control
+
+### BPF Map Access Control
+
+**Threat:** BPF maps pinned under `/sys/fs/bpf/` are accessible to any
+process with `CAP_BPF` or `CAP_SYS_ADMIN`. After a container escape
+(see T6), an attacker with elevated capabilities can read
+`identity_cache`, `policy_map`, and `peer_cache` to reconstruct the
+node's communication graph and policy decisions. This is a local
+information disclosure -- it does not grant the ability to modify policy
+or inject traffic, but it reveals the topology of active flows.
+
+**Pinning strategy:**
+
+- Maps that require cross-program sharing (e.g., `identity_cache`,
+  `policy_map`, `policy_map_shadow`, `active_map_selector`) MUST be
+  pinned under `/sys/fs/bpf/wirescale/` so the agent and TC programs
+  can share them.
+- Maps that are private to a single eBPF program (e.g., per-veth
+  scratch maps, temporary lookup buffers) SHOULD use fd-only maps
+  (created without pinning). Fd-only maps are not visible in the
+  BPF filesystem and are inaccessible without the owning file
+  descriptor.
+- The `connection_log` ring buffer SHOULD be fd-only where the
+  architecture permits. If it must be pinned for multi-program
+  access, it MUST follow the filesystem restrictions below.
+
+**Filesystem permissions:**
+
+- The directory `/sys/fs/bpf/wirescale/` MUST be owned by
+  `root:wirescale` with mode `0700`.
+- The `wirescale-agent` process MUST run as root (or with the
+  required capabilities) and MUST be a member of the `wirescale`
+  group.
+- No other process on the node SHOULD have access to this directory.
+- Agents MUST NOT create world-readable pinned maps.
+
+**Monitoring:**
+
+- The Linux audit subsystem SHOULD be configured to log access
+  attempts on `/sys/fs/bpf/wirescale/` by any process other than
+  `wirescale-agent`. An example audit rule:
+
+  ```
+  -w /sys/fs/bpf/wirescale/ -p rwxa -k wirescale-bpf-access
+  ```
+
+- Agents SHOULD periodically enumerate pinned maps under
+  `/sys/fs/bpf/wirescale/` using `bpftool map show` and alert if
+  unexpected maps appear (indicating a rogue program has pinned
+  into the namespace).
+- Unauthorized `BPF_MAP_LOOKUP_ELEM` syscalls targeting Wirescale
+  maps SHOULD be detectable via `bpf_audit` tracepoints where
+  kernel support exists.
+
+**Normative requirements:**
+
+- Pinned BPF maps MUST be restricted to mode `0700` under a
+  dedicated directory.
+- Maps that do not require cross-program sharing MUST NOT be pinned.
+- Filesystem access to `/sys/fs/bpf/wirescale/` MUST be audited.
+
+---
+
+## 15. Implementation Details
 
 ### Implementation Phases
 
