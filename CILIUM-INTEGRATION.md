@@ -24,6 +24,8 @@
 - [SECURITY.md](SECURITY.md) -- Network security and dynamic access control
 - [ROUTABLE-PREFIX.md](ROUTABLE-PREFIX.md) -- Globally routable /64-per-host
   design
+- [CILIUM-SECURITY-GAPS.md](CILIUM-SECURITY-GAPS.md) -- Security isolation
+  gaps in Cilium-only deployments and how Wirescale closes them
 
 ---
 

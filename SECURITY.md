@@ -16,6 +16,8 @@
 - [PERFORMANCE.md](PERFORMANCE.md) -- Line-rate performance engineering
 - [ROUTABLE-PREFIX.md](ROUTABLE-PREFIX.md) -- Globally routable /64-per-host design
 - [CILIUM-INTEGRATION.md](CILIUM-INTEGRATION.md) -- Architecture comparison with Cilium as CNI
+- [CILIUM-SECURITY-GAPS.md](CILIUM-SECURITY-GAPS.md) -- Security isolation
+  gaps in Cilium-only deployments and how Wirescale closes them
 
 ---
 
