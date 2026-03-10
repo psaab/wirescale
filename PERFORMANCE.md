@@ -228,18 +228,18 @@ bpf_l4_csum_replace() -- TCP/UDP pseudo-header checksum delta
 bpf_redirect(phys_ifindex, 0) -- send out physical NIC
   |
   v
-SIIT-DC stateless translation -- src becomes node's IPv4 (pod's port range preserved)
+SIIT-DC stateless translation -- src becomes 100.64.H.P (EAM from pod ULA, zero map lookups)
   |
   v
 Wire
 ```
 
-**Performance:** The eBPF translation path is O(1) per packet -- one hash
-map lookup for the address mapping, fixed-cost header rewrite, and a single
-redirect. SIIT-DC translation (RFC 7755) is fully stateless: each pod owns
-a deterministic ephemeral port range, so the return path identifies the pod
-from the destination port alone. No state table, no kernel conntrack, no
-nftables.
+**Performance:** The eBPF translation path is O(1) per packet -- pure
+arithmetic address derivation (CGNAT `100.64.H.P` ↔ pod ULA), fixed-cost
+header rewrite, and a single redirect. SIIT-DC translation (RFC 7755 with
+EAM per RFC 7757) is fully stateless: the return path derives the pod's IPv6
+address from the CGNAT destination alone -- zero map lookups. No state table,
+no kernel conntrack, no nftables.
 
 ### CLAT eBPF Program (TC on Pod veth)
 
@@ -407,7 +407,7 @@ nat64 interface:
   bpf_skb_change_proto() + bpf_redirect(eth0)
   |
   v
-SIIT-DC stateless: src = node IPv4, sport in pod's port range (no state table)
+SIIT-DC stateless: src = 100.64.H.P (EAM from pod ULA, no state table)
   |
   v
 Physical NIC TX (hardware checksum offload)

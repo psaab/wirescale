@@ -96,16 +96,17 @@ Pod (ULA fd00:1234:0001:0042::5)
   ├─ [3b] TC on nat64 interface ────────── SIIT-DC translation (IPv4 internet)
   │       • Extract IPv4 dest from 64:ff9b::C0A8:0101
   │       • IPv6 → IPv4 stateless header translation (RFC 7915)
-  │       • Source: node's IPv4, sport already in pod's port range
-  │       • No state table — port range identifies pod on return
+  │       • Source IPv4 derived arithmetically: 100.64.H.P (EAM)
+  │       • No state table — CGNAT address encodes pod identity
   │       • Redirect to physical NIC
   │
   └─ [4] Physical NIC egress ───────────── Wire
 ```
 
-Return path is the reverse: physical NIC TC ingress → destination port
-maps to pod's port range (stateless lookup) → NAT64 reverse IPv4→IPv6
-→ host routing → pod veth.
+Return path is the reverse: physical NIC TC ingress → destination
+CGNAT address `100.64.H.P` arithmetically maps back to pod IPv6
+`fd00:1234:CCCC:HHHH::P` → SIIT-DC reverse IPv4→IPv6 → host routing
+→ pod veth.
 
 ---
 
@@ -223,75 +224,95 @@ never hits NPTv6. Only genuine internet-bound traffic reaches the
 
 ## 4. SIIT-DC: Stateless IPv4 Internet Access
 
-NAT64 in the traditional sense requires stateful connection tracking
-for port-sharing SNAT. Wirescale eliminates all state by using
-**SIIT-DC (RFC 7755/7757)** with deterministic per-pod port range
-allocation. The entire IPv4 egress path is stateless — zero conntrack,
-zero state tables, pure header rewrite in eBPF.
+Traditional NAT64 requires stateful connection tracking because many
+pods share a single IPv4 address. Wirescale eliminates all state by
+using **SIIT-DC (RFC 7755) with Explicit Address Mapping (EAM, RFC
+7757)**, reusing the CGNAT address that CLAT already assigns to every
+pod. The entire IPv4 egress path is stateless — zero conntrack, zero
+state tables, pure prefix-derived header rewrite in eBPF.
 
-### 4.1 Deterministic Port Range Allocation
+### 4.1 Reusing the CLAT Address Space
 
-Each pod on a node receives a dedicated ephemeral port range. The
-kernel selects source ports from this range via per-netns
-`ip_local_port_range`. Because each pod owns a unique range, the
-return-path translator can identify the pod from the destination port
-alone — no state lookup required.
+ARCHITECTURE.md §8 already assigns each pod a deterministic CGNAT
+address via CLAT: `100.64.N.P` where N = node index and P = pod index
+within the node. The mapping is:
 
 ```
-Node IPv4: 198.51.100.1
-Port space: 1024-65535 (64,512 ports)
-Pods per node: 64 (typical)
-Ports per pod: 1,008 (64,512 / 64)
-
-Pod 0:  ports 1024-2031
-Pod 1:  ports 2032-3039
-Pod 2:  ports 3040-4047
-...
-Pod 63: ports 64528-65535
+Pod IPv6:  fd00:1234:CCCC:HHHH::P   (ULA overlay address)
+Pod IPv4:  100.64.H.P               (CGNAT, H = host index mod 256)
 ```
 
-**Configuration:** The wirescale-agent sets `net.ipv4.ip_local_port_range`
-in each pod's network namespace at admission time:
+This mapping is bidirectional and computed from the address itself — no
+lookup table. SIIT-DC at the egress boundary simply **reuses this same
+mapping** as the EAM translation rule:
 
-```bash
-# Pod 5 gets ports 6064-7071
-nsenter -t $POD_PID -n sysctl -w net.ipv4.ip_local_port_range="6064 7071"
+```
+Outbound (IPv6 → IPv4):
+  src: fd00:1234:0001:0042::5  →  100.64.66.5
+  dst: 64:ff9b::5db8:d822     →  93.184.216.34
+
+Return (IPv4 → IPv6):
+  src: 93.184.216.34           →  64:ff9b::5db8:d822
+  dst: 100.64.66.5             →  fd00:1234:0001:0042::5
 ```
 
-**Scaling:** With 1,008 ports per pod, each pod supports ~1,000
-simultaneous outbound IPv4 connections. For high-connection workloads,
-the agent MAY allocate a larger range (reducing max pods per node).
-The range is configurable per pod via annotation:
+Every field is derived from the packet itself. No state table. No port
+rewriting. Each pod gets the **full 64K port space** — no connection
+limits from shared port pools.
 
-```yaml
-metadata:
-  annotations:
-    wirescale.io/ipv4-port-range-size: "4032"   # 4x default
-```
+### 4.2 Address Space and Routing
 
-### 4.2 Stateless Translation (SIIT-DC, RFC 7755)
+`100.64.0.0/10` is CGNAT space (RFC 6598). It is not globally routable
+on the public internet. Three deployment models handle this:
 
-The `nat64` TC eBPF program performs pure header translation with no
-state:
+| Model | How it works | When to use |
+|-------|-------------|-------------|
+| **Internal egress** | CGNAT space routed within the organization's WAN. Upstream routers accept `100.64.0.0/10`. No further translation needed. | Private datacenters, enterprise WANs |
+| **Gateway SNAT** | Dedicated egress gateway nodes perform stateful `100.64.x.x → public_ipv4` SNAT with a public IPv4 pool. Stateful NAT is isolated to a small number of gateway nodes. | Public cloud, internet-facing workloads |
+| **Public EAM** | Egress gateways have a public IPv4 pool large enough for 1:1 EAM (one public IP per active pod). Fully stateless end-to-end. | High-connection workloads needing per-pod public identity |
+
+**Internal egress (recommended for most deployments):** The
+organization's border routers accept `100.64.0.0/10` as a routable
+prefix within the WAN. Each pod's CGNAT address is unique across the
+cluster (and across clusters if CGNAT ranges are scoped per-cluster,
+e.g., cluster-1 uses `100.64.0.0/18`, cluster-2 uses `100.64.64.0/18`).
+The entire path from pod to upstream NAT/firewall is stateless.
+
+**Gateway SNAT:** For traffic that must exit to the public internet with
+a routable source address, dedicated egress gateway nodes (see §12,
+`WirescaleEgressGateway`) perform the final `100.64.x.x → public_ipv4`
+SNAT using an eBPF or AF_XDP stateful translator with a public IPv4
+pool. This concentrates stateful NAT at a small number of purpose-built
+nodes (typically 2-4 per cluster for HA), keeping the rest of the mesh
+entirely stateless.
+
+### 4.3 eBPF Implementation
+
+The `nat64` TC eBPF program performs pure header translation — the
+source IPv4 is derived from the source IPv6 address, not looked up:
 
 ```c
 SEC("tc/siit_dc_egress")
 int siit_out(struct __sk_buff *skb) {
     struct ipv6hdr *ip6 = get_ipv6_hdr(skb);
 
-    /* Verify destination is NAT64 prefix */
-    if (ip6->daddr.s6_addr32[0] != NAT64_PREFIX_96[0])
+    /* Verify destination is NAT64 prefix 64:ff9b::/96 */
+    if (!is_nat64_prefix(&ip6->daddr))
         return TC_ACT_OK;
 
-    /* Extract embedded IPv4 destination */
+    /* Extract embedded IPv4 destination from low 32 bits */
     __be32 dst_v4 = ip6->daddr.s6_addr32[3];
 
-    /* Source: node's IPv4 (sport is already in pod's allocated range) */
-    __be32 src_v4 = NODE_IPV4;
+    /* Derive source IPv4 from pod's ULA address (EAM rule):
+       fd00:1234:CCCC:HHHH::P  →  100.64.H.P
+       H = htons(ip6->saddr.s6_addr16[3])  (host index, low 8 bits)
+       P = ip6->saddr.s6_addr32[3]          (pod index, low 8 bits) */
+    __be32 src_v4 = htonl(0x64400000                           /* 100.64.0.0 */
+                        | ((ntohs(ip6->saddr.s6_addr16[3]) & 0xFF) << 8)
+                        | (ntohl(ip6->saddr.s6_addr32[3]) & 0xFF));
 
-    /* Stateless IPv6→IPv4 translation (RFC 7915) */
+    /* Stateless IPv6 → IPv4 translation (RFC 7915) */
     bpf_skb_change_proto(skb, htons(ETH_P_IP), 0);
-    /* Rewrite IP header, fix checksums */
     write_ipv4_header(skb, src_v4, dst_v4, ip6->hop_limit);
     fix_l4_checksum_v6_to_v4(skb);
 
@@ -306,37 +327,38 @@ SEC("tc/siit_dc_ingress")
 int siit_in(struct __sk_buff *skb) {
     struct iphdr *ip4 = get_ipv4_hdr(skb);
 
-    /* Only process traffic to our node's IPv4 */
-    if (ip4->daddr != NODE_IPV4)
+    /* Only process traffic to CGNAT range 100.64.0.0/10 */
+    if ((ntohl(ip4->daddr) & 0xFFC00000) != 0x64400000)
         return TC_ACT_OK;
 
-    /* Destination port identifies the pod (stateless!) */
-    __u16 dport = get_l4_dport(skb);
-    __u32 pod_index = (dport - PORT_RANGE_BASE) / PORTS_PER_POD;
-
-    /* Look up pod's IPv6 address from pod_index */
-    struct in6_addr *pod_v6 = bpf_map_lookup_elem(&pod_index_map, &pod_index);
-    if (!pod_v6)
-        return TC_ACT_SHOT;  /* no pod for this port range */
+    /* Derive pod's ULA IPv6 from CGNAT address (reverse EAM):
+       100.64.H.P  →  fd00:1234:CCCC:00H0::P
+       where CCCC = local cluster index (compile-time constant) */
+    __u8 host_idx = (ntohl(ip4->daddr) >> 8) & 0xFF;
+    __u8 pod_idx  = ntohl(ip4->daddr) & 0xFF;
+    struct in6_addr dst_v6 = ULA_PREFIX;   /* fd00:1234:CCCC:: */
+    dst_v6.s6_addr16[3] = htons(host_idx); /* HHHH */
+    dst_v6.s6_addr32[3] = htonl(pod_idx);  /* ::P */
 
     /* Reconstruct IPv6 source from embedded IPv4 */
-    struct in6_addr src_v6 = NAT64_PREFIX;
+    struct in6_addr src_v6 = NAT64_PREFIX;  /* 64:ff9b:: */
     src_v6.s6_addr32[3] = ip4->saddr;
 
-    /* Stateless IPv4→IPv6 translation */
+    /* Stateless IPv4 → IPv6 translation */
     bpf_skb_change_proto(skb, htons(ETH_P_IPV6), 0);
-    write_ipv6_header(skb, &src_v6, pod_v6, ip4->ttl);
+    write_ipv6_header(skb, &src_v6, &dst_v6, ip4->ttl);
     fix_l4_checksum_v4_to_v6(skb);
 
     return TC_ACT_OK;  /* route to pod via host stack */
 }
 ```
 
-**Total eBPF instructions:** ~25 per direction. No hash map lookups
-for connection state. The only map access is `pod_index_map` (array,
-O(1) by index) on the return path.
+**Total eBPF instructions:** ~20 per direction. **Zero map lookups** —
+both source and destination addresses are derived arithmetically from
+the packet headers. No hash maps, no array lookups, no state of any
+kind.
 
-### 4.3 Policy Integration
+### 4.4 Policy Integration
 
 SIIT-DC traffic passes through the same egress policy pipeline as NPTv6:
 
@@ -350,33 +372,33 @@ The key insight: **policy enforcement happens at the pod veth (step 2),
 before translation (step 4).** The `nat64` interface is a pure
 stateless translator with no policy logic.
 
-### 4.4 IPv4 Source Identity Preservation
+### 4.5 IPv4 Source Identity Preservation
 
-After SIIT-DC translation, all outbound IPv4 traffic shares the node's
-IPv4 address but each pod uses a unique source port range. This
-provides **per-pod identity at the transport layer** without state:
+After SIIT-DC translation, each pod has a **unique CGNAT source
+address** (`100.64.H.P`). Unlike traditional NAT64 where all pods
+share one IPv4, SIIT-DC provides per-pod IPv4 identity:
 
-- External observers see `(node_ip, port_range)` per pod.
-- Firewalls can allowlist specific pods by port range.
+- External observers see a unique `100.64.H.P` per pod (within the
+  organization's WAN) or a unique `(public_ip, port)` (after gateway
+  SNAT).
 - The `connection_log` records the full mapping for audit: `(pod_id,
-  pod_ipv6, node_ipv4, port_range, dest, fqdn, timestamp)`.
-- For environments requiring per-pod external IPv4 identity, a
-  dedicated SIIT-DC gateway with a larger IPv4 pool and 1:1 EAM
-  (Explicit Address Mapping, RFC 7757) SHOULD be used (see §12,
-  `WirescaleEgressGateway` CRD).
+  pod_ipv6, cgnat_ipv4, dest, port, fqdn, timestamp)`.
+- With internal egress (no gateway SNAT), per-pod IPv4 identity is
+  fully preserved end-to-end.
 
-### 4.5 Comparison: SIIT-DC vs Stateful NAT64
+### 4.6 Comparison: SIIT-DC/EAM vs Stateful NAT64
 
-| Property | SIIT-DC (Wirescale) | Traditional NAT64 |
-|----------|--------------------|--------------------|
+| Property | SIIT-DC/EAM (Wirescale) | Traditional NAT64 |
+|----------|------------------------|--------------------|
 | State per flow | **0** | 1 conntrack entry |
-| eBPF instructions | ~25 | ~200+ |
+| eBPF instructions | **~20** | ~200+ |
+| Map lookups | **0** (arithmetic) | 1+ hash lookups |
 | Throughput | Line rate | Conntrack-limited |
-| Port exhaustion | Per-pod (1,008 ports) | Per-node (64K shared) |
-| Return-path lookup | O(1) array index | Hash table lookup |
-| Pod identification | Deterministic (port range) | Requires log correlation |
+| Ports per pod | **Full 64K** | 64K shared across all pods |
+| Return-path demux | Address-derived (O(1) arithmetic) | Hash table lookup |
+| Pod identification | Unique CGNAT per pod | Shared IP, requires log correlation |
 | Failure mode | Stateless (survives restart) | State loss = connection reset |
-| Max concurrent IPv4 conns/pod | ~1,000 (configurable) | ~64K shared across all pods |
+| Connection limit | **Unlimited** (full port space) | Port exhaustion under load |
 
 ---
 
@@ -1185,15 +1207,15 @@ Pod (fd00:1234:0001:0042::5) runs: curl https://api.stripe.com/v1/charges
 3. Host routing
    64:ff9b::/96 → dev nat64
 
-4. SIIT-DC translation (stateless)
+4. SIIT-DC translation (stateless EAM)
    TC on nat64: IPv6 64:ff9b::34cc:0164 → IPv4 52.204.1.100
-   Source: node's IPv4 198.51.100.1, sport=10500 (pod's port range)
-   No state table — pure header rewrite (~25 eBPF instructions)
+   Source: 100.64.66.5 (derived: H=0x42=66, P=5 from pod's ULA)
+   No state table — pure arithmetic (~25 eBPF instructions)
    → Physical NIC → Internet
 
-5. Return path (stateless)
-   Physical NIC TC ingress: dst 198.51.100.1, dport=10500
-   → dport 10500 is in pod 5's range → pod_index_map[5] → fd00:1234:0001:0042::5
+5. Return path (stateless EAM)
+   Physical NIC TC ingress: dst 100.64.66.5
+   → CGNAT 100.64.66.5 → H=66=0x42, P=5 → fd00:1234:0001:0042::5
    → SIIT-DC reverse: IPv4→IPv6 → host route → pod veth
 ```
 
@@ -1339,7 +1361,6 @@ enforcement source.
 
 | Map | Type | Key | Value | Max Entries | Purpose |
 |-----|------|-----|-------|-------------|---------|
-| `pod_index_map` | Array | pod_index (u32) | pod IPv6 addr (16B) | 256 | SIIT-DC return path: port range → pod IPv6 |
 | `dns_fqdn_map` | LRU hash | dest IP (16B) | fqdn + metadata | 65,536 | IP→FQDN mapping from DNS snooping |
 | `egress_fqdn_policy` | Hash | pod_id + fqdn_hash | action + ports | 32,768 | Compiled FQDN allowlist |
 | `egress_ip_policy` | LPM trie | pod_id + IP prefix | action + fqdn_hash | 65,536 | Compiled CIDR rules + DNS-derived entries |
@@ -1350,8 +1371,8 @@ enforcement source.
 | `egress_fanout_counter` | Per-CPU hash | pod_id | unique_dest_count | 16,384 | Anomaly detection (connection fan-out) |
 
 Total per-node memory: ~85 MB (dominated by threat_intel_ip at 1M entries × 64B ≈ 64MB).
-Note: no conntrack or NAT state table. SIIT-DC translation is stateless;
-`pod_index_map` is a static array populated at pod admission (4 KB for 256 pods).
+Note: no conntrack or NAT state table. SIIT-DC translation is fully stateless —
+pod identity is derived arithmetically from the CGNAT address (zero map lookups).
 
 ---
 

@@ -1153,11 +1153,14 @@ wirescale-agent on each node:
 ```
 
 **Implementation:** eBPF programs attached to the `nat64` dummy interface
-perform stateless SIIT-DC translation (RFC 7755). Each pod receives a
-deterministic ephemeral port range via per-netns `ip_local_port_range`.
-The translator performs a pure IPv6→IPv4 header swap with no state table —
-the return path identifies the destination pod from the port range alone.
-No kernel conntrack, no stateful NAT, no nftables. See [EGRESS.md §4](EGRESS.md#4-siit-dc-stateless-ipv4-internet-access)
+perform stateless SIIT-DC translation (RFC 7755) with Explicit Address
+Mapping (EAM, RFC 7757). Each pod's ULA address `fd00:1234:CCCC:HHHH::P`
+maps deterministically to CGNAT address `100.64.H.P` — the same address
+already assigned by CLAT. The translator derives the IPv4 source from the
+IPv6 source arithmetically (~25 eBPF instructions, zero map lookups). The
+return path reverses the mapping from the CGNAT destination to reconstruct
+the pod's full IPv6 address. No kernel conntrack, no stateful NAT, no
+nftables. See [EGRESS.md §4](EGRESS.md#4-siit-dc-stateless-ipv4-internet-access)
 for the full design.
 
 See [EGRESS.md](EGRESS.md) for the full egress data path, including DNS
