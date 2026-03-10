@@ -293,6 +293,98 @@ packet. This means:
 The NAT64 translation cost is amortized across the entire superpacket,
 not paid per-MTU-segment. This is critical for line-rate performance.
 
+### IPv6 Extension Header Parsing in eBPF Programs
+
+The NAT64 translation logic parses the fixed 40-byte IPv6 header to
+extract `nexthdr`, source/destination addresses, and transport-layer
+fields. In production traffic, IPv6 packets MAY carry an extension
+header chain between the fixed header and the upper-layer payload.
+Extension header types include Hop-by-Hop Options (0), Routing (43),
+Fragment (44), Destination Options (60), Authentication Header (51),
+and ESP (50).
+
+#### eBPF Verifier Constraints
+
+The BPF verifier prohibits unbounded loops. Parsing a variable-length
+extension header chain therefore requires an unrolled loop with a
+compile-time maximum iteration count. Each iteration reads the
+`nexthdr` and `hdrextlen` fields, advances the parse offset, and
+checks packet bounds via `skb->data` / `skb->data_end` comparisons.
+
+The enforcement eBPF programs MUST support a chain depth of at least
+**6 extension headers**. Implementations SHOULD support up to 8 where
+verifier complexity budget permits. A chain depth of 6 covers all
+standard extension header types defined in RFC 8200 Section 4.1.
+
+```c
+// Unrolled extension header walk (conceptual)
+#define MAX_EXT_HEADERS 6
+
+__u8 nexthdr = ip6->nexthdr;
+__u32 offset = sizeof(struct ipv6hdr);
+
+#pragma unroll
+for (int i = 0; i < MAX_EXT_HEADERS; i++) {
+    if (nexthdr == IPPROTO_TCP || nexthdr == IPPROTO_UDP ||
+        nexthdr == IPPROTO_ICMPV6 || nexthdr == IPPROTO_NONE)
+        break;
+    struct ipv6_opt_hdr *ext = (void *)data + offset;
+    if ((void *)(ext + 1) > data_end)
+        return TC_ACT_SHOT;  // truncated
+    nexthdr = ext->nexthdr;
+    offset += (ext->hdrlen + 1) * 8;  // Fragment hdr: fixed 8 bytes
+    if (offset > skb->len)
+        return TC_ACT_SHOT;
+}
+```
+
+#### Fragment Header Handling
+
+The Fragment header (nexthdr 44) is fixed at 8 bytes and does not carry
+an `hdrlen` field. The parser MUST special-case it. Non-initial fragments
+(fragment offset != 0) lack transport headers entirely; the enforcement
+program MUST NOT attempt to extract port numbers from fragments and
+SHOULD apply identity-only policy (no port match) or pass them to the
+slow path.
+
+#### Exceeding Maximum Chain Depth
+
+If the parser exhausts `MAX_EXT_HEADERS` iterations without reaching a
+transport header, the program MUST fall back to one of two strategies:
+
+1. **Pass to slow path (recommended):** Return `TC_ACT_OK` with a
+   metadata flag that causes the agent's userspace component to inspect
+   the packet. This preserves connectivity for unusual but legitimate
+   traffic.
+2. **Drop:** Return `TC_ACT_SHOT`. This is acceptable under a strict
+   security posture where unknown header chains are treated as evasion
+   attempts. Operators MUST be able to select this behavior via the
+   `WirescaleAgent` CRD field `extensionHeaderPolicy` (`pass` or `drop`,
+   default `pass`).
+
+#### Performance Impact
+
+Each extension header adds one bounds check, one 8-byte read, and one
+offset advance -- approximately **5-10 ns per header** on current
+hardware. For the common case (zero extension headers), the unrolled
+loop adds negligible overhead because the first iteration immediately
+hits a transport-layer `nexthdr` and breaks. Worst case with 6
+extension headers adds ~30-60 ns, which remains well within the
+per-packet enforcement budget of ~50-80 ns documented in
+[SECURITY.md](SECURITY.md) Section 7.
+
+The NAT64 translation path MUST perform the same extension header walk
+before extracting transport-layer checksums. The GRO/GSO amortization
+described above applies identically: the extension header parse cost is
+paid once per superpacket, not per MTU-segment.
+
+#### Monitoring
+
+The agent SHOULD expose a per-node metric
+`wirescale_ext_header_depth_exceeded_total` counting packets that hit
+the maximum chain depth. A sustained non-zero rate MAY indicate evasion
+attempts or misconfigured middleboxes injecting extension headers.
+
 ---
 
 ## 4. Packet Pipeline Architecture
@@ -635,6 +727,99 @@ retransmit timers fire:
   warning and emit a `wirescale_cold_path_timeout_total` metric.
   Applications will see elevated latency but MUST NOT see failures
   unless the cold path exceeds the application's connect timeout.
+
+### QUIC and UDP Protocols Through Cold Paths
+
+Section 5 documents the cold-path interaction with TCP, noting that the
+TCP SYN retransmit timer (~1s default) provides ample budget for the
+7-15 ms intra-cluster establishment latency. UDP-based protocols have
+fundamentally different retry semantics and MUST be handled explicitly.
+
+#### The UDP Cold-Path Problem
+
+When a packet triggers the cold path and no WireGuard peer exists, the
+kernel has no transport-layer state to hold the packet. Unlike TCP, where
+the SYN sits in the socket's retransmit queue, UDP packets are
+fire-and-forget at the transport layer. If the agent drops or fails to
+queue the triggering packet, recovery depends entirely on the
+application-layer protocol -- or does not happen at all.
+
+#### Agent Queuing for UDP
+
+The wirescale-agent MUST maintain a per-destination packet queue for
+cold-path establishment. When egress eBPF detects a missing peer, it
+MUST redirect the packet to a userspace capture ring (via
+`bpf_ringbuf_output` or `BPF_MAP_TYPE_QUEUE`) rather than silently
+dropping it. The agent replays queued packets once the WireGuard peer
+is established.
+
+Queue parameters:
+- **Capacity:** 64 packets per destination (configurable via
+  `WirescaleAgent` CRD field `coldPathQueueSize`).
+- **Timeout:** Queued packets MUST be dropped if peer establishment
+  does not complete within 5 seconds (configurable via
+  `coldPathQueueTimeout`).
+- **Memory bound:** Total cold-path queue memory MUST NOT exceed 16 MB
+  per node to prevent resource exhaustion from scanning or port sweeps.
+
+This queuing mechanism benefits all UDP protocols equally: DNS, QUIC,
+gaming, VoIP, and any custom UDP application.
+
+#### QUIC-Specific Considerations
+
+QUIC (RFC 9000) uses UDP and manages its own connection establishment,
+loss detection, and retry logic. Several QUIC behaviors interact with
+cold-path latency:
+
+**Initial handshake.** QUIC clients send an Initial packet containing a
+CRYPTO frame. If the WireGuard peer is not yet established, the agent's
+packet queue holds this Initial packet. QUIC's Probe Timeout (PTO,
+typically ~1s initial value per RFC 9002 Section 6.2) provides
+sufficient budget for intra-cluster cold paths (~7-15 ms). Cross-cluster
+cold paths (~30-150 ms) also complete well within a single PTO.
+
+**0-RTT early data.** QUIC clients with cached session tickets MAY send
+0-RTT data in the same flight as the Initial packet. This early data
+is not retransmittable by QUIC's loss recovery if it was never
+acknowledged. The agent's cold-path queue MUST capture 0-RTT packets
+alongside the Initial packet so they are delivered intact after peer
+establishment. Without queuing, 0-RTT data is irrecoverably lost and
+the connection falls back to 1-RTT, adding one RTT of latency.
+
+**Retry packets.** QUIC servers MAY respond with a Retry packet for
+address validation. Retry interactions add one additional RTT before
+the handshake proceeds. The cold-path queue MUST be bidirectional:
+if the responding server's node also needs to establish a return peer,
+the Retry packet is queued on that side as well.
+
+#### Protocols Without Application-Layer Retry
+
+Certain UDP protocols lack any retry mechanism:
+
+| Protocol | Retry Behavior | Cold-Path Risk |
+|----------|---------------|----------------|
+| DNS (stub) | Client retries after 1-5s | Low: queue covers the gap |
+| DNS (iterative) | Resolver retries after ~2s | Low |
+| QUIC | PTO-based, ~1s initial | Low with queuing |
+| NTP | Poll interval 64-1024s | Negligible |
+| syslog (UDP) | No retry | Loss acceptable |
+| Gaming/VoIP (RTP) | No retry, tolerates loss | First 7-150 ms of media lost |
+
+For latency-sensitive real-time protocols (VoIP, gaming), applications
+SHOULD pre-warm the WireGuard peer path by sending an initial probe
+packet during connection setup. The warm-path latency (~0.1 ms) is
+documented in Section 5 and imposes no ongoing penalty.
+
+#### Guidance for Operators
+
+1. Applications using QUIC through Wirescale SHOULD NOT disable 0-RTT
+   solely due to cold-path concerns. The agent's packet queue preserves
+   0-RTT data during peer establishment.
+2. Operators running latency-sensitive UDP workloads (sub-millisecond
+   budgets) SHOULD configure pre-warming via the `WirescaleAgent` CRD
+   field `preWarmDestinations` to avoid first-packet cold-path delays.
+3. The agent SHOULD expose `wirescale_cold_path_queue_drops_total` and
+   `wirescale_cold_path_queue_depth` metrics per node for observability.
 
 ---
 
@@ -1242,6 +1427,117 @@ hashing separately if supported:
 ethtool -N eth0 rx-flow-hash udp4 sdfn    # src/dst IP + src/dst port
 ethtool -N eth0 rx-flow-hash udp6 sdfn
 ```
+
+### NUMA-Aware Packet Processing
+
+Section 12 documents RSS/RPS configuration for distributing WireGuard
+UDP flows across CPU cores. At 40-100 Gbps link speeds, multi-core
+distribution alone is insufficient -- cross-NUMA memory accesses add
+~70-100 ns of latency per cache-line miss and reduce effective memory
+bandwidth by 30-50%. Wirescale deployments at these speeds MUST ensure
+NUMA-local affinity for all components of the packet processing pipeline.
+
+#### NUMA Locality Requirements
+
+The following components participate in per-packet processing and MUST
+be co-located on the same NUMA node as the physical NIC:
+
+1. **NIC interrupt handlers (hardirq).** IRQ affinity MUST pin NIC
+   receive interrupts to CPUs on the NUMA node local to the NIC's PCIe
+   slot.
+2. **NAPI poll / softirq threads.** These run on the CPU that received
+   the interrupt and inherit its NUMA placement from IRQ affinity.
+3. **XDP programs on the physical NIC.** XDP runs in softirq context
+   on the interrupt CPU; correct IRQ affinity ensures NUMA locality.
+4. **WireGuard kthreads (threaded NAPI on wg0).** After decryption,
+   threaded NAPI kthreads SHOULD be affined to the same NUMA node via
+   `taskset` or cgroup cpuset. The scheduler MAY migrate them otherwise.
+5. **BPF map memory.** Maps used in the hot path (identity_cache,
+   policy_map, peer_cache) SHOULD be allocated on NUMA-local memory.
+
+#### IRQ Affinity Configuration
+
+The wirescale-agent MUST configure NIC IRQ affinity at startup. For a
+NIC on NUMA node 0 with CPUs 0-15:
+
+```bash
+# Identify NUMA node for the NIC
+NIC_NUMA=$(cat /sys/class/net/eth0/device/numa_node)
+# Get CPU list for that NUMA node
+NUMA_CPUS=$(cat /sys/devices/system/node/node${NIC_NUMA}/cpulist)
+
+# Pin each NIC IRQ to NUMA-local CPUs
+for irq in $(grep eth0 /proc/interrupts | awk -F: '{print $1}'); do
+    echo "$NUMA_CPUS" > /proc/irq/${irq}/smp_affinity_list
+done
+```
+
+When RPS is used (software steering), the `rps_cpus` mask documented in
+Section 12 MUST be restricted to NUMA-local CPUs rather than set to
+`ffffffff`. Steering packets to a remote NUMA node for softirq processing
+negates the benefit of multi-core distribution.
+
+#### WireGuard kthread Affinity
+
+Threaded NAPI kthreads for `wg0` appear as `napi/wg0-<N>` in the
+process table. The agent SHOULD pin these to the NIC-local NUMA node:
+
+```bash
+for pid in $(pgrep -f 'napi/wg0'); do
+    taskset -pc "$NUMA_CPUS" "$pid"
+done
+```
+
+If the system has multiple NICs on different NUMA nodes (e.g., bonded
+interfaces), the agent MUST identify which physical NIC carries WireGuard
+traffic and pin kthreads to that NIC's NUMA node.
+
+#### BPF Map NUMA Allocation
+
+BPF maps are allocated from the CPU that calls `bpf_map_create`. The
+agent MUST ensure that map creation runs on a NUMA-local CPU so the
+backing pages are allocated from local memory. For the hot-path maps
+(identity_cache, policy_map, peer_cache), this avoids cross-NUMA
+lookups on every packet.
+
+```bash
+# Run BPF loader pinned to NUMA-local CPUs
+numactl --cpunodebind=$NIC_NUMA --membind=$NIC_NUMA \
+    wirescale-agent load-bpf
+```
+
+Alternatively, the agent MAY use `set_mempolicy(MPOL_BIND)` before map
+creation to force NUMA-local allocation programmatically.
+
+#### XDP Redirect and NUMA Boundaries
+
+`bpf_redirect_map` and `bpf_redirect` transmit packets on the target
+device's TX queue. If the target NIC is on a different NUMA node than
+the source NIC, the redirect crosses a NUMA boundary. This scenario
+arises when NAT64 redirects from a `nat64` dummy interface to a physical
+NIC on a different NUMA node.
+
+Deployments MUST ensure the physical NIC used for WireGuard egress is
+on the same NUMA node as the NIC used for WireGuard ingress. On systems
+with a single NIC this is automatic. On multi-NIC systems, the agent
+SHOULD log a warning if NUMA mismatch is detected.
+
+#### Monitoring
+
+Operators SHOULD use the following tools to verify NUMA-local operation:
+
+| Tool | Purpose |
+|------|---------|
+| `numastat -p $(pgrep wirescale)` | Per-node memory allocation for the agent |
+| `numastat -m` | System-wide NUMA memory distribution |
+| `perf stat -e node-load-misses` | Cross-NUMA cache-line transfers |
+| `cat /proc/interrupts` | Verify IRQ distribution across CPUs |
+| `lstopo` (hwloc) | Visualize NIC-to-NUMA topology |
+
+A sustained `node-load-misses` rate above 5% of total memory accesses
+during packet processing indicates NUMA misconfiguration. The agent
+SHOULD expose `wirescale_numa_cross_node_redirects_total` as a
+Prometheus metric when redirect targets cross NUMA boundaries.
 
 ---
 

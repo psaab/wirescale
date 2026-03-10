@@ -802,6 +802,97 @@ TCP MSS clamping:        1380 (1420 - 40 for IPv6 TCP header)
 The agent programs MSS clamping via nftables on the `wg0` interface to
 prevent fragmentation.
 
+### Multicast and Neighbor Discovery Through WireGuard
+
+#### Background
+
+IPv6 NDP (RFC 4861) relies on link-local multicast -- solicited-node
+multicast `ff02::1:ffXX:XXXX` -- to resolve addresses to link-layer
+addresses.  WireGuard is Layer 3 point-to-point: it carries routed
+unicast and does not forward link-local multicast.
+
+#### When NDP Works Natively
+
+**Routable-prefix mode with unencrypted forwarding** (ROUTABLE-PREFIX.md
+Section 7, encryption policy = `default` or `cross-cluster-only`):
+
+- Intra-cluster traffic traverses the physical L2 segment.
+- NDP operates on `eth0` against the rack /64 as usual.
+- Cross-node traffic within the same L2 domain resolves the next-hop
+  (ToR gateway) via standard NDP on `eth0`.
+
+No Wirescale-specific handling is required in this mode.
+
+#### When NDP Needs Help
+
+**ULA overlay mode** (ARCHITECTURE.md Section 6) and **routable-prefix
+with `always` encryption** (ROUTABLE-PREFIX.md Section 8):
+
+All inter-node pod traffic goes through `wg0`, which has no link-layer
+address resolution.  NDP solicitations sent into `wg0` have no
+meaningful recipient.
+
+| Scenario | Interface | NDP Status |
+|----------|-----------|------------|
+| Same node | `cni0` bridge / veth | Works (local L2) |
+| Cross-node, overlay/always-encrypt | `wg0` | Broken (L3 P2P) |
+| Pod-to-external, overlay | `wg0` -> physical | Broken on `wg0` leg |
+| Host NDP on physical NIC | `eth0` | Works (native L2) |
+
+#### Solution: NDP Suppression on Overlay Paths
+
+The wirescale-agent MUST suppress NDP on WireGuard paths and rely on
+explicit routing entries from the control plane:
+
+1. **Explicit /64 routes.**  When the agent installs a WireGuard peer,
+   it programs the remote node's entire /64 via the `wg0` nexthop.
+   Individual pod /128s within that /64 are resolved by the remote node
+   after decryption -- no local neighbor resolution is needed.
+
+2. **Static neighbor entries for local pods.**  The agent MUST install
+   static or proxy neighbor entries on `cni0` for each local pod's
+   link-local and global addresses, ensuring intra-node NDP succeeds
+   without multicast.
+
+3. **eBPF NDP interception.**  The agent SHOULD attach a TC/XDP program
+   on `wg0` that drops NDP Neighbor Solicitation packets, preventing
+   unresolvable solicitations from wasting tunnel bandwidth.
+
+```
+Pod A (node-1) -> Pod B (node-2), overlay mode:
+
+  Pod A sends to 3fff:1d:0001:0002::b
+    -> host routing: 3fff:1d:0001:0002::/64 via wg0 peer=node-2
+    -> NO NDP: route is explicit, nexthop is the WireGuard peer
+    -> wg0 encrypts, sends to node-2
+    -> node-2 decrypts, routes to Pod B via local veth (local bridge)
+```
+
+#### Multicast Applications (mDNS, MLD)
+
+General IPv6 multicast (`ff02::/16`, `ff05::/16`) does not traverse
+WireGuard.  Implications:
+
+- **mDNS / DNS-SD** (`ff02::fb`): MUST NOT be relied upon for
+  cross-node discovery.  Use Wirescale DNS (ARCHITECTURE.md Section 9).
+- **MLD:** Unaffected in routable-prefix native mode.  In overlay mode,
+  MLD is confined to the local node's bridge.
+- **Application multicast:** Workloads needing cross-node multicast
+  MUST be adapted to unicast or use an external multicast overlay.
+
+The agent SHOULD log a warning when multicast traffic is destined for
+`wg0`.
+
+#### NDP and Multicast Summary
+
+| Traffic Type | Native/Routable Mode | Overlay / Always-Encrypt Mode |
+|-------------|---------------------|-------------------------------|
+| NDP (same node) | Works | Works (local bridge) |
+| NDP (cross-node) | Works (physical L2) | Suppressed; explicit routes |
+| Solicited-node multicast | Works | Dropped on `wg0` |
+| mDNS / DNS-SD | Works on L2 segment | Use Wirescale DNS |
+| Application multicast | Works on L2 segment | Not available cross-node |
+
 ---
 
 ## 7. Cross-Cluster Connectivity
@@ -1143,6 +1234,81 @@ Pod A on node-1: app connects to 100.64.2.7 (Pod B's IPv4)
   App on Pod B sees: src=100.64.1.5 dst=100.64.2.7
 ```
 
+### 8.6 Cross-Cluster IPv4 Address Collisions
+
+#### The Problem
+
+The CLAT mapping `100.64.N.P <--> 3fff:1d:CCCC:N::P` embeds the node
+index `N` and pod index `P` but not the cluster index `CCCC`.  Two pods
+on identically-indexed nodes in different clusters receive the same IPv4
+address:
+
+```
+Cluster 1, Node 3, Pod 7:  100.64.3.7  <-->  3fff:1d:0001:0003::7
+Cluster 2, Node 3, Pod 7:  100.64.3.7  <-->  3fff:1d:0002:0003::7
+```
+
+Both pods believe they own `100.64.3.7`.  Within a single cluster this
+is unambiguous because CLAT resolves the IPv4 address against the local
+cluster's IPv6 prefix.  Across clusters, the same IPv4 address maps to
+two distinct IPv6 endpoints and the reverse translation is ambiguous.
+
+#### Design Decision: IPv4 Is Intra-Cluster Only
+
+Cross-cluster pod-to-pod traffic MUST use IPv6 addresses.  The CGNAT
+`100.64.0.0/10` address space is scoped to the originating cluster and
+MUST NOT be routed across cluster boundaries.
+
+Rationale:
+
+1. **Ambiguous reverse mapping.**  A destination of `100.64.3.7` cannot
+   be translated to a unique IPv6 address without knowing the target
+   cluster -- information that is absent from the IPv4 packet.
+2. **Address space exhaustion.**  `100.64.0.0/10` provides ~4 million
+   addresses.  Partitioning it across clusters (e.g., `/16` per cluster)
+   severely limits per-cluster pod capacity and introduces fragile
+   coordination between the global directory and CLAT configuration.
+3. **IPv6 is the primary address family.**  Wirescale is an IPv6-native
+   architecture.  Cross-cluster connectivity (Section 7) operates on
+   hierarchical IPv6 prefixes with route aggregation; IPv4 is a
+   compatibility layer for legacy applications, not a routable fabric.
+
+#### Enforcement
+
+The wirescale-agent MUST NOT install CLAT reverse-translation routes
+for remote clusters.  Specifically:
+
+- The `100.64.0.0/10` route on each node MUST point only to the local
+  CLAT translation path, never to a WireGuard peer in another cluster.
+- Cross-cluster aggregate routes (`3fff:1d:CCCC::/32` for remote
+  clusters) MUST NOT have corresponding IPv4 CGNAT routes.
+- If a pod attempts to reach an IPv4 address that maps to a remote
+  cluster's IPv6 prefix, the packet MUST be dropped and the agent
+  SHOULD log a diagnostic message.
+
+#### Operator Guidance
+
+Applications that require cross-cluster communication MUST use IPv6
+addresses or DNS names that resolve to IPv6 (AAAA records).  The
+cross-cluster DNS system (Section 9) returns AAAA records for remote
+pods; operators SHOULD NOT configure A record synthesis for cross-cluster
+names.
+
+For legacy applications that cannot use IPv6 socket APIs, operators MAY
+deploy an application-layer proxy (e.g., Envoy, HAProxy) within the
+local cluster that accepts IPv4 connections and forwards to the remote
+pod's IPv6 address.
+
+```
+Legacy IPv4 app -> 100.64.N.P (local proxy pod)
+  -> proxy opens IPv6 connection to 3fff:1d:CCCC:H::Q (remote pod)
+  -> cross-cluster WireGuard tunnel (IPv6)
+  -> remote pod receives IPv6 connection
+```
+
+This preserves the deterministic CLAT model within each cluster while
+providing a clear upgrade path for cross-cluster IPv4 consumers.
+
 ---
 
 ## 9. DNS Architecture
@@ -1208,6 +1374,87 @@ CoreDNS
   v
 Pod receives AAAA (native or synthesized)
 ```
+
+### 9.1 StatefulSet Stable Network Identities
+
+#### The Challenge
+
+Kubernetes StatefulSets provide stable DNS names via headless Services:
+`web-0.web.<ns>.svc.cluster.local` survives rescheduling.  The IP
+address behind that name does not.
+
+In Wirescale, pod IPs derive from the hosting node's /64 prefix
+(`3fff:1d:CCCC:HHHH::P`).  When a StatefulSet pod moves to a different
+node, `HHHH` changes:
+
+```
+web-0 on node-3:  3fff:1d:0001:0003::1 / 100.64.3.1
+web-0 on node-7:  3fff:1d:0001:0007::1 / 100.64.7.1  (after reschedule)
+```
+
+This is consistent with standard Kubernetes -- pod IPs are always
+ephemeral -- but certain patterns are sensitive to it:
+
+- **IP caching:** Connection pools or gRPC channels that resolve once
+  and hold the IP for the lifetime of the connection.
+- **Ordinal discovery:** Patterns like "connect to `web-{0..N-1}`" that
+  resolve all peers at startup and cache the results.
+- **Storage affinity:** PVs with node affinity constrain rescheduling,
+  reducing IP changes in practice but not eliminating them.
+
+#### Interaction with Wirescale DNS
+
+Both Kubernetes DNS and Wirescale DNS (`*.ws.cluster.internal`) MUST
+return the current pod IP after rescheduling:
+
+```
+web-0.web.default.svc.cluster.local   -> AAAA 3fff:1d:0001:0007::1
+web-0.web.default.ws.cluster.internal -> AAAA 3fff:1d:0001:0007::1
+```
+
+The wirescale-agent MUST update its in-memory name-to-IP map within 5
+seconds of receiving a pod relocation event from wirescale-control.
+CoreDNS cache TTL (default 30s, per Section 8.3) bounds how quickly
+downstream clients observe the change.
+
+#### Stable IPs Are a Non-Goal
+
+Wirescale does NOT provide node-independent stable IPs for StatefulSet
+pods.  A reserved /128 pool would require:
+
+- Addresses outside the /64-per-host model, breaking hierarchical
+  prefix aggregation (Section 5).
+- Per-pod /128 routes on every node, regressing routing state from
+  O(hosts) to O(statefulset_pods).
+- Scheduler-to-allocator coordination to ensure the /128 is routable
+  regardless of placement.
+
+This contradicts the design principles in Section 2 (hierarchical
+aggregation, minimal per-node state).
+
+#### Operator Guidance
+
+1. **Use DNS names, not IPs.**  All StatefulSet peer communication
+   MUST go through DNS.  Applications SHOULD re-resolve on reconnect
+   rather than caching addresses indefinitely.
+
+2. **Lower DNS TTLs for latency-sensitive workloads.**  Operators MAY
+   reduce the CoreDNS cache TTL for faster convergence:
+   ```
+   cache 5   # 5-second TTL
+   ```
+
+3. **Retry with re-resolution.**  Applications SHOULD trigger a fresh
+   DNS lookup on connection failure rather than retrying a cached IP.
+
+4. **Topology constraints.**  Use `topologySpreadConstraints` or node
+   affinity to reduce cross-node rescheduling frequency where stable
+   placement is operationally important.
+
+5. **ClusterIP for stable VIPs.**  When a fixed address is needed
+   (e.g., a database primary), use a ClusterIP Service instead of a
+   headless Service.  The VIP is allocated from the Service CIDR
+   (`3fff:1d:CCCC:ffff::/108`) and is placement-independent.
 
 ---
 

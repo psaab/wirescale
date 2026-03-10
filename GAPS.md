@@ -15,13 +15,14 @@
   on-demand resolution via control hierarchy, VIP strategies, topology-aware
   LB, health checking, Cilium integration).
 
-- [ ] **Cross-cluster IPv4 address collisions**
+- [x] **Cross-cluster IPv4 address collisions**
   CLAT maps `100.64.N.P` deterministically, but two pods in different
   clusters can share the same IPv4 address. Pod-to-pod IPv4 across
   clusters is ambiguous. Need to define whether cross-cluster IPv4 is
   supported and how collisions are resolved (cluster-scoped CGNAT ranges,
   or IPv4 is intra-cluster only).
-  Target: ARCHITECTURE.md Section 8 (IPv4 Compatibility).
+  Added: ARCHITECTURE.md Section 8 subsection (cross-cluster IPv4 explicitly
+  unsupported; CGNAT is cluster-scoped; cross-cluster uses IPv6 only).
 
 - [x] **Host-network pods (`hostNetwork: true`)**
   No veth pair, no CLAT, no per-pod eBPF. Identity attribution, policy
@@ -30,40 +31,45 @@
   Added: ARCHITECTURE.md Section 11 (identity model, WireGuard data path,
   CLAT non-applicability, policy enforcement via nftables/Cilium host firewall).
 
-- [ ] **Multicast and NDP through WireGuard**
+- [x] **Multicast and NDP through WireGuard**
   IPv6 NDP uses multicast. In ULA overlay mode or `always` encryption,
   multicast doesn't traverse WireGuard (L3 point-to-point). NDP on the
   rack /64 is fine for native routing, but overlay mode needs explicit
   handling (proxy NDP, unicast NDP, or NDP suppression).
-  Target: ARCHITECTURE.md and ROUTABLE-PREFIX.md.
+  Added: ARCHITECTURE.md Section 6 subsection (NDP suppression via explicit
+  routes, static neighbor entries, eBPF drop of NDP on wg0, mDNS/MLD notes).
 
-- [ ] **StatefulSet stable network identities**
+- [x] **StatefulSet stable network identities**
   Pods rescheduled to a different node get a different /64 prefix and
   different IP. Headless service DNS and StatefulSet ordinal-based
   discovery may break. Need to document interaction with stable identity
   patterns.
-  Target: ARCHITECTURE.md DNS section.
+  Added: ARCHITECTURE.md Section 9 subsection (stable IPs are non-goal;
+  DNS updates within 5s; operator guidance: use DNS names, lower TTLs).
 
 ---
 
 ## Operational Gaps
 
-- [ ] **Upgrade and migration strategy** (Critical)
+- [x] **Upgrade and migration strategy** (Critical)
   No document covers: rolling agent upgrades, control plane upgrades,
   CRD schema migration, migration from Cilium-only to Cilium+Wirescale,
   or migration from Wirescale standalone to Cilium+Wirescale.
-  Target: new document (OPERATIONS.md or UPGRADE.md).
+  Added: OPERATIONS.md Section 1 (rolling upgrades, CRD migration,
+  three migration paths, canary deployments, version skew policy).
 
-- [ ] **Capacity planning guidance**
+- [x] **Capacity planning guidance**
   Scaling tables give theoretical limits but no concrete sizing guide.
   Controller replicas per cluster size, agent memory requirements, XDP
   CPU at various link speeds, directory sizing.
-  Target: PERFORMANCE.md or OPERATIONS.md.
+  Added: OPERATIONS.md Section 2 (controller sizing table, agent resources,
+  XDP CPU budget, directory/etcd sizing, BPF map sizing, scaling decisions).
 
-- [ ] **Monitoring and alerting runbook**
+- [x] **Monitoring and alerting runbook**
   Prometheus metrics are defined but no guidance on healthy vs. degraded
   thresholds, what to alert on, or how to diagnose common issues.
-  Target: SECURITY.md Section 12 or OPERATIONS.md.
+  Added: OPERATIONS.md Section 3 (health thresholds, 6 alerts, 4
+  troubleshooting runbooks with diagnosis/resolution steps).
 
 - [x] **Thundering herd on cold start**
   Mass agent restart (rolling update, DR) causes simultaneous control
@@ -73,16 +79,18 @@
   circuit breaker, control-side rate limiting, pre-warming peer cache,
   TCP SYN retry budget interaction).
 
-- [ ] **Backup and disaster recovery**
+- [x] **Backup and disaster recovery**
   What state needs backup? Global directory is critical. Controller state
   is derived from k8s API. Agent state is ephemeral. DR procedures
   undefined.
-  Target: OPERATIONS.md.
+  Added: OPERATIONS.md Section 4 (state classification, backup procedures,
+  recovery procedures, RPO/RTO targets, multi-region quorum handling).
 
-- [ ] **Testing strategy**
+- [x] **Testing strategy**
   No conformance test suite, integration test plan, or performance
   regression test framework documented.
-  Target: new document or OPERATIONS.md.
+  Added: OPERATIONS.md Section 5 (conformance suite, kind/k3d integration
+  framework, performance regression CI gates, chaos testing scenarios).
 
 ---
 
@@ -110,36 +118,41 @@
   Added: SECURITY.md Section 13 threat T19 (query log retention limits,
   access control, optional batch anonymization, audit of log access).
 
-- [ ] **Post-quantum migration**
+- [x] **Post-quantum migration**
   WireGuard uses Curve25519 (not quantum-resistant). No discussion of
   hybrid key exchange or migration planning for post-quantum crypto.
-  Target: SECURITY.md Section 10 (Key Lifecycle).
+  Added: SECURITY.md Section 10 subsection (HNDL threat, PSK mitigation,
+  four-phase migration roadmap: PSK → hybrid TLS → Rosenpass → native PQ).
 
-- [ ] **Regulatory compliance mapping**
+- [x] **Regulatory compliance mapping**
   PCI-DSS and HIPAA mentioned but no control-to-feature mapping.
-  Target: SECURITY.md or dedicated compliance document.
+  Added: SECURITY.md new section (PCI-DSS v4.0 mapping, HIPAA Security
+  Rule mapping, SOC 2 Type II mapping, cross-framework summary, auditor guidance).
 
 ---
 
 ## Performance Edge Cases
 
-- [ ] **IPv6 extension headers in eBPF**
+- [x] **IPv6 extension headers in eBPF**
   Pseudocode parses fixed IPv6 header only. Real traffic has extension
   header chains that require unrolled bounds-checked parsing in eBPF.
   Docs should acknowledge this implementation complexity.
-  Target: SECURITY.md Section 7, PERFORMANCE.md Section 3.
+  Added: PERFORMANCE.md Section 3 + SECURITY.md Section 7 (unrolled parsing,
+  6-header depth, Fragment header special case, fallback strategies, perf cost).
 
-- [ ] **QUIC and UDP protocols through cold paths**
+- [x] **QUIC and UDP protocols through cold paths**
   Cold-path analysis covers TCP retransmit budget. QUIC has different
   retry semantics and 0-RTT that interact differently with packet
   queuing during peer setup.
-  Target: PERFORMANCE.md Section 5.
+  Added: PERFORMANCE.md Section 5 subsection (UDP packet queue, QUIC Initial/
+  0-RTT/Retry handling, protocol comparison table with cold-path risk).
 
-- [ ] **NUMA-aware packet processing**
+- [x] **NUMA-aware packet processing**
   At 40-100G, WireGuard kthreads, eBPF programs, and NIC interrupts
   should be on the same NUMA node. Kernel tuning section covers RSS/RPS
   but not NUMA pinning.
-  Target: PERFORMANCE.md Section 12.
+  Added: PERFORMANCE.md Section 12 subsection (IRQ affinity, kthread pinning,
+  NUMA-local BPF maps, XDP redirect boundaries, monitoring tools).
 
 ---
 
