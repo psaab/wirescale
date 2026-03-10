@@ -149,22 +149,22 @@ Each cluster receives a contiguous prefix from which all host /64s within
 that cluster are allocated. The choice of prefix depends on the addressing
 mode:
 
-**ULA mode:** each cluster gets a `/32` from `fd00:1d::/16`:
+**ULA mode:** each cluster gets a `/48` from `fd00:1234::/32`:
 
 ```
-Organization prefix:   fd00:1d::/16     (reserved for Wirescale ULA)
+Organization prefix:   fd00:1234::/32   (reserved for Wirescale ULA)
 
-  Cluster 1:           fd00:1d:0001::/32
-    Host 1:            fd00:1d:0001:0001::/64
-    Host 2:            fd00:1d:0001:0002::/64
+  Cluster 1:           fd00:1234:0001::/48
+    Host 1:            fd00:1234:0001:0001::/64
+    Host 2:            fd00:1234:0001:0002::/64
     ...                (up to 65,536 hosts per cluster)
 
-  Cluster 2:           fd00:1d:0002::/32
-    Host 1:            fd00:1d:0002:0001::/64
-    Host 2:            fd00:1d:0002:0002::/64
+  Cluster 2:           fd00:1234:0002::/48
+    Host 1:            fd00:1234:0002:0001::/64
+    Host 2:            fd00:1234:0002:0002::/64
     ...
 
-  Cluster N:           fd00:1d:N::/32
+  Cluster N:           fd00:1234:CCCC::/48
     (up to 65,536 clusters addressable)
 ```
 
@@ -537,12 +537,12 @@ Three routes, not 25,000. The WAN sees O(clusters), not O(hosts).
 
 ### ULA Mode: /32 Aggregation
 
-In ULA mode, the aggregation is at /32 per cluster:
+In ULA mode, the aggregation is at /48 per cluster:
 
 ```
-fd00:1d:0001::/32  -> Cluster 1 (local or via gateway)
-fd00:1d:0002::/32  -> Cluster 2 (via gateway)
-fd00:1d:0003::/32  -> Cluster 3 (via gateway)
+fd00:1234:0001::/48  -> Cluster 1 (local or via gateway)
+fd00:1234:0002::/48  -> Cluster 2 (via gateway)
+fd00:1234:0003::/48  -> Cluster 3 (via gateway)
 ```
 
 Because ULA addresses are not globally routable, cross-cluster traffic
@@ -1253,11 +1253,11 @@ addressing with WireGuard tunnels:
 
 ```
 Cluster 1 (DC, GUA):     3fff:1234:0001::/48   (native routing)
-Remote office (ULA):      fd00:1d:00ff::/32      (WireGuard overlay)
+Remote office (ULA):      fd00:1234:00ff::/48    (WireGuard overlay)
 
 Gateway peers:
   Cluster 1 gateway -> WireGuard -> Remote office VPN endpoint
-  AllowedIPs = fd00:1d:00ff::/32
+  AllowedIPs = fd00:1234:00ff::/48
 
 Pods in Cluster 1 reach office pods via WireGuard through gateway.
 Office pods reach Cluster 1 pods via WireGuard (encrypted, NATed if needed).

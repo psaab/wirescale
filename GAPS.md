@@ -158,20 +158,18 @@
 
 ## Documentation Consistency
 
-- [ ] **Example prefix inconsistency** (Quick win)
+- [x] **Example prefix inconsistency** (Quick win)
   Different prefixes across documents:
   - ARCHITECTURE.md: `3fff:1d:...`
   - ROUTABLE-PREFIX.md: `3fff:1234:...`
   - CILIUM-INTEGRATION.md: `3fff:0a00:...`
   - PERFORMANCE.md: `fd00:1d:...` and `3fff:1:...`
   Should standardize on one example allocation across all docs.
-  Target: all documents.
-  **Planned:** PREFIX-STANDARD.md defines canonical prefixes and per-document
-  change mappings. Apply pending.
+  Applied: all documents now use canonical `3fff:1234:...` (GUA) and
+  `fd00:1234:...` (ULA) per PREFIX-STANDARD.md.
 
-- [ ] **ULA prefix length inconsistency**
+- [x] **ULA prefix length inconsistency**
   ARCHITECTURE.md uses `/32` per cluster (ULA). PERFORMANCE.md Section 8
   uses `/48` for both modes. Need to reconcile.
-  Target: ARCHITECTURE.md, PERFORMANCE.md, ROUTABLE-PREFIX.md.
-  **Planned:** PREFIX-STANDARD.md standardizes on `/48` per cluster for
-  both GUA and ULA. Apply pending.
+  Applied: all documents now use `/48` per cluster for both GUA and ULA
+  per PREFIX-STANDARD.md.

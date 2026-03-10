@@ -853,9 +853,9 @@ metadata:
   name: dev-laptop-alice
 spec:
   publicKey: "eHl6MTIz..."
-  endpoint: "[3fff:0e01::1]:51820"
+  endpoint: "[3fff:1234:00ff:ff01::1]:51820"
   allowedIPs:
-    - "3fff:1d:e1:1::1/128"
+    - "3fff:1234:00ff:0001::1/128"
   authKeyRef:
     name: external-peer-keys
     key: dev-laptop-alice

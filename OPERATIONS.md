@@ -89,7 +89,7 @@ all objects, then retire the old version.
 retains intra-cluster ownership. Deploy Wirescale CRDs, control, and
 agent alongside Cilium. The agent creates `wg0` alongside Cilium
 interfaces. Configure WirescaleMesh with the cluster prefix (e.g.,
-`3fff:1d:0001::/32`), register with the directory. Intra-cluster traffic
+`3fff:1234:0001::/48`), register with the directory. Intra-cluster traffic
 stays on Cilium; cross-cluster routes through WireGuard.
 
 **Standalone Wirescale to Cilium + Wirescale:** Install Cilium in
@@ -284,7 +284,7 @@ cloud security groups allow bidirectional UDP on `listenPort`.
 |------|--------|
 | 1 | Check directory: `wirescale-directory status` |
 | 2 | Verify registration: `wirescale-directory list-clusters` |
-| 3 | Check cross-cluster metrics and aggregate routes (`ip -6 route show \| grep 3fff:1d`) |
+| 3 | Check cross-cluster metrics and aggregate routes (`ip -6 route show \| grep 3fff:1234`) |
 | 4 | Check gateway node health and firewall rules |
 
 **Resolution:** If directory is unreachable, cached registrations remain
@@ -384,8 +384,8 @@ A conformance suite MUST validate before any production release:
 - WirescalePolicy enforcement for intra-cluster, cross-cluster, and
   external-peer traffic
 - Identity cache miss triggers control query; cached identity used within TTL
-- Cross-cluster connectivity: pods in `3fff:1d:0001::/32` reach pods in
-  `3fff:1d:0002::/32` via on-demand WireGuard tunnels
+- Cross-cluster connectivity: pods in `3fff:1234:0001::/48` reach pods in
+  `3fff:1234:0002::/48` via on-demand WireGuard tunnels
 - Agent restart does not drop in-flight connections
 - Controller failover within 10 s
 - 24-hour key rotation without handshake failures

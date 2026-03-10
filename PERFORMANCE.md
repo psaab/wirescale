@@ -264,8 +264,8 @@ Pod sends IPv4 packet via clat0 TUN
 TC egress eBPF on host-side veth:
   - Match IPv4 packet from pod's CLAT range
   - bpf_skb_change_proto(skb, ETH_P_IPV6, 0)
-  - Deterministic mapping: 100.64.N.P -> fd00:1d:N::P
-  - If dst is another pod: dst 100.64.M.Q -> fd00:1d:M::Q
+  - Deterministic mapping: 100.64.N.P -> fd00:1234:CCCC:HHHH::P
+  - If dst is another pod: dst 100.64.M.Q -> fd00:1234:CCCC:HHHH::Q
   - If dst is external: dst X.Y.Z.W -> 64:ff9b::X.Y.Z.W
   - Checksum fixup
   - TC_ACT_OK (continue to host routing as IPv6)
@@ -400,7 +400,7 @@ Pod app: connect("93.184.216.34", 80)
 eth0 (pod side) -> veth (host side)
   |
   | TC eBPF on veth: CLAT IPv4->IPv6
-  | src: fd00:1d:1::5, dst: 64:ff9b::5db8:d822
+  | src: fd00:1234:0001:0001::5, dst: 64:ff9b::5db8:d822
   v
 Host routing table:
   64:ff9b::/96 -> nat64 dummy interface
@@ -427,12 +427,12 @@ Wire (IPv4 packet, source = node's IPv4)
 ### Complete Fast Path (Pod-to-Pod Cross-Node, IPv6 Native)
 
 ```
-Pod A: send to fd00:1d:2::7
+Pod A: send to fd00:1234:0002:0001::7
   |
   v
 eth0 -> veth -> host routing
   |
-  | route: fd00:1d:2::/64 dev wg0
+  | route: fd00:1234:0002:0001::/64 dev wg0
   v
 wg0: WireGuard encrypt (kernel, GRO/GSO)
   |
@@ -460,11 +460,11 @@ Pod A: send to 100.64.2.7
   |
   v
 clat0 -> TC eBPF on veth:
-  100.64.1.5 -> fd00:1d:1::5 (src)
-  100.64.2.7 -> fd00:1d:2::7 (dst)  [deterministic, no NAT64 prefix!]
+  100.64.1.5 -> fd00:1234:0001:0001::5 (src)
+  100.64.2.7 -> fd00:1234:0002:0001::7 (dst)  [deterministic, no NAT64 prefix!]
   |
   v
-Host routing: fd00:1d:2::/64 dev wg0
+Host routing: fd00:1234:0002:0001::/64 dev wg0
   |
   v
 wg0: WireGuard encrypt (GRO/GSO)
@@ -475,8 +475,8 @@ wg0: WireGuard decrypt (node 2)
 Host routing -> veth
   |
   | TC eBPF on veth (ingress):
-  | fd00:1d:1::5 -> 100.64.1.5 (src)
-  | fd00:1d:2::7 -> 100.64.2.7 (dst)
+  | fd00:1234:0001:0001::5 -> 100.64.1.5 (src)
+  | fd00:1234:0002:0001::7 -> 100.64.2.7 (dst)
   v
 clat0 TUN -> Pod B app sees IPv4
 ```
@@ -1019,19 +1019,19 @@ bounded regardless of fleet scale.
 
 ```
 Global allocation (ULA or GUA):
-  Fleet:    fd00:1d::/32        (ULA) or 3fff:1::/32    (GUA)
+  Fleet:    fd00:1234::/32      (ULA) or 3fff:1234::/32  (GUA)
     |
-    +-- Cluster A: fd00:1d:0::/48                        (/48 per cluster)
-    |     +-- Host 1: fd00:1d:0:1::/64                   (/64 per host)
-    |     +-- Host 2: fd00:1d:0:2::/64
+    +-- Cluster A: fd00:1234:0001::/48                   (/48 per cluster)
+    |     +-- Host 1: fd00:1234:0001:0001::/64           (/64 per host)
+    |     +-- Host 2: fd00:1234:0001:0002::/64
     |     +-- ...
-    |     +-- Host N: fd00:1d:0:N::/64
+    |     +-- Host N: fd00:1234:0001:HHHH::/64
     |
-    +-- Cluster B: fd00:1d:1::/48
-    |     +-- Host 1: fd00:1d:1:1::/64
+    +-- Cluster B: fd00:1234:0002::/48
+    |     +-- Host 1: fd00:1234:0002:0001::/64
     |     +-- ...
     |
-    +-- Cluster C: fd00:1d:2::/48
+    +-- Cluster C: fd00:1234:0003::/48
           +-- ...
 ```
 
@@ -1061,15 +1061,15 @@ route per remote cluster prefix:
 
 ```
 # Intra-cluster: 10K individual /64 routes
-fd00:1d:0:1::/64 dev wg0 peer <host-1-key>
-fd00:1d:0:2::/64 dev wg0 peer <host-2-key>
+fd00:1234:0001:0001::/64 dev wg0 peer <host-1-key>
+fd00:1234:0001:0002::/64 dev wg0 peer <host-2-key>
 ...
-fd00:1d:0:2710::/64 dev wg0 peer <host-10000-key>
+fd00:1234:0001:2710::/64 dev wg0 peer <host-10000-key>
 
 # Cross-cluster: one aggregate per remote cluster
-fd00:1d:1::/48 dev wg0 metric 100    # → Cluster B
-fd00:1d:2::/48 dev wg0 metric 100    # → Cluster C
-fd00:1d:3::/48 dev wg0 metric 100    # → Cluster D
+fd00:1234:0002::/48 dev wg0 metric 100    # → Cluster B
+fd00:1234:0003::/48 dev wg0 metric 100    # → Cluster C
+fd00:1234:0004::/48 dev wg0 metric 100    # → Cluster D
 ...
 ```
 
@@ -1139,11 +1139,11 @@ The full cross-cluster resolution chain, step by step:
 ```
 Pod A (Cluster X) → Pod B (Cluster Y):
 
-1. Pod A sends to fd00:1d:Y:N::P (matches aggregate route fd00:1d:Y::/48)
+1. Pod A sends to fd00:1234:CCCC:HHHH::P (matches aggregate route fd00:1234:CCCC::/48)
    Agent intercepts: no WireGuard peer for destination /64           ~μs
 
 2. Agent → local wirescale-control (Cluster X)
-   "Resolve fd00:1d:Y:N::/64 -- which host, which cluster?"         ~5-10 ms
+   "Resolve fd00:1234:CCCC:HHHH::/64 -- which host, which cluster?" ~5-10 ms
    Controller sees prefix belongs to Cluster Y's allocation.
 
 3. Controller (Cluster X) → wirescale-directory
@@ -1151,7 +1151,7 @@ Pod A (Cluster X) → Pod B (Cluster Y):
    Directory returns: gateway_endpoint, cluster_ca, auth_token
 
 4. Controller (Cluster X) → Controller (Cluster Y)
-   "Resolve fd00:1d:Y:N::/64 to host endpoint and public key"       ~10-30 ms
+   "Resolve fd00:1234:CCCC:HHHH::/64 to host endpoint and public key" ~10-30 ms
    Remote controller returns: host_endpoint, wireguard_pubkey,
    allowed_ips, identity_metadata
 

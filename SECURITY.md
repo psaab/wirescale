@@ -181,7 +181,7 @@ wirescale-directory:
   Stores:
     cluster_id -> {
       gateway_endpoints: [ip:port, ...],
-      prefix_allocation: 3fff:c1::/48,
+      prefix_allocation: 3fff:1234:0001::/48,
       cluster_CA_cert: <PEM>,
       metadata: { region, provider, labels }
     }
@@ -926,7 +926,7 @@ model:
 
 ```
 Map 1: identity_cache (LPM trie, per-node)
-  Key:   IP prefix (e.g., fd00:1d:3::7/128)
+  Key:   IP prefix (e.g., fd00:1234:0003:0001::7/128)
   Value: {
     identity_id: u32,      // index into identity table
     ttl_expiry: u64,       // ktime_ns when entry becomes stale
@@ -1264,7 +1264,7 @@ Cluster-A wants to reach a pod in Cluster-B:
      - Both sides are now mutually authenticated
 
   4. Cluster-A's controller requests identity/peer info:
-     - "What is the identity of pod at IP 3fff:c2:3::7?"
+     - "What is the identity of pod at IP 3fff:1234:0002:0003::7?"
      - Cluster-B's controller evaluates cross-cluster policy
      - Returns identity info (or denies the request)
 
@@ -1557,9 +1557,9 @@ provided by the identity system:
 Pod A sends packet to Pod B:
   1. WireGuard guarantees the packet came from node-A
      (cryptographic proof via decryption)
-  2. Node-A guarantees Pod A has IP fd00:1d:1::5
+  2. Node-A guarantees Pod A has IP fd00:1234:0001:0001::5
      (only kubelet on node-A can assign this IP)
-  3. wirescale-agent resolves fd00:1d:1::5 = pod "web-xyz"
+  3. wirescale-agent resolves fd00:1234:0001:0001::5 = pod "web-xyz"
      with identity (production, web-sa, app=web)
      (from local cache or via control query)
   4. Policy engine checks: is (production, web-sa, app=web) allowed
@@ -1602,7 +1602,7 @@ The `wirescale-agent` reads from the ring buffer and writes structured logs:
   "node": "worker-3",
   "action": "allow",
   "src": {
-    "ip": "fd00:1d:1::5",
+    "ip": "fd00:1234:0001:0001::5",
     "pod": "web-frontend-abc",
     "namespace": "production",
     "serviceAccount": "web-sa",
@@ -1611,7 +1611,7 @@ The `wirescale-agent` reads from the ring buffer and writes structured logs:
     "cluster": "us-east-1"
   },
   "dst": {
-    "ip": "fd00:1d:3::12",
+    "ip": "fd00:1234:0003:0001::12",
     "pod": "api-server-xyz",
     "namespace": "production",
     "serviceAccount": "api-sa",
@@ -1642,7 +1642,7 @@ operations:
   "target": "worker-3",
   "details": {
     "public_key_fingerprint": "Xk3p...",
-    "allowed_ips": ["fd00:1d:3::/64"],
+    "allowed_ips": ["fd00:1234:0003::/64"],
     "authorization_latency_ms": 2
   }
 }
@@ -1656,7 +1656,7 @@ operations:
   "requestor_cluster": "us-east-1",
   "target_cluster": "eu-west-1",
   "details": {
-    "ip": "3fff:c2:3::7",
+    "ip": "3fff:1234:0002:0003::7",
     "identity": "production/api-sa",
     "resolution_latency_ms": 45,
     "cached": false
@@ -1856,7 +1856,7 @@ If an attacker can cause control to serve wrong identity for an IP:
   - Identity responses SHOULD be signed by control; agents MAY verify
     signatures before caching
   - Agents can cross-verify: the IP prefix MUST belong to the node CIDR
-    that the WireGuard peer is authorized for. If control says IP fd00:1d:3::7
+    that the WireGuard peer is authorized for. If control says IP fd00:1234:0003:0001::7
     belongs to a pod on node-1, but the packet arrived via node-3's
     WireGuard tunnel, the agent MUST reject the mapping.
   - Generation counters detect stale or replayed identity data

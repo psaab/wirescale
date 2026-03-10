@@ -109,7 +109,7 @@ It maintains O(clusters) state:
 wirescale-directory state per cluster entry:
   cluster_id:         "us-east-prod"
   gateway_endpoints:  [203.0.113.1:51820, 203.0.113.2:51820]
-  prefix_allocation:  3fff:0a00::/48
+  prefix_allocation:  3fff:1234:0001::/48
   cluster_ca_cert:    <PEM>
   last_heartbeat:     <timestamp>
 ```
@@ -300,15 +300,15 @@ The IPv6 address plan is identical whether Cilium or Wirescale manages
 the data plane. The fabric, not the CNI, owns the address topology.
 
 ```
-Site A (DC-East):        3fff:0a00::/48
-  Rack /64s:             3fff:0a00:ff00::/56  (one per rack, shared L2)
-    Rack 1:              3fff:0a00:ff01::/64
-  Pod /64s:              3fff:0a00:0000::/52  (one per host, routed)
-    worker-1:            3fff:0a00:0001::/64
+Site A (DC-East):        3fff:1234:0001::/48
+  Rack /64s:             3fff:1234:0001:ff00::/56  (one per rack, shared L2)
+    Rack 1:              3fff:1234:0001:ff01::/64
+  Pod /64s:              3fff:1234:0001:0000::/52  (one per host, routed)
+    worker-1:            3fff:1234:0001:0001::/64
 
 Per host:
-  eth0 (rack):           3fff:0a00:ff01::11/128  (from rack /64)
-  Pod /64:               3fff:0a00:0001::/64     (dedicated, fabric-routed)
+  eth0 (rack):           3fff:1234:0001:ff01::11/128  (from rack /64)
+  Pod /64:               3fff:1234:0001:0001::/64     (dedicated, fabric-routed)
 ```
 
 Cilium's IPAM in **Kubernetes host-scope mode** reads `spec.podCIDRs`
@@ -321,7 +321,7 @@ metadata:
   name: worker-1
 spec:
   podCIDRs:
-    - "3fff:0a00:0001::/64"    # pod /64 from site allocation
+    - "3fff:1234:0001:0001::/64"    # pod /64 from site allocation
 ```
 
 Cilium reads this and allocates pod IPs from the /64. Configuration:
@@ -330,7 +330,7 @@ Cilium reads this and allocates pod IPs from the /64. Configuration:
 # Cilium Helm values
 ipam:
   mode: kubernetes           # use Node.spec.podCIDRs
-ipv6NativeRoutingCIDR: "3fff:0a00::/48"  # site prefix, no masquerade
+ipv6NativeRoutingCIDR: "3fff:1234:0001::/48"  # site prefix, no masquerade
 ```
 
 The `ipv6NativeRoutingCIDR` tells Cilium that traffic within the site
@@ -343,9 +343,9 @@ The fabric's BGP installs kernel routes for each remote node's pod /64:
 
 ```
 # Kernel routing table on worker-1 (installed by fabric BGP, not Cilium):
-3fff:0a00:0002::/64 via 3fff:0a00:ff01::12 dev eth0   # host-2, same rack
-3fff:0a00:0003::/64 via 3fff:0a00:ff01::1  dev eth0    # host-3, via ToR
-::/0                via 3fff:0a00:ff01::1  dev eth0    # default route
+3fff:1234:0001:0002::/64 via 3fff:1234:0001:ff01::12 dev eth0   # host-2, same rack
+3fff:1234:0001:0003::/64 via 3fff:1234:0001:ff01::1  dev eth0    # host-3, via ToR
+::/0                     via 3fff:1234:0001:ff01::1  dev eth0    # default route
 ```
 
 Cilium delegates all non-local forwarding to these kernel routes.
