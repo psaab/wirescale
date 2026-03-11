@@ -14,7 +14,8 @@
 **See also:**
 - [ARCHITECTURE.md](ARCHITECTURE.md) -- Core architecture (three-tier hierarchy, on-demand peering)
 - [PERFORMANCE.md](PERFORMANCE.md) -- Line-rate performance engineering
-- [SECURITY.md](SECURITY.md) -- Network security, identity model, Prometheus metrics (Section 12)
+- [SECURITY.md](SECURITY.md) -- Network security, identity model, CA hierarchy (Section 4),
+  Prometheus metrics (Section 12)
 
 ---
 
@@ -24,6 +25,8 @@
 2. [Capacity Planning](#2-capacity-planning)
 3. [Monitoring and Alerting](#3-monitoring-and-alerting)
 4. [Backup and Disaster Recovery](#4-backup-and-disaster-recovery)
+   - [4.6 Certificate Rotation Procedures](#46-certificate-rotation-procedures)
+   - [4.7 Emergency CA Compromise Response](#47-emergency-ca-compromise-response)
 5. [Testing Strategy](#5-testing-strategy)
 
 ---
@@ -64,7 +67,9 @@ agent upgrade.
 
 **Directory upgrade:** Upgrade one Raft member at a time. Verify quorum
 between each member. The directory MUST maintain a majority of members
-throughout the upgrade.
+throughout the upgrade. The directory is a discovery service and does NOT
+hold CA private keys; upgrading the directory does NOT affect the
+certificate trust hierarchy.
 
 ### 1.3 CRD Schema Migration
 
@@ -171,8 +176,10 @@ Agent resource usage is bounded by active peer count, not cluster size
 | <= 500 clusters | 3-5 | < 100 MB | 512 MB | < 500 |
 | <= 5,000 clusters | 5 | < 1 GB | 1 GB | < 2,000 |
 
-Read:write ratio is ~1000:1. Storage per cluster: ~1 KB (cluster ID,
-endpoints, prefix allocation, CA fingerprint, metadata).
+Read:write ratio is ~1000:1. Storage per cluster: ~2 KB (cluster ID,
+endpoints, prefix allocation, intermediate CA certificate, CRL reference,
+metadata). The federation trust bundle adds ~1 KB per cluster
+intermediate CA plus ~1 KB for the root CA certificate and CRL.
 
 ### 2.4 BPF Map Sizing
 
@@ -234,6 +241,9 @@ Metrics are exposed at two endpoints (see [SECURITY.md Section 12](SECURITY.md#1
 | HandshakeFailures | `handshake_failures_total` rate > 0 for 5 min | warning |
 | BPFMapNearFull | `identity_cache_size` / max > 80% or `policy_rules_total` / max > 80% | warning |
 | CertExpiringSoon | `certificate_expiry_seconds` < 7 days | warning |
+| IntermediateCAExpiring | `wirescale_intermediate_ca_expiry_seconds` < 90 days | warning |
+| RootCAExpiring | `wirescale_root_ca_expiry_seconds` < 365 days | warning |
+| TrustBundleStale | `wirescale_trust_bundle_age_seconds` > 3600 | warning |
 
 ### 3.4 Troubleshooting Runbook
 
@@ -299,11 +309,31 @@ labels and pods. If aggregate routes are missing, restart the agent.
 
 | Category | Examples | Loss Impact |
 |----------|---------|-------------|
-| **Critical** | Directory data (cluster registry, prefix allocations), CA private keys, CRD definitions | Federation-wide outage or security compromise |
+| **Critical (offline)** | Offline federation root CA private key (HSM-backed) | Federation-wide trust compromise; requires full re-keying ceremony |
+| **Critical (per-cluster)** | Per-cluster intermediate CA private keys, CRD definitions | Cluster-wide certificate issuance failure; requires re-issuance from offline root |
+| **Critical (federation)** | Directory data (cluster registry, prefix allocations, trust bundles, CRLs) | Cross-cluster discovery outage (intra-cluster operations unaffected) |
 | **Derived** | Controller in-memory cache (pod/identity index, compiled policies) | ~30 s rebuild from Kubernetes API on restart |
 | **Ephemeral** | Agent peer cache, identity cache, BPF maps, WireGuard private keys | Peers re-established on demand within seconds |
 
 ### 4.2 Backup Procedures
+
+**Offline federation root CA:** The root CA private key resides on an
+air-gapped HSM. Backup MUST follow the HSM vendor's key backup procedure
+(typically M-of-N key shares stored in physically separate secure
+locations). The root CA public certificate and CRL SHOULD be backed up
+alongside directory data. Root CA backup verification SHOULD be performed
+at least annually during a planned ceremony.
+
+**Per-cluster intermediate CA:** The cluster intermediate CA private key
+is the one exception to the no-escrow policy for node keys. Back up the
+intermediate CA secret encrypted at rest:
+```bash
+kubectl -n wirescale-system get secret wirescale-cluster-ca -o yaml | \
+  gpg --encrypt --recipient ops-team@example.com > /backup/cluster-ca-$(date +%Y%m%d).yaml.gpg
+```
+Store intermediate CA backups separately from the cluster they protect.
+In the event of total cluster loss, the intermediate CA backup allows
+re-bootstrapping the cluster without a new offline root CA ceremony.
 
 **Directory etcd:** Take snapshots at least every 4 hours:
 ```bash
@@ -312,24 +342,43 @@ ETCDCTL_API=3 etcdctl snapshot save /backup/directory-$(date +%Y%m%d).snap \
   --cacert=/etc/etcd/ca.crt --cert=/etc/etcd/client.crt --key=/etc/etcd/client.key
 ```
 
+**Trust bundles and CRLs:** The directory stores trust bundles and CRLs.
+These are included in the directory etcd snapshot. Additionally, the
+current trust bundle SHOULD be exported and archived independently:
+```bash
+wirescale-directory export-trust-bundle > /backup/trust-bundle-$(date +%Y%m%d).pem
+wirescale-directory export-crl > /backup/federation-crl-$(date +%Y%m%d).pem
+```
+
 **CRDs:** Include all Wirescale CRDs (WirescaleMesh, WirescaleNode,
 WirescalePolicy, WirescaleCluster, WirescaleExternalPeer,
 WirescaleAccessGrant, WirescaleServiceExport/Import) in Velero backups
 or etcd snapshots.
 
-**CA key escrow:** The cluster CA is the one exception to the no-escrow
-policy for node keys. Back up the CA secret encrypted at rest:
-```bash
-kubectl -n wirescale-system get secret wirescale-ca -o yaml | \
-  gpg --encrypt --recipient ops-team@example.com > /backup/ca-$(date +%Y%m%d).yaml.gpg
-```
-
 ### 4.3 Recovery Procedures
 
+**Offline root CA:** If the root CA HSM is lost or destroyed, restore from
+the M-of-N key share backup. If the root CA private key is suspected
+compromised, initiate a full root CA rotation ceremony (see Section 4.7).
+During root CA recovery, existing clusters continue operating normally
+with their cached trust bundles; only new cluster admissions and
+intermediate CA re-signing are blocked.
+
+**Per-cluster intermediate CA:** Restore the encrypted intermediate CA
+backup. Re-deploy the secret to the cluster:
+```bash
+gpg --decrypt /backup/cluster-ca-YYYYMMDD.yaml.gpg | \
+  kubectl -n wirescale-system apply -f -
+```
+Restart `wirescale-control` to pick up the restored CA. If the
+intermediate CA is suspected compromised, request revocation via the
+offline root CRL and provision a new intermediate CA (see Section 4.6).
+
 **Directory:** Stop all members, restore etcd snapshot, restart members,
-verify quorum. Controllers re-register on their next heartbeat (60 s).
-During the outage, intra-cluster operations are unaffected; only new
-cross-cluster peer establishment is blocked.
+verify quorum. Verify the trust bundle and CRL integrity after restore.
+Controllers re-register on their next heartbeat (60 s). During the outage,
+intra-cluster operations are unaffected; only new cross-cluster peer
+establishment and trust bundle refresh are blocked.
 
 **Controller:** Kubernetes restarts failed pods automatically. On start,
 the controller rebuilds its index from the API server (~30 s for 10K
@@ -345,10 +394,12 @@ during restart.
 
 | Component | RPO | RTO | Notes |
 |-----------|-----|-----|-------|
+| Offline root CA (HSM) | 0 (HSM backup) | <= 4 hours | M-of-N key share recovery ceremony |
+| Cluster intermediate CA | <= 24 hours | <= 1 hour | Encrypted backup restore |
 | Directory (etcd) | <= 4 hours | <= 30 min | Snapshot restore + quorum |
+| Trust bundle / CRLs | <= 4 hours | <= 30 min | Restored with directory; independent archive optional |
 | Controller | 0 (stateless) | <= 2 min | Pod restart + cache rebuild |
 | Agent | 0 (ephemeral) | <= 30 s | Pod restart + key registration |
-| CA keys | <= 24 hours | <= 1 hour | Encrypted backup restore |
 | CRDs (Velero) | <= 1 hour | <= 15 min | Velero restore |
 
 ### 4.5 Multi-Region Directory: Quorum and Split-Brain
@@ -370,6 +421,167 @@ Region A (us-east-1):  2 members
 Region B (eu-west-1):  2 members
 Region C (ap-south-1): 1 member
 Total: 5 members, tolerates loss of any 2
+```
+
+### 4.6 Certificate Rotation Procedures
+
+The certificate hierarchy has three rotation cadences: node certificates
+(frequent, automated), cluster intermediate CAs (periodic, semi-automated),
+and the offline federation root CA (rare, planned ceremony).
+
+#### Node Certificate Rotation (Automated)
+
+Node certificates are short-lived (default: 24 hours) and MUST be
+renewed automatically by `wirescale-control`.
+
+```
+Cadence: every 24 hours (configurable via WirescaleMesh CRD)
+Trigger: automatic, ~50% of certificate lifetime remaining
+Process:
+  1. Agent detects certificate approaching renewal threshold
+  2. Agent generates a new CSR and submits to wirescale-control
+  3. Control signs the CSR with the cluster intermediate CA
+  4. Agent installs the new certificate and re-establishes mTLS
+  5. Old certificate remains valid until its original expiry
+
+Monitoring:
+  - Alert: wirescale_certificate_expiry_seconds < 7200 (2 hours)
+  - Metric: wirescale_certificate_renewals_total
+  - Metric: wirescale_certificate_renewal_failures_total
+```
+
+No manual intervention is required. Certificate renewal failure MUST
+trigger a critical alert.
+
+#### Cluster Intermediate CA Rotation (Semi-Automated)
+
+Intermediate CAs have a longer lifetime (default: 1 year) and require
+a pre-signing ceremony with the offline root CA.
+
+```
+Cadence: every 12 months (RECOMMENDED: initiate at 9 months)
+Trigger: automated monitoring alert at 75% of intermediate CA lifetime
+
+Phase 1: Offline ceremony (requires physical access to root CA HSM)
+  1. Generate new intermediate CA keypair for the cluster
+  2. Create CSR with the same cluster identity constraints
+  3. Sign CSR with the offline federation root CA on the air-gapped HSM
+  4. Verify the certificate chain: new intermediate CA -> root CA
+  5. Deliver signed certificate to the cluster operator
+  Duration: SHOULD complete within 1 business day
+
+Phase 2: Online rotation (automated by wirescale-control)
+  6. Upload new intermediate CA certificate to wirescale-control:
+     kubectl -n wirescale-system create secret tls wirescale-cluster-ca-next \
+       --cert=new-intermediate.crt --key=new-intermediate.key
+  7. Control detects the new CA and begins dual-CA mode:
+     - Both old and new intermediate CAs are trusted
+     - New node certificates are signed by the new intermediate CA
+  8. Control publishes the new intermediate CA to the global directory
+  9. All agents renew their certificates within one rotation cycle (24h)
+ 10. After all agents hold certificates from the new CA:
+     - Old intermediate CA is removed from the trust bundle
+     - Old intermediate CA MAY be added to the root CRL for defense
+       in depth
+
+Grace period: both CAs MUST be trusted for at least 48 hours to allow
+all agents to renew. The grace period SHOULD be configurable.
+
+Monitoring:
+  - Alert: wirescale_intermediate_ca_expiry_seconds < 90 days
+  - Metric: wirescale_intermediate_ca_rotation_state
+    (values: normal, dual_ca, completing)
+```
+
+#### Offline Root CA Rotation (Rare, Planned Ceremony)
+
+Root CA rotation is a rare event that SHOULD occur only when the root CA
+is approaching expiry (default lifetime: 10 years) or when a compromise
+is suspected.
+
+```
+Cadence: every 10 years, or upon suspected compromise
+Planning lead time: MUST be at least 60 days
+
+Ceremony steps:
+  1. Generate new root CA keypair on the air-gapped HSM
+  2. Cross-sign: new root signs old root, old root signs new root
+     (creates a trust bridge for the transition period)
+  3. Re-sign all existing cluster intermediate CAs with the new root
+     (requires one air-gapped ceremony per cluster, or batch signing)
+  4. Package new trust bundle:
+     - New root CA cert
+     - Old root CA cert (for trust bridge)
+     - All re-signed intermediate CA certs
+     - Updated root CRL signed by new root
+  5. Upload trust bundle to the global directory
+  6. Verify: all cluster controllers refresh their trust bundles
+  7. Grace period: minimum 30 days with both roots trusted
+  8. Remove old root CA from the trust bundle
+  9. Securely destroy old root CA key material on the HSM
+
+Post-ceremony verification:
+  - All clusters report successful trust bundle refresh
+  - Cross-cluster mTLS handshakes succeed with new chain
+  - No certificate validation errors in any cluster
+
+Monitoring:
+  - Alert: wirescale_root_ca_expiry_seconds < 365 days (1 year)
+  - Metric: wirescale_trust_bundle_version (monotonically increasing)
+```
+
+### 4.7 Emergency CA Compromise Response
+
+#### Cluster Intermediate CA Compromise
+
+If a cluster's intermediate CA private key is suspected compromised:
+
+```
+Immediate actions (within 1 hour):
+  1. Revoke the compromised intermediate CA:
+     - Request root CA operator to add the intermediate to the root CRL
+     - Publish updated CRL to the global directory
+  2. Isolate the affected cluster:
+     - Remove the cluster entry from the global directory
+     - This prevents cross-cluster connections to/from the cluster
+
+Re-establishment (within 24 hours):
+  3. Generate a new intermediate CA keypair for the cluster
+  4. Sign with the offline root CA (emergency air-gapped ceremony)
+  5. Deploy the new intermediate CA to wirescale-control
+  6. All agents in the cluster renew certificates automatically
+  7. Re-register the cluster with the global directory
+  8. Cross-cluster peers re-establish via trust bundle refresh
+
+Impact: The compromised cluster experiences a brief cross-cluster
+outage (hours). Intra-cluster operations continue if the new
+intermediate CA is deployed promptly. Other clusters are unaffected.
+```
+
+#### Offline Root CA Compromise
+
+If the federation root CA is suspected compromised, this is a
+critical security event requiring full re-keying:
+
+```
+Immediate actions:
+  1. Activate incident response
+  2. Generate a new root CA on a fresh, verified HSM
+  3. Re-sign ALL cluster intermediate CAs with the new root
+     (this is the most time-consuming step)
+  4. Distribute new trust bundles to all directory replicas
+  5. All controllers refresh trust bundles
+  6. Securely destroy the compromised root CA key material
+
+Impact: Federation-wide re-keying ceremony. Each cluster must
+participate in the intermediate CA re-signing. Total duration
+depends on the number of clusters and the speed of the air-gapped
+ceremonies. Intra-cluster operations continue throughout.
+
+Prevention: The root CA MUST be stored on a FIPS 140-2 Level 3+
+HSM, air-gapped, with multi-party authorization. Root CA compromise
+requires physical access to the HSM and collusion of M-of-N key
+holders.
 ```
 
 ---
@@ -417,6 +629,7 @@ rotation cycles.
 | Agent-to-controller network partition | Existing peers/policies persist. New establishment fails gracefully. Auto-recovery on heal. |
 | Controller pod kill | Leader re-election < 5 s. Agents fail over. No data-plane impact. |
 | Node failure | Peers time out at WireGuard rekey (~2 min). Remote agents GC stale peers. No cascade. |
-| Certificate expiry | Handshake failures detected. Alert fires. Manual or auto-rotation restores connectivity. |
+| Certificate expiry | Handshake failures detected. Alert fires. Automatic node cert rotation restores connectivity. |
+| Intermediate CA rotation | Dual-CA mode activated. All agents renew within 24h. Cross-cluster partners accept new CA via trust bundle refresh. |
 | Directory quorum loss | Intra-cluster unaffected. Cross-cluster new peers blocked. Cached peers continue. |
 | BPF map exhaustion | New lookups fail. Agent logs map-full. Alert fires. Increase map size and redeploy. |

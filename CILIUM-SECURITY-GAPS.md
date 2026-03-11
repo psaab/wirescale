@@ -61,7 +61,7 @@ exploitable way. The table below summarizes them:
 |---|-----|-------------------|-----------------|-------------------|
 | 1 | Identity granularity | Label-hash only (32-bit) | Pods with same labels share identity regardless of SA, node, or cluster | Structured tuple: (cluster, namespace, SA, labels, node) |
 | 2 | Blast radius of state | Push all identities to all nodes | Any compromised node exposes complete identity map | Pull-based: each node knows only active flows |
-| 3 | No hierarchical trust | Single cluster CA, flat ClusterMesh | Cluster CA compromise = total compromise; no tiered containment | Three-tier: global directory CA → cluster CA → node certs |
+| 3 | No hierarchical trust | Single cluster CA, flat ClusterMesh | Cluster CA compromise = total compromise; no tiered containment | Three-tier: offline root CA → cluster intermediate CA → node certs; directory is discovery only |
 | 4 | All-or-nothing encryption | WireGuard on/off per cluster | Either encrypt everything (20-40% perf hit intra-site) or nothing | Selective: cross-site, cross-cluster, per-flow, or never |
 | 5 | TC-level ingress | Host firewall at TC hook | 2-5 Mpps/core; sk_buff already allocated before drop | XDP on eth0: 14-26 Mpps/core; drop before kernel stack |
 | 6 | No time-bounded access | Policies are permanent until deleted | Forgotten rules accumulate; no automatic expiry | WirescaleAccessGrant: mandatory expiry, approval workflow |
@@ -375,25 +375,32 @@ every remaining cluster. There is no "remove from directory" operation.
 
 ### How Wirescale Closes This Gap
 
-Wirescale implements a three-level certificate hierarchy:
+Wirescale implements a three-level certificate hierarchy with the trust
+anchor separated from the online discovery service:
 
 ```
-Level 1: Global Directory CA
-  - Self-signed root (or externally rooted at org PKI)
-  - Issues intermediate certificates to each cluster CA
-  - Maintains registry: cluster_id -> cluster_CA_cert
-  - Can revoke a cluster by removing its entry
+Level 1: Offline Federation Root CA
+  - HSM-backed, air-gapped -- never online during normal operation
+  - Signs per-cluster intermediate CA certificates
+  - Publishes CRLs for intermediate CA revocation
+  - Compromise requires physical HSM access + multi-party authorization
 
-Level 2: Cluster CA (per-cluster, issued by Level 1)
+Level 2: Per-Cluster Intermediate CA (issued by Level 1)
   - Signs node and agent certificates within its cluster
   - Managed by wirescale-control
   - Compromise affects ONLY this cluster
-  - Revocable by global directory without affecting others
+  - Revocable by offline root via CRL without affecting others
 
 Level 3: Node Certificates (per-node, issued by Level 2)
   - Used for mTLS between agent and controller
   - Short-lived (default 24h, auto-renewed)
   - Revocable by controller without affecting other nodes
+
+Global Directory (NOT a CA):
+  - Distributes trust bundles (root CA cert, intermediate CA certs, CRLs)
+  - Provides cluster discovery (endpoints, prefixes, metadata)
+  - Holds NO CA private key material
+  - Compromise = discovery disruption, NOT trust compromise
 ```
 
 **Blast radius containment:**
@@ -410,29 +417,35 @@ Level 3: Node Certificates (per-node, issued by Level 2)
 
 ```
 Cluster A controller contacts Cluster B controller:
-  1. A presents its cluster certificate (signed by directory CA)
-  2. B validates A's cert chain: A cert -> A cluster CA -> directory CA
+  1. A presents its cluster certificate (signed by A's intermediate CA)
+  2. B validates A's cert chain: A cert -> A intermediate CA -> offline root CA
   3. B presents its cluster certificate
-  4. A validates B's cert chain: B cert -> B cluster CA -> directory CA
-  5. Both sides are mutually authenticated
+  4. A validates B's cert chain: B cert -> B intermediate CA -> offline root CA
+  5. Both sides are mutually authenticated (no online CA involvement)
 
-If A's cluster CA is compromised:
+If A's intermediate CA is compromised:
   - Attacker can forge A-internal certs
-  - Attacker CANNOT forge certs that chain to the directory CA
-    (unless they also compromise the directory)
-  - B validates A's cluster CA against what the directory registered
-  - If the directory revokes A's entry, B immediately rejects A
+  - Attacker CANNOT forge certs that chain to the offline root CA
+    (root CA is air-gapped, HSM-backed)
+  - B validates A's intermediate CA against the federation trust bundle
+  - Offline root CA publishes CRL revoking A's intermediate CA
+  - B immediately rejects A after refreshing CRL from directory
 ```
 
 **Selective revocation:**
 
 ```bash
-# Revoke compromised cluster -- single operation
+# Revoke compromised cluster -- two levels
+# Level 1: Remove from directory discovery (immediate)
 wirescale-directory revoke-cluster compromised-cluster-id
+
+# Level 2: Revoke intermediate CA via offline root CRL (authoritative)
+# (performed by root CA operator on air-gapped HSM)
 
 # Effect:
 # - All other clusters querying the directory for this cluster get "not found"
-# - Existing cross-cluster sessions time out (WireGuard rekey timer)
+# - CRL update ensures certificate-level rejection even if directory is bypassed
+# - Existing cross-cluster sessions fail on next rekey (within 2 min)
 # - Intra-cluster operations in the compromised cluster continue
 #   (but are no longer trusted by the federation)
 # - No reconfiguration needed on any other cluster
@@ -443,8 +456,8 @@ wirescale-directory revoke-cluster compromised-cluster-id
 Multi-cluster deployments MUST use Wirescale's hierarchical trust chain
 instead of ClusterMesh's flat trust model. Single-cluster deployments
 with high security requirements SHOULD still deploy Wirescale's
-cluster CA under a directory CA to enable future federation without
-trust model changes.
+cluster intermediate CA under the offline federation root CA to enable
+future federation without trust model changes.
 
 ---
 
@@ -960,26 +973,26 @@ Removing a compromised cluster:
 **Authentication chain for cross-cluster communication:**
 
 ```
-Cluster A controller -> Global directory: "info for Cluster B?"
-  Directory validates A's cluster cert (signed by directory CA)
-  Directory returns B's CA cert, endpoints
+Cluster A controller -> Global directory: "discovery info for Cluster B?"
+  Directory validates A's intermediate CA against the federation trust bundle
+  Directory returns B's intermediate CA cert, endpoints
 
 Cluster A controller -> Cluster B controller: mutual TLS
-  A presents cert: A-controller cert -> A cluster CA -> directory CA
-  B validates: checks A's cluster CA is registered in directory
-  B presents cert: B-controller cert -> B cluster CA -> directory CA
-  A validates: checks B's cluster CA is registered in directory
+  A presents cert: A-controller cert -> A intermediate CA -> offline root CA
+  B validates: checks A's intermediate CA chains to the offline root CA
+  B presents cert: B-controller cert -> B intermediate CA -> offline root CA
+  A validates: checks B's intermediate CA chains to the offline root CA
 
-  Both sides mutually authenticated.
+  Both sides mutually authenticated (no online CA involvement).
   Credential rotation is automatic (certificate renewal).
-  Revocation is instant (directory entry removal).
+  Revocation: directory removal (discovery) + root CRL update (authoritative).
 ```
 
 | Operation | ClusterMesh | Wirescale Directory |
 |-----------|-------------|-------------------|
-| Add cluster N+1 | Update N clusters' configs | Register in directory (1 operation) |
-| Remove compromised cluster | Update N-1 configs | Revoke in directory (1 operation) |
-| Rotate cross-cluster creds | Manual cert redistribution | Automatic (cert renewal via directory CA) |
+| Add cluster N+1 | Update N clusters' configs | Register in directory (1 operation); intermediate CA signed by offline root |
+| Remove compromised cluster | Update N-1 configs | Revoke in directory + root CRL update |
+| Rotate cross-cluster creds | Manual cert redistribution | Automatic (cert renewal via intermediate CA; root rotation is planned ceremony) |
 | Discover new cluster | Pre-configured | On-demand via directory query |
 | Mutual authentication | Implicit (etcd TLS) | Explicit (federated CA chain) |
 
@@ -1174,9 +1187,10 @@ model provides layered isolation that neither system achieves alone:
 
 ```
 Layer 0: Hierarchical Trust (Wirescale)
-  Global directory CA → Cluster CA → Node certs
+  Offline root CA → Cluster intermediate CA → Node certs
+  Global directory: discovery and trust bundle distribution only
   Tiered blast radius containment
-  Cross-cluster mutual authentication via federated CAs
+  Cross-cluster mutual authentication via federated intermediate CAs
 
 Layer 1: Node Authentication (Both)
   Cilium: agent authenticates to API server

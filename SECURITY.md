@@ -14,6 +14,7 @@
 **See also:**
 - [ARCHITECTURE.md](ARCHITECTURE.md) -- Core architecture (ULA overlay model)
 - [PERFORMANCE.md](PERFORMANCE.md) -- Line-rate performance engineering
+- [OPERATIONS.md](OPERATIONS.md) -- CA rotation procedures, backup, disaster recovery
 - [ROUTABLE-PREFIX.md](ROUTABLE-PREFIX.md) -- Globally routable /64-per-host design
 - [CILIUM-INTEGRATION.md](CILIUM-INTEGRATION.md) -- Architecture comparison with Cilium as CNI
 - [CILIUM-SECURITY-GAPS.md](CILIUM-SECURITY-GAPS.md) -- Security isolation
@@ -94,10 +95,11 @@ Normative baseline:
 ### Layered Defense
 
 ```
-Layer 0: Hierarchical Trust (global directory -> cluster CA -> node certs)
-         - Three-tier certificate hierarchy
-         - Cross-cluster trust via federated cluster CAs
-         - Root of trust: global directory
+Layer 0: Hierarchical Trust (offline root CA -> cluster intermediate CA -> node certs)
+         - Three-tier certificate hierarchy with offline root
+         - Cross-cluster trust via federated cluster intermediate CAs
+         - Root of trust: offline federation root CA (HSM-backed, air-gapped)
+         - Global directory: discovery and trust bundle distribution only
 
 Layer 1: Control-Plane Authentication (node-to-control)
          - mTLS or projected ServiceAccount tokens
@@ -174,9 +176,16 @@ authorization, and enforcement.
 
 ### Tier 1: Global Directory (`wirescale-directory`)
 
-The global directory is a lightweight, globally replicated service that serves
-as the root of trust for cross-cluster authentication. It knows about
-clusters, not about individual pods or nodes.
+The global directory is a lightweight, globally replicated **discovery
+service**. It stores signed cluster metadata and trust bundle references
+for peer topology resolution. It is NOT a certificate authority and MUST
+NOT issue or sign certificates during normal operation.
+
+Certificate issuance is the responsibility of the **offline federation
+root CA** (HSM-backed, air-gapped) and **per-cluster intermediate CAs**.
+The directory distributes trust bundles (CA certificates and CRLs) but
+does not hold any CA private key material. See
+[Section 4](#4-hierarchical-trust-chain) for the full CA hierarchy.
 
 ```
 wirescale-directory:
@@ -184,26 +193,49 @@ wirescale-directory:
     cluster_id -> {
       gateway_endpoints: [ip:port, ...],
       prefix_allocation: 3fff:1234:0001::/48,
-      cluster_CA_cert: <PEM>,
+      cluster_CA_cert: <PEM>,          # public cert only, NOT the signing key
+      trust_bundle_version: u64,       # monotonic version for bundle updates
+      crl_distribution_url: <URL>,     # per-cluster CRL endpoint
       metadata: { region, provider, labels }
     }
 
   Responsibilities:
-    - Root of trust for cross-cluster authentication
-    - Issues/validates cluster-level certificates
-    - Maps cluster IDs to gateway endpoints and CA certs
-    - Manages global prefix allocation
+    - Discovery: maps cluster IDs to gateway endpoints, CA certs, and
+      controller endpoints
+    - Trust bundle distribution: stores and serves the federation trust
+      bundle (root CA cert, per-cluster intermediate CA certs, CRLs)
+    - Prefix allocation: assigns contiguous prefixes to clusters
+    - CRL/OCSP relay: distributes revocation information published by
+      the offline root CA or per-cluster intermediate CAs
 
-  Does NOT know about:
-    - Individual pods or nodes
-    - Per-pod identities or policies
-    - Intra-cluster state of any kind
+  Does NOT:
+    - Issue or sign any certificates (not a CA)
+    - Hold any CA private key material
+    - Act as a live certificate authority during normal operation
+    - Know about individual pods or nodes
+    - Store per-pod identities or policies
+    - Participate in intra-cluster state of any kind
 ```
 
 The global directory MUST be highly available and SHOULD be globally
 replicated. Its data set is small (one entry per cluster) and changes
 infrequently (cluster joins/leaves). It is not in the hot path for
 any per-packet or per-flow operation.
+
+**Directory compromise blast radius:** A compromised directory can disrupt
+discovery (serve wrong endpoints, inject fraudulent cluster metadata) but
+MUST NOT compromise the trust hierarchy. Because the directory holds no CA
+private keys, an attacker who gains full control of the directory cannot
+issue certificates, cannot forge cluster identities, and cannot perform
+man-in-the-middle attacks on connections where clients verify certificates
+against pinned trust bundles. The blast radius is limited to **discovery
+disruption**, not **trust compromise**.
+
+**Directory outage behavior:** When the directory is unreachable, cached
+discovery data on cluster controllers MUST continue to be used for
+established cross-cluster relationships. New cluster joins and discovery
+of previously-unknown clusters are blocked until the directory recovers.
+Intra-cluster operations are entirely unaffected.
 
 ### Tier 2: Cluster Controller (`wirescale-control`)
 
@@ -266,7 +298,7 @@ wirescale-agent (per-node):
 | Policy per node | Grows with cluster size | Local pods + cached remote rules |
 | CRD watches per node | O(N) events/sec | O(1) -- own node only |
 | Cross-cluster identity | Full sync | On-demand resolution, cached |
-| Trust chain | Single cluster CA | Hierarchical: global dir -> cluster CA -> node certs |
+| Trust chain | Single cluster CA | Hierarchical: offline root CA -> cluster intermediate CA -> node certs |
 | Node join cost | O(N) fan-out | O(1) registration with controller |
 
 ---
@@ -396,59 +428,119 @@ updated on demand as cache misses are resolved and refreshed on TTL expiry.
 
 ### Overview
 
-Wirescale uses a three-level certificate hierarchy that mirrors the three-tier
-control hierarchy. This replaces the single-CA model with a federated approach
-where each cluster is its own trust domain.
+Wirescale uses a three-level certificate hierarchy that cleanly separates
+**offline trust establishment** from **online discovery**. The certificate
+authority hierarchy is rooted in an offline, air-gapped federation root CA.
+The global directory is an online discovery service that distributes trust
+bundles but MUST NOT act as a certificate authority.
 
 ```
-Level 1: Global Directory CA
-         - Self-signed root (or externally rooted)
-         - Issues cluster-level certificates
-         - Validates cluster identity for cross-cluster operations
+Level 1: Offline Federation Root CA
+         - HSM-backed, air-gapped -- never online during normal operation
+         - Signs per-cluster intermediate CA certificates
+         - Publishes CRLs for intermediate CA revocation
+         - Rotation: rare, planned ceremony (see Section 10)
 
-Level 2: Cluster CA (per-cluster)
-         - Signed by global directory CA (or independently operated,
-           registered with global directory)
-         - Issues node and agent certificates
+Level 2: Per-Cluster Intermediate CA (per-cluster)
+         - Issued by the offline federation root CA
+         - Signs node and agent certificates within its cluster
          - Managed by wirescale-control
+         - Can be rotated independently per cluster without affecting
+           other clusters or the root CA
 
 Level 3: Node Certificates (per-node)
-         - Signed by cluster CA
+         - Signed by the cluster's intermediate CA
          - Used for mTLS between agent and controller
          - WireGuard keys are separate (not certificate-based)
+
+Global Directory (discovery, NOT a CA):
+         - Stores and distributes trust bundles (root CA cert,
+           intermediate CA certs, CRLs)
+         - Provides cluster discovery (endpoints, prefixes, metadata)
+         - Relays CRL/OCSP revocation data published by the CAs
+         - Holds NO CA private key material
 ```
 
-### Level 1: Global Directory as Root of Trust
+### Level 1: Offline Federation Root CA
+
+The federation root CA is the ultimate trust anchor. It MUST be operated
+offline on air-gapped infrastructure with HSM-backed key storage. It is
+never online during normal cluster operation.
 
 ```
-Global Directory CA:
-  - Issues certificates to each cluster's CA
-  - Maintains registry: cluster_id -> cluster_CA_cert
-  - Cross-cluster authentication works by:
-    1. Cluster-A presents its cluster cert to global directory
-    2. Global directory validates cert, returns Cluster-B's CA cert
-    3. Cluster-A's controller contacts Cluster-B's controller
-    4. Both sides validate each other via their respective cluster CAs,
-       which are both traceable to the global directory
+Offline Federation Root CA:
+  Key storage:
+    - MUST be stored in a FIPS 140-2 Level 3 (or higher) HSM
+    - MUST be air-gapped: the HSM MUST NOT be connected to any network
+    - Access MUST require multi-party authorization (M-of-N key ceremony)
+
+  Responsibilities:
+    - Signs per-cluster intermediate CA certificates
+    - Publishes a Certificate Revocation List (CRL) for revoking
+      compromised cluster intermediate CAs
+    - Signs the federation trust bundle (root CA cert + CRL)
+
+  Certificate properties:
+    Subject: CN=wirescale-federation-root, O=<organization>
+    Key: RSA-4096 or Ed25519
+    Validity: 10 years (long-lived, rotation is a planned ceremony)
+    Extensions:
+      - X509v3 Basic Constraints: CA:TRUE, pathlen:1
+      - X509v3 Key Usage: Certificate Sign, CRL Sign
+      - X509v3 Name Constraints: (optional, restrict to org O= values)
 
   Trust properties:
-  - No single CA signs everything (blast radius containment)
-  - Cluster CA compromise affects only that cluster
-  - Global directory CA rotation does not require re-issuing node certs
-  - Clusters can operate independently if global directory is unreachable
-    (existing cross-cluster sessions continue, new ones are delayed)
+    - Compromise of the root CA requires physical access to the HSM
+      and multi-party authorization -- the highest bar in the hierarchy
+    - Root CA rotation does NOT require re-issuing node certificates;
+      only intermediate CAs need new signatures (see Section 10)
+    - The root CA is NEVER contacted during normal operation; clusters
+      operate entirely with their intermediate CAs and cached trust bundles
+
+  Cross-cluster authentication works by:
+    1. All cluster intermediate CAs chain to the same offline root
+    2. The global directory distributes the federation trust bundle
+       (root CA cert + all intermediate CA certs)
+    3. Cluster-A's controller contacts Cluster-B's controller
+    4. Both sides validate each other's certificates against the
+       trust bundle (intermediate CA -> root CA chain)
+    5. No online CA involvement is needed for validation
 ```
 
-### Level 2: Cluster CA
+### Level 2: Per-Cluster Intermediate CA
+
+Each cluster operates its own intermediate CA, signed by the offline
+federation root. The intermediate CA is the only CA that is online during
+normal operation.
 
 ```
-Cluster CA (managed by wirescale-control):
-  - Stored securely within the cluster (e.g., Kubernetes Secret with
-    restricted RBAC, or external HSM/KMS)
-  - Signs node certificates for agents joining the cluster
-  - Signs controller certificates for inter-controller mTLS
+Per-Cluster Intermediate CA (managed by wirescale-control):
+  Key storage:
+    - MUST be stored securely within the cluster: Kubernetes Secret
+      with restricted RBAC, or external HSM/KMS (RECOMMENDED for
+      production)
+    - MUST NOT be exported or escrowed except for disaster recovery
+      (see OPERATIONS.md Section 4)
 
-  Certificate contents:
+  Issued by:
+    - The offline federation root CA (via air-gapped signing ceremony)
+
+  Responsibilities:
+    - Signs node certificates for agents joining the cluster
+    - Signs controller certificates for inter-controller mTLS
+    - Publishes per-cluster CRL for node certificate revocation
+
+  Certificate properties:
+    Subject: CN=wirescale-cluster-ca, O=<cluster-id>
+    Key: ECDSA P-256 or Ed25519
+    Issuer: CN=wirescale-federation-root, O=<organization>
+    Validity: 1 year (auto-rotation, see Section 10)
+    Extensions:
+      - X509v3 Basic Constraints: CA:TRUE, pathlen:0
+      - X509v3 Key Usage: Certificate Sign, CRL Sign
+      - X509v3 Name Constraints: permitted O=<cluster-id>
+
+  Node certificate properties:
     Subject: CN=wirescale-agent-<node-name>, O=<cluster-id>
     SAN: DNS:<node-name>, IP:<node-ip>
     Issuer: CN=wirescale-cluster-ca, O=<cluster-id>
@@ -456,15 +548,24 @@ Cluster CA (managed by wirescale-control):
     Extensions:
       - X509v3 Key Usage: Digital Signature, Key Encipherment
       - X509v3 Extended Key Usage: TLS Client Auth
+
+  Blast radius:
+    - Compromise of a cluster intermediate CA affects ONLY that cluster
+    - Other clusters are unaffected because they chain to different
+      intermediate CAs (all rooted at the same offline root)
+    - The offline root CA can revoke the compromised intermediate via CRL
+    - Rotation of one cluster's intermediate CA does NOT require
+      re-issuing certificates in other clusters
 ```
 
 ### Level 3: Node-to-Control Authentication
 
 ```
 Node-to-control authentication:
-  Option A: mTLS with cluster CA-signed certificates
-    - Agent presents certificate signed by cluster CA
-    - Control validates certificate chain
+  Option A: mTLS with cluster intermediate CA-signed certificates
+    - Agent presents certificate signed by the cluster intermediate CA
+    - Control validates the certificate chain:
+        node cert -> cluster intermediate CA -> federation root CA
     - Control extracts node identity from certificate subject
 
   Option B: Projected ServiceAccount tokens
@@ -477,6 +578,49 @@ Node-to-control authentication:
     - Control MUST reject connections from unrecognized nodes
     - All identity queries, policy requests, and peer authorizations
       flow over this authenticated channel
+```
+
+### Global Directory: Trust Bundle Distribution (Not a CA)
+
+The global directory distributes trust bundles but does NOT participate
+in certificate issuance. This separation ensures that directory compromise
+cannot lead to trust compromise.
+
+```
+Global Directory trust bundle distribution:
+  Stores:
+    - Federation root CA certificate (public)
+    - All cluster intermediate CA certificates (public)
+    - Root CRL (revoked intermediate CAs)
+    - Per-cluster CRLs (revoked node certificates)
+    - Trust bundle version counter (monotonic)
+
+  Distribution:
+    - Cluster controllers pull the trust bundle on startup and cache it
+    - Controllers SHOULD refresh the trust bundle periodically
+      (default: every 5 minutes)
+    - Trust bundle updates are versioned; controllers MUST NOT accept
+      a bundle with a lower version than the one they already hold
+
+  Revocation relay:
+    - The offline root CA publishes CRLs out-of-band (e.g., signed file
+      uploaded to the directory by an authorized operator)
+    - Per-cluster intermediate CAs publish their CRLs to the directory
+      via authenticated gRPC
+    - The directory serves CRLs to all cluster controllers
+    - Revocation authority resides in the CAs (offline root or per-cluster
+      intermediate), NOT in the directory
+    - The directory MUST NOT modify or forge CRL entries
+
+  Compromise properties:
+    - A compromised directory can serve stale CRLs (delaying revocation
+      propagation) or inject false discovery data
+    - A compromised directory CANNOT issue certificates, because it holds
+      no CA private key material
+    - A compromised directory CANNOT forge CRL entries, because CRLs
+      are signed by the issuing CA
+    - Controllers that pin known cluster CAs locally detect if the
+      directory serves a different CA certificate for a known cluster
 ```
 
 ### WireGuard Keys (Separate from Certificate Hierarchy)
@@ -497,22 +641,27 @@ public key is accepted by the controller.
 
 ```
 Trust chain for data-plane packets:
-  Global dir CA -> Cluster CA -> Node cert (mTLS to control)
-                                     |
-                                     v
-                              Control accepts WireGuard pubkey
-                                     |
-                                     v
-                              WireGuard peer established
-                                     |
-                                     v
-                              Packet decrypted (proves node identity)
-                                     |
-                                     v
-                              IP -> Pod identity (from cache or control)
-                                     |
-                                     v
-                              Policy evaluated -> ALLOW or DROP
+  Offline root CA -> Cluster intermediate CA -> Node cert (mTLS to control)
+                                                    |
+                                                    v
+                                             Control accepts WireGuard pubkey
+                                                    |
+                                                    v
+                                             WireGuard peer established
+                                                    |
+                                                    v
+                                             Packet decrypted (proves node identity)
+                                                    |
+                                                    v
+                                             IP -> Pod identity (from cache or control)
+                                                    |
+                                                    v
+                                             Policy evaluated -> ALLOW or DROP
+
+  Note: The global directory distributes the trust bundle (root CA cert,
+  intermediate CA certs, CRLs) but is NOT in the certificate chain.
+  Certificate validation uses the cached trust bundle, not a live
+  directory query.
 ```
 
 ---
@@ -1165,24 +1314,40 @@ A new node joins the mesh through this sequence:
      never learn about it
 ```
 
-### Cluster Admission (Into the Global Directory)
+### Cluster Admission (Into the Federation)
 
-A new cluster joins the global directory:
+A new cluster joins the federation through a two-phase process: offline
+CA signing, then online directory registration.
 
 ```
-1. Cluster operator generates cluster CA keypair
-2. Cluster operator requests registration with global directory:
-   - Presents cluster CA certificate
-   - Provides: gateway endpoints, requested prefix allocation, metadata
-3. Global directory validates the request:
-   - Authenticates the cluster operator (out-of-band or via admin API)
-   - Checks prefix allocation does not conflict
-   - Signs cluster CA certificate (or records it as a trusted CA)
-4. Global directory registers the cluster:
-   - cluster_id -> {gateway_endpoints, prefix, CA_cert, metadata}
-5. Cluster is now discoverable by other clusters
-6. wirescale-control starts: connects to global directory for
-   cross-cluster operations
+Phase 1: Offline CA Ceremony (air-gapped)
+  1. Cluster operator generates an intermediate CA keypair for the new cluster
+  2. Operator presents a Certificate Signing Request (CSR) to the offline
+     federation root CA via air-gapped ceremony:
+     - CSR includes: cluster_id, organization, name constraints
+     - Root CA operator verifies the request out-of-band (identity
+       verification of the requesting cluster operator)
+  3. Root CA signs the intermediate CA certificate:
+     - Subject: CN=wirescale-cluster-ca, O=<cluster-id>
+     - Issuer: CN=wirescale-federation-root, O=<organization>
+     - Validity: 1 year
+     - pathlen:0 (cannot issue further intermediate CAs)
+  4. Signed intermediate CA certificate delivered to the cluster operator
+
+Phase 2: Online Directory Registration
+  5. Cluster operator registers the cluster with the global directory:
+     - Presents the signed intermediate CA certificate
+     - Provides: gateway endpoints, requested prefix allocation, metadata
+  6. Global directory validates the request:
+     - Verifies the intermediate CA certificate chains to the federation
+       root CA (directory holds the root CA public certificate)
+     - Checks prefix allocation does not conflict
+     - Records the cluster entry (does NOT sign anything)
+  7. Global directory registers the cluster:
+     - cluster_id -> {gateway_endpoints, prefix, CA_cert, CRL_url, metadata}
+  8. Cluster is now discoverable by other clusters
+  9. wirescale-control starts: connects to global directory for
+     cross-cluster discovery and trust bundle retrieval
 ```
 
 ### Node Revocation
@@ -1214,17 +1379,33 @@ Option C: Key rotation (suspected partial compromise)
 
 ### Cluster Revocation
 
-When a cluster must be removed from the federation:
+When a cluster must be removed from the federation, revocation occurs at
+two levels: directory discovery removal and CA-level revocation.
 
 ```
-1. Global directory admin removes cluster entry
-2. Remote clusters querying the global directory for this cluster
-   receive "not found"
-3. Existing cross-cluster WireGuard sessions time out
-4. No new cross-cluster connections can be established to/from
-   the revoked cluster
-5. Intra-cluster operations are unaffected (the cluster's own CA
-   and controller continue to function independently)
+Level 1: Directory discovery removal (immediate)
+  1. Global directory admin removes the cluster entry
+  2. Remote clusters querying the directory for this cluster receive
+     "not found"
+  3. No new cross-cluster connections can be discovered for the
+     revoked cluster
+
+Level 2: CA-level revocation (authoritative)
+  4. Offline root CA operator adds the cluster's intermediate CA to
+     the root CRL
+  5. Updated CRL published to the global directory
+  6. Controllers refresh their CRL cache and reject certificates
+     chaining to the revoked intermediate CA
+  7. Existing cross-cluster WireGuard sessions fail on next rekey
+     (within 2 minutes) because the mTLS renegotiation is rejected
+  8. Intra-cluster operations are unaffected (the cluster's own
+     intermediate CA and controller continue to function independently
+     for intra-cluster purposes)
+
+Both levels SHOULD be executed. Level 1 provides immediate discovery
+removal. Level 2 provides cryptographic revocation that is effective
+even if the directory is compromised or the revoked cluster's operator
+attempts to re-register.
 ```
 
 ### Node Attestation (Hardened Mode)
@@ -1250,9 +1431,10 @@ policy decision point and enforcement point for node admission.
 
 ### Federated Trust Model
 
-Cross-cluster authentication uses the hierarchical trust chain without
-requiring a single global CA to sign everything. Each cluster maintains
-its own CA; the global directory federates trust between them.
+Cross-cluster authentication uses the hierarchical trust chain rooted at
+the offline federation root CA. Each cluster maintains its own intermediate
+CA; the global directory distributes trust bundles but does NOT participate
+in the certificate chain validation.
 
 ```
 Cross-Cluster Authentication Flow:
@@ -1260,17 +1442,21 @@ Cross-Cluster Authentication Flow:
 Cluster-A wants to reach a pod in Cluster-B:
 
   1. Cluster-A's controller queries the global directory:
-     "give me info for cluster-B"
+     "give me discovery info for cluster-B"
 
   2. Global directory authenticates Cluster-A's controller:
-     - Validates cluster certificate against registered CA
-     - Returns: Cluster-B's CA cert, controller endpoints, prefix
+     - Validates Cluster-A's intermediate CA certificate against the
+       federation trust bundle (intermediate CA -> root CA chain)
+     - Returns: Cluster-B's intermediate CA cert, controller endpoints,
+       prefix, CRL distribution URL
 
   3. Cluster-A's controller establishes mTLS to Cluster-B's controller:
-     - Presents its own cluster certificate
-     - Validates Cluster-B's certificate against the CA cert
-       received from the global directory
-     - Both sides are now mutually authenticated
+     - Presents its own certificate (signed by Cluster-A's intermediate CA)
+     - Validates Cluster-B's certificate against the trust bundle:
+         Cluster-B controller cert -> Cluster-B intermediate CA -> root CA
+     - Checks Cluster-B's intermediate CA against the root CRL
+     - Both sides are now mutually authenticated WITHOUT any online CA
+       involvement
 
   4. Cluster-A's controller requests identity/peer info:
      - "What is the identity of pod at IP 3fff:1234:0002:0003::7?"
@@ -1300,10 +1486,11 @@ Node-A (Cluster-1) <-> Node-B (Cluster-2):
   6. Agent-A configures WireGuard peer for Node-B
   7. Symmetric process: Control-2 informs Agent-B about Node-A
 
-  No global PKI needed:
-  - Cluster CAs are federated through the global directory
+  No online CA needed for peer establishment:
+  - All cluster intermediate CAs chain to the same offline root CA
+  - Trust bundles distributed through the global directory (cached locally)
   - WireGuard keys are exchanged through the authenticated control plane
-  - Each cluster independently manages its own keys
+  - Each cluster independently manages its own keys and node certificates
 ```
 
 ### Cross-Cluster Policy Enforcement
@@ -1330,13 +1517,26 @@ Pod-A (Cluster-1) -> Pod-B (Cluster-2):
 
 ### Trust Properties
 
-- **No single point of global compromise:** Compromising one cluster's CA
-  does not affect other clusters. The attacker can only forge identities
-  within the compromised cluster.
-- **Global directory compromise:** An attacker controlling the global
-  directory can introduce fraudulent cluster entries, potentially enabling
-  man-in-the-middle attacks on cross-cluster connections. Mitigations:
-  certificate pinning, out-of-band cluster CA verification, audit logging.
+- **No single point of online compromise:** The offline root CA is
+  air-gapped and never participates in runtime operations. Compromising
+  any online component (directory, controller, agent) cannot compromise
+  the root of trust.
+- **Cluster CA compromise is contained:** Compromising one cluster's
+  intermediate CA does not affect other clusters. The attacker can only
+  forge identities within the compromised cluster. The offline root CA
+  can revoke the compromised intermediate via CRL.
+- **Global directory compromise -- discovery only:** An attacker
+  controlling the global directory can disrupt discovery (serve wrong
+  endpoints, delay CRL distribution) but CANNOT issue certificates or
+  forge trust relationships. Controllers that pin known cluster CAs
+  detect if the directory serves a different CA certificate.
+  Mitigations: certificate pinning, out-of-band CA verification, audit
+  logging, signed trust bundles.
+- **Revocation authority resides in the CAs:** CRLs are signed by the
+  issuing CA (root or intermediate). The directory relays CRLs but
+  cannot forge them. An attacker who compromises the directory can
+  suppress CRL distribution (delay revocation awareness) but cannot
+  create fake revocation entries.
 - **Cluster isolation:** A cluster can leave the federation at any time
   by removing its entry from the global directory. Intra-cluster operations
   are unaffected.
@@ -1392,20 +1592,62 @@ Key difference from push model:
   - O(active_peers) notification instead of O(N) broadcast
 ```
 
-### Cluster CA Rotation
+### Cluster Intermediate CA Rotation
+
+Intermediate CA rotation is a per-cluster operation that SHOULD be
+automated. It does NOT require the offline root CA to be online for
+the rotation itself -- the new intermediate CA certificate is signed
+by the root CA in advance (see OPERATIONS.md Section 4.6).
 
 ```
-Cluster CA rotation (managed by wirescale-control):
-  1. New cluster CA keypair generated
-  2. New CA registered with global directory (alongside old CA)
-  3. Control begins issuing new node certificates signed by new CA
-  4. Grace period: both old and new CA are trusted
-  5. All nodes re-authenticate with new certificates
-  6. Old CA removed from global directory
-  7. Old CA is no longer trusted
+Cluster intermediate CA rotation (managed by wirescale-control):
+  Pre-rotation (offline ceremony):
+    1. New intermediate CA keypair generated for the cluster
+    2. CSR signed by the offline federation root CA
+    3. Signed intermediate CA certificate delivered to the cluster operator
+    4. New intermediate CA certificate uploaded to wirescale-control
+
+  Online rotation:
+    5. Control registers new intermediate CA with the global directory
+       (alongside the old intermediate CA in the trust bundle)
+    6. Control begins issuing new node certificates signed by the new
+       intermediate CA
+    7. Grace period: both old and new intermediate CAs are trusted
+       (both present in the trust bundle)
+    8. All nodes re-authenticate with new certificates on their next
+       renewal cycle (default: within 24 hours)
+    9. Old intermediate CA removed from the trust bundle in the directory
+   10. Old intermediate CA added to the root CRL (optional, for defense
+       in depth)
 
   This process is transparent to agents -- they simply re-authenticate
-  when their certificate is renewed.
+  when their certificate is renewed. Cross-cluster partners accept the
+  new intermediate CA as soon as they refresh their trust bundle.
+```
+
+### Offline Root CA Rotation
+
+Root CA rotation is a rare, planned ceremony that SHOULD occur only when
+the root CA is approaching expiry or when a compromise is suspected.
+
+```
+Offline root CA rotation (planned ceremony):
+  1. New root CA keypair generated on the air-gapped HSM
+  2. New root CA cross-signs the old root CA (and vice versa) to
+     create a trust bridge
+  3. All existing intermediate CAs are re-signed by the new root CA
+     (this requires an air-gapped ceremony per cluster)
+  4. New trust bundle (containing both old and new root CA certs)
+     distributed to the global directory
+  5. Controllers refresh trust bundles and begin accepting certificates
+     chaining to either root
+  6. Grace period (RECOMMENDED: 30 days minimum): both roots are trusted
+  7. Old root CA removed from the trust bundle
+  8. Old root CA key material securely destroyed on the HSM
+
+  Timeline: This process SHOULD be planned with at least 60 days lead
+  time. The grace period MUST be long enough for all clusters to
+  refresh their trust bundles and re-sign their intermediate CAs.
 ```
 
 ### Emergency Key Revocation
@@ -1828,9 +2070,9 @@ TIMESTAMP           ACTION  SRC_CLUSTER  SRC                DST_CLUSTER  DST    
 | T12 | Lateral movement after pod compromise | Escalation | Deny-by-default policy. Compromised pod can only reach explicitly allowed destinations. WirescaleAccessGrant provides time-limited escalation. |
 | T13 | Identity cache poisoning (T-CACHE-POISON) | Wrong identity for IP, policy bypass | Short TTL on cached entries. Identity responses signed by control. Agent can cross-verify identity against node's WireGuard key (IP must come from correct node CIDR). See expanded analysis below. |
 | T14 | DDoS against wirescale-control (T-CONTROL-DOS) | Nodes cannot establish new peers or resolve new identities | Cached peers and identities continue working. Stale entries remain usable during outage. Existing WireGuard sessions independent of control. Graceful degradation by design. See expanded analysis below. |
-| T15 | Global directory compromise (T-DIRECTORY) | Fraudulent cluster entries, cross-cluster MITM | Certificate pinning for known clusters. Out-of-band CA verification. Audit logging on all directory operations. Intra-cluster operations unaffected. See expanded analysis below. |
+| T15 | Global directory compromise (T-DIRECTORY) | Discovery disruption, stale CRL distribution; CANNOT issue certificates or forge trust (directory holds no CA keys) | Certificate pinning for known clusters. Signed trust bundles. Signed CRLs (directory cannot forge). Out-of-band CA verification. Audit logging. Intra-cluster operations unaffected. See expanded analysis below. |
 | T16 | Cross-cluster identity forgery | Remote cluster serves fake identity | Dual-side policy enforcement (both clusters must allow). Short TTL on cross-cluster cache. Controller validates remote identity against known prefix allocation. |
-| T17 | Cluster CA compromise | All nodes/pods in that cluster can be impersonated | Blast radius limited to the compromised cluster. Global directory can revoke the cluster. Other clusters are unaffected. CA rotation procedure restores trust. |
+| T17 | Cluster intermediate CA compromise | All nodes/pods in that cluster can be impersonated | Blast radius limited to the compromised cluster. Offline root CA revokes the intermediate via CRL. Directory distributes updated CRL. Other clusters are unaffected. New intermediate CA issued by offline root restores trust. |
 | T18 | Supply chain attack on agent container image loads malicious eBPF | TC program returns `TC_ACT_OK` unconditionally, bypassing all policy enforcement | Image signing, eBPF hash verification, runtime audit, read-only filesystem |
 | T19 | Pull model concentrates communication metadata at wirescale-control | Complete communication graph observable at a single point | Query log retention limits, access control, optional anonymization |
 
@@ -1902,23 +2144,34 @@ If control becomes unavailable:
 
 If an attacker gains control of the global directory:
 
-- **Can do:** Register fraudulent clusters; serve wrong CA certificates for
-  existing clusters; enable man-in-the-middle attacks on cross-cluster
-  connections; deny cross-cluster connectivity.
-- **Cannot do:** Affect intra-cluster operations (each cluster's CA and
+- **Can do:** Register fraudulent cluster discovery entries (wrong
+  endpoints, wrong metadata); suppress CRL distribution (delay revocation
+  awareness); serve stale trust bundles; deny cross-cluster discovery.
+- **Cannot do:** Issue or sign any certificates (the directory holds no CA
+  private keys); forge CRL entries (CRLs are signed by the issuing CA);
+  affect intra-cluster operations (each cluster's intermediate CA and
   controller operate independently); decrypt any traffic (the directory
-  only stores public CA certificates); directly control any cluster's
-  nodes or pods.
+  only stores public certificates).
+- **Key architectural property:** Because the directory is a discovery
+  service and NOT a certificate authority, directory compromise results in
+  **discovery disruption**, not **trust compromise**. An attacker cannot
+  use the directory to forge cluster identities or perform
+  man-in-the-middle attacks on connections where clients verify
+  certificates against the federation trust bundle.
 - **Mitigations:**
   - Certificate pinning: clusters MAY pin known remote cluster CAs locally,
-    detecting if the directory serves a different CA
+    detecting if the directory serves a different CA certificate
+  - Signed trust bundles: the trust bundle is signed by the offline root CA;
+    the directory cannot modify it without detection
+  - Signed CRLs: CRLs are signed by the issuing CA; the directory cannot
+    forge revocation entries
   - Out-of-band verification: operators can verify cluster CA fingerprints
     through a side channel
   - Audit logging on all directory operations
   - The directory's data set is small and changes infrequently, making
     anomalies easier to detect
   - Recovery: restore directory from backup (small data set), re-verify
-    all cluster CA entries
+    all cluster entries against signed trust bundles
 
 **T18: Compromised Agent Loading Malicious eBPF (Supply Chain)**
 
@@ -2011,9 +2264,11 @@ Attack surface reduced by:
    - External IPv4 only reachable via controlled NAT64 path
 
 2. Hierarchical trust (Layer 0)
-   - Three-tier CA hierarchy limits blast radius
-   - Cluster CA compromise affects only that cluster
-   - Global directory compromise does not affect intra-cluster
+   - Offline root CA (HSM-backed, air-gapped) as trust anchor
+   - Per-cluster intermediate CAs limit blast radius
+   - Cluster intermediate CA compromise affects only that cluster
+   - Global directory is discovery only -- compromise does not
+     affect trust hierarchy
 
 3. Central authentication (Layer 1)
    - Every node authenticated via mTLS to control
@@ -2036,7 +2291,8 @@ Attack surface reduced by:
 7. Automatic key rotation
    - Limits window of compromise
    - No long-lived static credentials
-   - Hierarchical: node keys, cluster CA, global CA
+   - Hierarchical: node keys (24h), cluster intermediate CA (1y),
+     offline root CA (10y)
 
 8. Graceful degradation
    - Control outage does not disrupt existing traffic
@@ -2139,7 +2395,7 @@ or inject traffic, but it reveals the topology of active flows.
 | 2.2 | Secure system configuration standards | Agent runs with read-only root filesystem, minimal capabilities (CAP_BPF, CAP_NET_ADMIN only), no key escrow, memory-only private keys. Control runs as stateless HA replicas with restricted RBAC. | Container hardening follows CIS Kubernetes Benchmark. |
 | 4.1 | Strong cryptography for transmission | All inter-node traffic encrypted via WireGuard (ChaCha20-Poly1305, Curve25519 key exchange). Control-plane traffic protected by mTLS. No plaintext inter-node path exists. | Encryption is non-negotiable and always on. |
 | 7.1 | Least privilege access | Identity-based policy grants access only to explicitly permitted (identity, port, protocol) tuples. WirescaleAccessGrant provides time-bounded privilege escalation that automatically expires. | Access is scoped to Kubernetes ServiceAccount identity. |
-| 8.3 | Strong authentication mechanisms | Node admission requires mTLS with X.509 certificates from the cluster CA. Three-tier CA hierarchy (global directory CA, cluster CA, node certificate) provides layered authentication. | No shared secrets for node authentication; each node holds a unique keypair. |
+| 8.3 | Strong authentication mechanisms | Node admission requires mTLS with X.509 certificates from the cluster intermediate CA. Three-tier CA hierarchy (offline federation root CA, per-cluster intermediate CA, node certificate) provides layered authentication. | No shared secrets for node authentication; each node holds a unique keypair. Offline root CA is HSM-backed and air-gapped. |
 | 10.1 | Audit trail mechanisms | eBPF ring buffer emits per-connection audit events with full identity attribution (pod, namespace, ServiceAccount, labels, node, cluster). Control-plane operations (peer authorization, identity queries, policy changes, revocations) are logged with timestamps. | Logs include identity, not just IP, enabling attribution across pod rescheduling. |
 | 11.5 | IDS/IPS and change detection | eBPF enforcement logs all denied connections. Anomaly detection SHOULD alert on mass peer authorizations, identity changes for stable pods, and policy generation spikes. eBPF program hash verification detects tampering with enforcement code. | Runtime BPF audit via `bpftool` detects modified enforcement programs. |
 
@@ -2159,7 +2415,7 @@ or inject traffic, but it reveals the topology of active flows.
 
 | Criterion | Requirement | Wirescale Capability | Notes |
 |-----------|-------------|---------------------|-------|
-| CC6.1 | Logical Access Security | Three-tier CA hierarchy authenticates all participants. mTLS for control-plane access. WireGuard cryptokey routing restricts data-plane access to authorized peers. Identity-based policy enforced in eBPF at every node. | Logical access is identity-based and cryptographically enforced. |
+| CC6.1 | Logical Access Security | Three-tier CA hierarchy (offline root, per-cluster intermediate, node certs) authenticates all participants. mTLS for control-plane access. WireGuard cryptokey routing restricts data-plane access to authorized peers. Identity-based policy enforced in eBPF at every node. | Logical access is identity-based and cryptographically enforced. Offline root CA provides the highest assurance trust anchor. |
 | CC6.6 | System Boundaries | WireGuard full-mesh defines an explicit cryptographic boundary: only nodes with authorized key pairs participate. Cross-cluster flows require federation through the global directory and dual-side policy approval. External peers require explicit WirescaleExternalPeer resources. | Boundary is defined by cryptographic peer authorization, not network topology. |
 | CC6.7 | Transmission Integrity and Security | All inter-node transmission encrypted (ChaCha20-Poly1305) and authenticated (Poly1305 MAC, Curve25519 mutual auth). Control-plane protected by mTLS. Key rotation every 24 hours (configurable); WireGuard rekeys every 2 minutes for forward secrecy. | No unencrypted transmission path between nodes. |
 | CC7.2 | System Monitoring | eBPF audit events for all denied connections. Prometheus metrics for peer health, policy generation, cache performance, handshake failures, and cross-cluster operations. Control-plane audit log for all authentication, authorization, and revocation events. Alerting on anomalous patterns (mass peer auth, identity changes). | Monitoring covers both data plane (eBPF events) and control plane (gRPC audit log). |
@@ -2268,16 +2524,25 @@ the three-tier control hierarchy.
 - [ ] Identity response signing
 - [ ] Certificate pinning for cross-cluster connections
 
-**Phase 3h: Global Directory and Cross-Cluster**
-- [ ] `wirescale-directory` service (globally replicated)
-- [ ] Global directory: cluster registration and CA management
+**Phase 3h: Offline Root CA and Per-Cluster Intermediate CAs**
+- [ ] Offline federation root CA tooling (HSM-backed key ceremony scripts)
+- [ ] Per-cluster intermediate CA issuance via offline root
+- [ ] Intermediate CA rotation automation (wirescale-control)
+- [ ] CRL generation and signing (root and intermediate levels)
+- [ ] Trust bundle packaging and signing
+
+**Phase 3i: Global Directory and Cross-Cluster**
+- [ ] `wirescale-directory` service (globally replicated, discovery only)
+- [ ] Global directory: cluster registration (validates intermediate CA
+      chain, does NOT sign certificates)
+- [ ] Global directory: trust bundle and CRL distribution
 - [ ] Global directory: prefix allocation management
-- [ ] Control-to-control mTLS federation (via global directory)
+- [ ] Control-to-control mTLS federation (via cached trust bundles)
 - [ ] Cross-cluster identity resolution (controller-to-controller)
 - [ ] Cross-cluster peer authorization (dual-side enforcement)
 - [ ] Cross-cluster WireGuard tunnel establishment
-- [ ] Cluster revocation via global directory
-- [ ] Cluster CA rotation procedure
+- [ ] Cluster revocation: directory removal + root CRL update
+- [ ] Root CA rotation procedure (planned ceremony)
 
 ### RBAC Configuration
 
