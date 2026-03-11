@@ -17,7 +17,7 @@
 - [SECURITY.md](SECURITY.md) -- Network security and dynamic access control
   (identity model, policy enforcement, BPF maps, audit)
 - [ROUTABLE-PREFIX.md](ROUTABLE-PREFIX.md) -- Globally routable /64-per-host
-  design (BGP routing, selective encryption, native IPv6 performance)
+  design (BGP routing, deployment profiles, native IPv6 performance)
 - [CILIUM-INTEGRATION.md](CILIUM-INTEGRATION.md) -- Architecture comparison
   with Cilium as CNI (what changes, what Wirescale still provides)
 - [EGRESS.md](EGRESS.md) -- Outbound internet access (NPTv6 egress,
@@ -29,20 +29,21 @@
 
 1. [Problem Statement](#1-problem-statement)
 2. [Design Principles](#2-design-principles)
-3. [Three-Tier Control Hierarchy](#3-three-tier-control-hierarchy)
-4. [Component Deep Dives](#4-component-deep-dives)
-5. [Address Architecture and Hierarchical Prefix Aggregation](#5-address-architecture-and-hierarchical-prefix-aggregation)
-6. [Data Plane: On-Demand WireGuard Peering](#6-data-plane-on-demand-wireguard-peering)
-7. [Cross-Cluster Connectivity](#7-cross-cluster-connectivity)
-8. [IPv4 in an IPv6-Only World](#8-ipv4-in-an-ipv6-only-world)
-9. [DNS Architecture](#9-dns-architecture)
-10. [Cross-Cluster Service Discovery and Load Balancing](#10-cross-cluster-service-discovery-and-load-balancing)
-11. [Host-Network Pods](#11-host-network-pods)
-12. [Security Model](#12-security-model)
-13. [Custom Resource Definitions](#13-custom-resource-definitions)
-14. [Packet Flow Walkthrough](#14-packet-flow-walkthrough)
-15. [Comparison with Existing Solutions](#15-comparison-with-existing-solutions)
-16. [Implementation Phases](#16-implementation-phases)
+3. [Deployment Profiles](#3-deployment-profiles)
+4. [Three-Tier Control Hierarchy](#4-three-tier-control-hierarchy)
+5. [Component Deep Dives](#5-component-deep-dives)
+6. [Address Architecture and Hierarchical Prefix Aggregation](#6-address-architecture-and-hierarchical-prefix-aggregation)
+7. [Data Plane: On-Demand WireGuard Peering](#7-data-plane-on-demand-wireguard-peering)
+8. [Cross-Cluster Connectivity](#8-cross-cluster-connectivity)
+9. [IPv4 in an IPv6-Only World](#9-ipv4-in-an-ipv6-only-world)
+10. [DNS Architecture](#10-dns-architecture)
+11. [Cross-Cluster Service Discovery and Load Balancing](#11-cross-cluster-service-discovery-and-load-balancing)
+12. [Host-Network Pods](#12-host-network-pods)
+13. [Security Model](#13-security-model)
+14. [Custom Resource Definitions](#14-custom-resource-definitions)
+15. [Packet Flow Walkthrough](#15-packet-flow-walkthrough)
+16. [Comparison with Existing Solutions](#16-comparison-with-existing-solutions)
+17. [Implementation Phases](#17-implementation-phases)
 
 ---
 
@@ -95,9 +96,12 @@ in an IPv6-only Kubernetes cluster:
 2. **Transparent IPv4 connectivity** -- the platform MUST provide an IPv4
    compatibility path so pods can use IPv4 socket semantics over an IPv6
    underlay.
-3. **Encrypted pod-to-pod mesh** -- inter-node traffic MUST be encrypted with
-   WireGuard via on-demand peering; peers MUST be established only when
-   traffic demands it and garbage-collected when idle.
+3. **Encrypted pod-to-pod mesh** -- in the default `encrypted-overlay`
+   deployment profile, all inter-node traffic MUST be encrypted with
+   WireGuard via on-demand peering. Other profiles (see
+   [Section 3](#3-deployment-profiles)) MAY permit plaintext paths within
+   defined trust boundaries. Peers MUST be established only when traffic
+   demands it and garbage-collected when idle.
 4. **Central authentication, decentralized forwarding** -- a central control
    plane MUST handle authentication, authorization, and peer brokering. The
    data plane MUST remain fully decentralized. Nodes MUST make forwarding
@@ -137,7 +141,227 @@ in an IPv6-only Kubernetes cluster:
 
 ---
 
-## 3. Three-Tier Control Hierarchy
+## 3. Deployment Profiles
+
+Wirescale's encryption posture is determined by a **deployment profile** --
+a named configuration that defines which traffic paths are encrypted, which
+MAY traverse the network in plaintext, and what security invariants the
+operator can rely on. Every Wirescale deployment MUST select exactly one
+profile. The profile is set in the `WirescaleMesh` CRD
+(`spec.encryption.profile`) and MUST NOT be changed at runtime without a
+planned maintenance window.
+
+> **Cross-reference:** [SECURITY.md](SECURITY.md) Section 1 describes how
+> each profile maps to the layered defense model. Compliance claims
+> (PCI-DSS, HIPAA, SOC 2) in SECURITY.md Section 15 are qualified by
+> the active deployment profile. [ROUTABLE-PREFIX.md](ROUTABLE-PREFIX.md)
+> Section 8 describes how deployment profiles govern encryption under the
+> `trusted-site` and `encrypted-routable` profiles.
+> [CILIUM-INTEGRATION.md](CILIUM-INTEGRATION.md) Section 7 describes
+> how profile selection interacts with Cilium's intra-cluster WireGuard.
+
+### 3.1 Profile Summary
+
+| Profile | Default | Intra-Node | Intra-Cluster | Cross-Cluster | Cross-Site | Use Case |
+|---------|:-------:|------------|---------------|---------------|------------|----------|
+| `encrypted-overlay` | **Yes** | Plaintext | WireGuard | WireGuard | WireGuard | Untrusted infra, compliance |
+| `encrypted-routable` | No | Plaintext | WireGuard | WireGuard | WireGuard | GUA pods, line-rate + encryption |
+| `trusted-site` | No | Plaintext | Plaintext | WireGuard | WireGuard | Trusted DC fabric, multi-site |
+| `development` | No | Plaintext | Plaintext | Plaintext | Plaintext | Dev/test only |
+
+### 3.2 `encrypted-overlay` (Default)
+
+The default profile. All inter-node traffic is encrypted via WireGuard using
+ULA overlay addressing. This profile provides the strongest security posture
+and SHOULD be used unless the operator has a documented reason to choose a
+different profile.
+
+**Security invariants:**
+- All inter-node pod traffic MUST traverse a WireGuard tunnel (ChaCha20-Poly1305).
+- Intra-node pod traffic is plaintext (kernel namespace isolation is sufficient).
+- No inter-node packet is ever sent in plaintext, regardless of cluster or
+  site topology.
+- WireGuard serves dual duty: routing overlay and encryption.
+
+**Permitted plaintext paths:**
+- Intra-node only (pods on the same host communicating via the local bridge).
+
+**Compliance claims:**
+- Satisfies PCI-DSS 4.1, HIPAA 164.312(e), SOC 2 CC6.7 unconditionally.
+- No plaintext inter-node path exists; auditors MAY verify by confirming
+  that all pod /64 routes point to `wg0`.
+
+**Prerequisites:**
+- None beyond base Wirescale installation. Works on any underlay.
+
+**WirescaleMesh configuration:**
+```yaml
+spec:
+  encryption:
+    profile: encrypted-overlay   # default if omitted
+```
+
+### 3.3 `encrypted-routable`
+
+Globally routable pods (GUA addressing) with WireGuard as a pure encryption
+layer. The fabric routes /64 prefixes to hosts natively; WireGuard provides
+confidentiality without serving as the routing overlay.
+
+**Security invariants:**
+- All inter-node pod traffic MUST be redirected through WireGuard by the
+  eBPF encryption decision point.
+- WireGuard is encryption-only; routing is handled natively by the fabric.
+- Cross-cluster traffic MUST be encrypted via direct WireGuard tunnels
+  established after signaling-plane resolution.
+
+**Permitted plaintext paths:**
+- Intra-node only (same as `encrypted-overlay`).
+
+**Compliance claims:**
+- Identical to `encrypted-overlay`. No plaintext inter-node path exists.
+- Auditors MAY verify by confirming that the eBPF `encrypt_map` marks all
+  remote /64 prefixes with `require_encryption = true`.
+
+**Prerequisites:**
+- Fabric-managed BGP routing for pod /64 prefixes (see
+  [ROUTABLE-PREFIX.md](ROUTABLE-PREFIX.md)).
+- GUA prefix allocation (`3fff:1234::/32` or provider-assigned space).
+
+**WirescaleMesh configuration:**
+```yaml
+spec:
+  encryption:
+    profile: encrypted-routable
+```
+
+### 3.4 `trusted-site`
+
+Native routing within a trusted site boundary (no encryption intra-site),
+with WireGuard encryption for all cross-site traffic. This profile trades
+intra-site confidentiality for line-rate performance on the local fabric.
+
+**Security invariants:**
+- Cross-site inter-node traffic MUST be encrypted via WireGuard.
+- Cross-cluster traffic within the same site MAY be plaintext if both
+  clusters are in the same declared site boundary.
+- Cross-cluster traffic between different sites MUST be encrypted.
+- The operator MUST define site boundaries explicitly in the `WirescaleMesh`
+  CRD; there is no automatic site detection.
+
+**Permitted plaintext paths:**
+- Intra-node (same as all profiles).
+- Intra-site inter-node traffic: pods communicating with pods on other nodes
+  within the same site boundary traverse the native fabric without WireGuard.
+  This includes both intra-cluster and cross-cluster-same-site traffic.
+
+**Compliance claims:**
+- PCI-DSS 4.1, HIPAA 164.312(e), SOC 2 CC6.7 are satisfied ONLY for
+  cross-site traffic. Intra-site traffic is NOT encrypted.
+- Operators MUST document the intra-site plaintext path in their compliance
+  assessment. The site boundary MUST correspond to a physically secured
+  network perimeter (e.g., a datacenter with controlled access).
+- If the compliance scope requires encryption of all inter-node traffic,
+  this profile MUST NOT be used; select `encrypted-overlay` or
+  `encrypted-routable` instead.
+
+**Prerequisites:**
+- Fabric-managed BGP routing for pod /64 prefixes within each site.
+- Explicit site boundary definitions in the `WirescaleMesh` CRD.
+- Physical or logical network security controls at each site boundary
+  (the operator asserts that intra-site transit is trusted).
+
+**WirescaleMesh configuration:**
+```yaml
+spec:
+  encryption:
+    profile: trusted-site
+    sites:
+      - name: dc-east
+        clusters: ["cluster-1", "cluster-4"]
+      - name: dc-west
+        clusters: ["cluster-2"]
+      - name: dc-south
+        clusters: ["cluster-3"]
+```
+
+### 3.5 `development`
+
+No encryption anywhere. All traffic is plaintext. This profile is provided
+for development and testing environments where encryption overhead interferes
+with debugging or performance profiling.
+
+**Security invariants:**
+- None. No traffic is encrypted.
+
+**Permitted plaintext paths:**
+- All paths: intra-node, intra-cluster, cross-cluster, cross-site.
+
+**Compliance claims:**
+- None. This profile MUST NOT be used in any environment subject to
+  PCI-DSS, HIPAA, SOC 2, or equivalent regulatory requirements.
+- The agent MUST log a warning at startup when this profile is active.
+- The `WirescaleNode` status MUST expose `encryptionProfile: development`
+  so monitoring systems can alert on non-production profiles in production
+  clusters.
+
+**Prerequisites:**
+- None.
+
+**WirescaleMesh configuration:**
+```yaml
+spec:
+  encryption:
+    profile: development
+```
+
+### 3.6 Profile Selection Guidance
+
+| Criterion | `encrypted-overlay` | `encrypted-routable` | `trusted-site` | `development` |
+|-----------|:---:|:---:|:---:|:---:|
+| Untrusted / shared infrastructure | **Yes** | Yes | No | No |
+| Regulatory compliance required | **Yes** | Yes | Partial | No |
+| Line-rate intra-cluster perf needed | No | Yes | Yes | Yes |
+| GUA addressing required | No | **Yes** | Yes | Either |
+| Multi-site with trusted DC fabric | N/A | N/A | **Yes** | No |
+| Dev/test/CI environment | No | No | No | **Yes** |
+
+### 3.7 Per-Flow Encryption Override
+
+Independent of the active profile, individual flows MAY be encrypted or
+exempted via `WirescalePolicy` resources with `encryption: required` or
+`encryption: none`. Per-flow overrides MUST NOT weaken the profile's
+security invariants -- they can only strengthen them:
+
+- In `encrypted-overlay` and `encrypted-routable`, `encryption: none` on a
+  policy is a no-op (the profile mandates encryption for all inter-node
+  traffic).
+- In `trusted-site`, `encryption: required` on a policy forces specific
+  intra-site flows through WireGuard even though the profile permits
+  intra-site plaintext.
+- In `development`, `encryption: required` on a policy is a no-op (WireGuard
+  is not active).
+
+### 3.8 Profile and Legacy Encryption Mode Mapping
+
+The deployment profiles replace the previous `spec.encryption.mode` field.
+For backward compatibility, the agent MUST accept the legacy mode values and
+map them to profiles:
+
+| Legacy `mode` | Mapped Profile | Notes |
+|---------------|---------------|-------|
+| `always` | `encrypted-overlay` | Exact equivalent |
+| `cross-cluster` | `encrypted-routable` | Closest match; encrypts cross-cluster, native intra-cluster |
+| `cross-site` | `trusted-site` | Exact equivalent |
+| `never` | `development` | Exact equivalent |
+| `policy` | (per-flow override) | Use any profile + per-flow `WirescalePolicy` overrides |
+
+If both `spec.encryption.profile` and `spec.encryption.mode` are set, the
+agent MUST reject the configuration and log an error. Operators MUST migrate
+to profile-based configuration.
+
+---
+
+## 4. Three-Tier Control Hierarchy
 
 The control plane is organized into three tiers, each holding only the state
 appropriate to its scope. This is the fundamental architectural change from
@@ -296,9 +520,9 @@ signaling gateway.
 
 ---
 
-## 4. Component Deep Dives
+## 5. Component Deep Dives
 
-### 4.1 wirescale-directory (Tier 1)
+### 5.1 wirescale-directory (Tier 1)
 
 The global directory runs as a replicated service (3+ nodes) outside any
 single Kubernetes cluster. It MAY run on dedicated infrastructure, as a
@@ -323,12 +547,12 @@ multi-cluster service, or within a designated management cluster.
 
 **Prefix Allocation:**
 - The directory allocates contiguous prefixes from the federation address
-  space (see [Section 5](#5-address-architecture-and-hierarchical-prefix-aggregation))
+  space (see [Section 6](#6-address-architecture-and-hierarchical-prefix-aggregation))
 - Allocation is idempotent: re-registering with the same cluster ID returns
   the existing allocation
 - Deallocated prefixes are quarantined (default 7 days) before reuse
 
-### 4.2 wirescale-control (Tier 2)
+### 5.2 wirescale-control (Tier 2)
 
 The per-cluster control plane service runs as a Kubernetes Deployment with 3+
 replicas behind a Service for high availability. It is the single component
@@ -396,7 +620,7 @@ gRPC over mTLS.
 - Issues peer authorization for external nodes through the same broker
   interface used by in-cluster agents.
 
-### 4.3 wirescale-agent (Tier 3)
+### 5.3 wirescale-agent (Tier 3)
 
 The agent is the workhorse. It runs as a privileged DaemonSet with
 `hostNetwork: true` and capabilities `NET_ADMIN`, `NET_RAW`, `SYS_MODULE`.
@@ -461,7 +685,7 @@ configurable TTL (default 60s) and are re-fetched on next access.
 The agent periodically verifies actual WireGuard state matches desired state
 and removes stale peers that should have been garbage-collected.
 
-### 4.4 wirescale-cni
+### 5.4 wirescale-cni
 
 A stateless binary invoked by the container runtime per-pod. The binary is
 short-lived -- it sets up the pod's network namespace and exits. All ongoing
@@ -496,7 +720,7 @@ mesh management is handled by the agent.
 
 ---
 
-## 5. Address Architecture and Hierarchical Prefix Aggregation
+## 6. Address Architecture and Hierarchical Prefix Aggregation
 
 ### Hierarchical Prefix Model
 
@@ -634,7 +858,7 @@ and installs a /64 route that overrides the aggregate for subsequent traffic.
 
 ---
 
-## 6. Data Plane: On-Demand WireGuard Peering
+## 7. Data Plane: On-Demand WireGuard Peering
 
 ### On-Demand Peer Lifecycle
 
@@ -817,7 +1041,7 @@ unicast and does not forward link-local multicast.
 #### When NDP Works Natively
 
 **Routable-prefix mode with unencrypted forwarding** (ROUTABLE-PREFIX.md
-Section 7, encryption policy = `default` or `cross-cluster-only`):
+Section 7, encryption profile = `encrypted-routable` or `trusted-site`):
 
 - Intra-cluster traffic traverses the physical L2 segment.
 - NDP operates on `eth0` against the rack /64 as usual.
@@ -828,8 +1052,8 @@ No Wirescale-specific handling is required in this mode.
 
 #### When NDP Needs Help
 
-**ULA overlay mode** (ARCHITECTURE.md Section 6) and **routable-prefix
-with `always` encryption** (ROUTABLE-PREFIX.md Section 8):
+**ULA overlay mode** (ARCHITECTURE.md Section 7) and **routable-prefix
+with `encrypted-routable` profile** (ROUTABLE-PREFIX.md Section 8):
 
 All inter-node pod traffic goes through `wg0`, which has no link-layer
 address resolution.  NDP solicitations sent into `wg0` have no
@@ -877,7 +1101,7 @@ General IPv6 multicast (`ff02::/16`, `ff05::/16`) does not traverse
 WireGuard.  Implications:
 
 - **mDNS / DNS-SD** (`ff02::fb`): MUST NOT be relied upon for
-  cross-node discovery.  Use Wirescale DNS (ARCHITECTURE.md Section 9).
+  cross-node discovery.  Use Wirescale DNS (ARCHITECTURE.md Section 10).
 - **MLD:** Unaffected in routable-prefix native mode.  In overlay mode,
   MLD is confined to the local node's bridge.
 - **Application multicast:** Workloads needing cross-node multicast
@@ -898,7 +1122,7 @@ The agent SHOULD log a warning when multicast traffic is destined for
 
 ---
 
-## 7. Cross-Cluster Connectivity
+## 8. Cross-Cluster Connectivity
 
 ### Signaling Gateway Model
 
@@ -987,7 +1211,7 @@ already cached). Total latency is reduced by ~10-20ms.
 
 ### Cross-Cluster Addressing
 
-- Hierarchical prefix aggregation (see [Section 5](#5-address-architecture-and-hierarchical-prefix-aggregation))
+- Hierarchical prefix aggregation (see [Section 6](#6-address-architecture-and-hierarchical-prefix-aggregation))
   makes cross-cluster routing efficient: one aggregate route per remote cluster.
 - In routable-prefix mode (see [ROUTABLE-PREFIX.md](ROUTABLE-PREFIX.md)),
   each cluster's prefix is routable via BGP, so packets reach the correct
@@ -1086,12 +1310,12 @@ the signaling gateway MAY act as a data relay:
 
 ---
 
-## 8. IPv4 in an IPv6-Only World
+## 9. IPv4 in an IPv6-Only World
 
 This is the core innovation: making IPv4 "just work" for pods on an
 IPv6-only underlay. Three mechanisms work together:
 
-### 8.1 CLAT (Customer-side Translator) -- Pod-Local IPv4
+### 9.1 CLAT (Customer-side Translator) -- Pod-Local IPv4
 
 Each pod gets a `clat0` TUN interface that provides a real IPv4 address.
 Applications can bind to IPv4, connect to IPv4 addresses, and use IPv4
@@ -1130,7 +1354,7 @@ The CLAT translation is stateless and deterministic. The reverse mapping
 works because of the 1:1 correspondence between IPv4 pod addresses and
 IPv6 pod addresses.
 
-### 8.2 NAT64 -- Reaching External IPv4 Destinations
+### 9.2 NAT64 -- Reaching External IPv4 Destinations
 
 For traffic destined to IPv4-only hosts on the internet, a per-node NAT64
 engine translates at the cluster edge.
@@ -1167,7 +1391,7 @@ See [EGRESS.md](EGRESS.md) for the full egress data path, including DNS
 snooping for FQDN-based filtering, the egress policy engine, and flow
 observability for NAT64 traffic.
 
-### 8.3 DNS64 -- Making It Transparent
+### 9.3 DNS64 -- Making It Transparent
 
 CoreDNS is configured with the `dns64` plugin:
 
@@ -1201,7 +1425,7 @@ When a pod queries `example.com` and only an A record exists:
 When an AAAA record exists, it is returned directly unless `translate_all` is
 explicitly enabled.
 
-### 8.4 Complete IPv4 Flow (Pod to External IPv4 Host)
+### 9.4 Complete IPv4 Flow (Pod to External IPv4 Host)
 
 ```
 Pod (100.64.1.5 / 3fff:1234:0001:0001::5)
@@ -1225,7 +1449,7 @@ Physical NIC -> Internet -> 93.184.216.34
 Return path reverses each step.
 ```
 
-### 8.5 IPv4 Within the Mesh
+### 9.5 IPv4 Within the Mesh
 
 Pod-to-pod IPv4 traffic stays within the WireGuard mesh and never hits
 NAT64. The routing is:
@@ -1251,7 +1475,7 @@ Pod A on node-1: app connects to 100.64.2.7 (Pod B's IPv4)
   App on Pod B sees: src=100.64.1.5 dst=100.64.2.7
 ```
 
-### 8.6 Cross-Cluster IPv4 Address Collisions
+### 9.6 Cross-Cluster IPv4 Address Collisions
 
 #### The Problem
 
@@ -1286,7 +1510,7 @@ Rationale:
    severely limits per-cluster pod capacity and introduces fragile
    coordination between the global directory and CLAT configuration.
 3. **IPv6 is the primary address family.**  Wirescale is an IPv6-native
-   architecture.  Cross-cluster connectivity (Section 7) operates on
+   architecture.  Cross-cluster connectivity (Section 8) operates on
    hierarchical IPv6 prefixes with route aggregation; IPv4 is a
    compatibility layer for legacy applications, not a routable fabric.
 
@@ -1307,7 +1531,7 @@ for remote clusters.  Specifically:
 
 Applications that require cross-cluster communication MUST use IPv6
 addresses or DNS names that resolve to IPv6 (AAAA records).  The
-cross-cluster DNS system (Section 9) returns AAAA records for remote
+cross-cluster DNS system (Section 10) returns AAAA records for remote
 pods; operators SHOULD NOT configure A record synthesis for cross-cluster
 names.
 
@@ -1328,7 +1552,7 @@ providing a clear upgrade path for cross-cluster IPv4 consumers.
 
 ---
 
-## 9. DNS Architecture
+## 10. DNS Architecture
 
 ### In-Mesh DNS (MagicDNS-inspired)
 
@@ -1392,7 +1616,7 @@ CoreDNS
 Pod receives AAAA (native or synthesized)
 ```
 
-### 9.1 StatefulSet Stable Network Identities
+### 10.1 StatefulSet Stable Network Identities
 
 #### The Challenge
 
@@ -1431,7 +1655,7 @@ web-0.web.default.ws.cluster.internal -> AAAA 3fff:1234:0001:0007::1
 
 The wirescale-agent MUST update its in-memory name-to-IP map within 5
 seconds of receiving a pod relocation event from wirescale-control.
-CoreDNS cache TTL (default 30s, per Section 8.3) bounds how quickly
+CoreDNS cache TTL (default 30s, per Section 9.3) bounds how quickly
 downstream clients observe the change.
 
 #### Stable IPs Are a Non-Goal
@@ -1440,7 +1664,7 @@ Wirescale does NOT provide node-independent stable IPs for StatefulSet
 pods.  A reserved /128 pool would require:
 
 - Addresses outside the /64-per-host model, breaking hierarchical
-  prefix aggregation (Section 5).
+  prefix aggregation (Section 6).
 - Per-pod /128 routes on every node, regressing routing state from
   O(hosts) to O(statefulset_pods).
 - Scheduler-to-allocator coordination to ensure the /128 is routable
@@ -1479,7 +1703,7 @@ architecture for DNS parsing and IP-to-FQDN mapping.
 
 ---
 
-## 10. Cross-Cluster Service Discovery and Load Balancing
+## 11. Cross-Cluster Service Discovery and Load Balancing
 
 Sections 7 and 9 describe how individual pods in one cluster can reach
 individual pods in another via on-demand WireGuard peering and cross-cluster
@@ -1491,7 +1715,7 @@ This section designs the Wirescale replacement: on-demand, hierarchical
 cross-cluster service discovery and load balancing that maintains O(active_services)
 state per node, not O(all_services_all_clusters).
 
-### 10.1 Cross-Cluster Service Model
+### 11.1 Cross-Cluster Service Model
 
 A pod in cluster-1 discovers and reaches a Service in cluster-2 through the
 following conceptual flow:
@@ -1508,13 +1732,13 @@ following conceptual flow:
 5. **Connect:** The resolved backend endpoints are programmed into the local
    cluster's load-balancing datapath. WireGuard peers to the remote backend
    nodes are established on demand (the existing cross-cluster peering flow
-   from Section 7).
+   from Section 8).
 
 A node in cluster-1 MUST NOT learn about services in cluster-2 unless a
 `WirescaleServiceImport` in cluster-1 explicitly references them. There is no
 background synchronization of service catalogs.
 
-### 10.2 WirescaleServiceExport / WirescaleServiceImport CRDs
+### 11.2 WirescaleServiceExport / WirescaleServiceImport CRDs
 
 The CRD design follows the KEP-1645 Multi-Cluster Services API pattern but
 adapts it for the three-tier hierarchy.
@@ -1558,7 +1782,7 @@ spec:
   ports:
     - { name: grpc, port: 9090, protocol: TCP }
   vip:
-    mode: allocate                        # "allocate" | "global" (see Section 10.4)
+    mode: allocate                        # "allocate" | "global" (see Section 11.4)
   healthCheck:
     intervalSeconds: 10
     timeoutSeconds: 3
@@ -1570,7 +1794,7 @@ status:
     - { clusterID: "cluster-2", ready: 3, notReady: 0, lastResolved: "2026-03-10T08:00:15Z" }
 ```
 
-### 10.3 Resolution via the Control Hierarchy
+### 11.3 Resolution via the Control Hierarchy
 
 Service resolution follows the same three-tier, on-demand pattern as
 cross-cluster peer resolution. The directory gains a lightweight service
@@ -1609,7 +1833,7 @@ First packet hits VIP with no backends programmed (cold path):
   7. Agent programs endpoints into local LB datapath
        (eBPF map or IPVS, depending on datapath mode)
   8. Agent triggers on-demand WireGuard peer setup for the
-       selected backend node (standard Section 7 flow)
+       selected backend node (standard Section 8 flow)
   9. Queued packets drain to the selected backend
 ```
 
@@ -1624,7 +1848,7 @@ the remote controller is unreachable, the agent MUST continue using the
 last-known endpoint list until `staleEndpointTimeout` (default 120s),
 then mark the service as degraded.
 
-### 10.4 Cross-Cluster Service VIPs
+### 11.4 Cross-Cluster Service VIPs
 
 Three VIP strategies are supported, selectable per `WirescaleServiceImport`:
 
@@ -1660,7 +1884,7 @@ Cluster-3 imports the same service:
   Backends:      (same remote endpoints, different local VIP)
 ```
 
-### 10.5 Load Balancing
+### 11.5 Load Balancing
 
 Traffic distribution across backends in multiple clusters uses a two-level
 scheme: **inter-cluster** (which cluster receives traffic) and
@@ -1693,7 +1917,7 @@ provides this property.
 exporting cluster's controller. Controllers SHOULD set lower weights for
 endpoints in zones with high latency relative to the importing cluster.
 
-### 10.6 DNS Integration
+### 11.6 DNS Integration
 
 Cross-cluster services appear in DNS through two complementary mechanisms.
 
@@ -1709,7 +1933,7 @@ api-server-cluster2.backend.svc.cluster.local  ->  3fff:1234:0001:ffff::a02
 **Mechanism 2: Wirescale mesh DNS (global names)**
 
 For federation-wide names consistent across clusters, the wirescale-agent DNS
-sidecar (from Section 9) resolves names under a dedicated zone:
+sidecar (from Section 10) resolves names under a dedicated zone:
 
 ```
 <service>.<namespace>.svc.ws.<cluster-name>.internal   -> remote service VIP
@@ -1745,7 +1969,7 @@ wirescale-agent DNS:
 Pod connects to VIP -> LB selects backend -> WireGuard tunnel to remote node
 ```
 
-### 10.7 Health Checking
+### 11.7 Health Checking
 
 Backend health is tracked across clusters without requiring direct probe
 connectivity from every importing node to every remote backend.
@@ -1787,7 +2011,7 @@ connections (rather than black-holing traffic). If `failover` topology mode
 is configured, the agent MUST attempt resolution from the next-priority
 cluster before declaring the service down.
 
-### 10.8 Interaction with Cilium
+### 11.8 Interaction with Cilium
 
 When Cilium is the intra-cluster CNI, cross-cluster services integrate
 with Cilium's service handling via standard Kubernetes primitives.
@@ -1858,7 +2082,7 @@ agent programs cross-cluster service backends directly into eBPF LB maps
 or IPVS. The same `WirescaleServiceImport` CRD drives both modes; only
 the datapath backend differs.
 
-### 10.9 Comparison with Alternatives
+### 11.9 Comparison with Alternatives
 
 | Property | Wirescale Cross-Cluster Services | Cilium ClusterMesh Services | KEP-1645 MCS API |
 |----------|----------------------------------|---------------------------|-------------------|
@@ -1874,7 +2098,7 @@ the datapath backend differs.
 
 ---
 
-## 11. Host-Network Pods
+## 12. Host-Network Pods
 
 Pods running with `hostNetwork: true` bypass the CNI entirely -- no veth
 pair, no per-pod eBPF attachment point, no CLAT translation layer. This
@@ -1948,8 +2172,9 @@ attachment point.
   `CiliumClusterwideNetworkPolicy` for host-level traffic. Wirescale
   SHOULD defer host-network pod L3/L4 policy to Cilium's host firewall
   when detected. The agent MUST NOT install conflicting TC programs on `eth0`.
-- Wirescale MUST still enforce WireGuard encryption: inter-node traffic
-  from host-network pods MUST traverse `wg0` regardless of whether
+- In profiles that require inter-node encryption (`encrypted-overlay`,
+  `encrypted-routable`), Wirescale MUST still enforce WireGuard: inter-node
+  traffic from host-network pods MUST traverse `wg0` regardless of whether
   Cilium handles L3/L4 filtering.
 
 ### Operator Guidance
@@ -1961,7 +2186,7 @@ attachment point.
 | L3/L4 policy | Per-pod eBPF maps | TC eBPF on eth0 or Cilium host firewall |
 | CLAT | Per-pod `100.64.x.x` | Not applicable |
 | WireGuard path | veth -> host route -> wg0 | host route -> wg0 (direct) |
-| Encryption | Always (inter-node) | Always (inter-node) |
+| Encryption | Per deployment profile (inter-node) | Per deployment profile (inter-node) |
 
 Operators SHOULD minimize the use of `hostNetwork: true` pods. Each
 host-network pod widens the node's attack surface because it shares the
@@ -1970,18 +2195,32 @@ with explicit `hostPort` mappings instead.
 
 ---
 
-## 12. Security Model
+## 13. Security Model
 
 ### Encryption
 
-- **Inter-node pod traffic:** WireGuard (ChaCha20-Poly1305, Curve25519, BLAKE2s)
-- **Intra-node pod traffic:** Unencrypted (kernel namespace isolation is sufficient)
-- **Agent-to-control:** gRPC over mTLS (kubelet certs or projected SA tokens)
+The encryption posture depends on the active deployment profile (see
+[Section 3](#3-deployment-profiles)). The following applies to all profiles:
+
+- **Intra-node pod traffic:** Plaintext (kernel namespace isolation is
+  sufficient) in all profiles.
+- **Agent-to-control:** gRPC over mTLS (kubelet certs or projected SA tokens).
 - **Control-to-control (cross-cluster):** Mutual TLS with CA certificates
-  validated by the global directory
-- **Control-to-directory:** gRPC over mTLS (cluster CA certificates)
+  validated by the global directory.
+- **Control-to-directory:** gRPC over mTLS (cluster CA certificates).
 - **Key material:** Private keys MUST never leave node memory. Public keys are
   registered with control and written to the node's own CRD.
+
+Profile-specific data-plane encryption:
+
+| Path | `encrypted-overlay` | `encrypted-routable` | `trusted-site` | `development` |
+|------|:---:|:---:|:---:|:---:|
+| Inter-node, same cluster | WireGuard | WireGuard | Plaintext | Plaintext |
+| Inter-node, cross-cluster same site | WireGuard | WireGuard | Plaintext | Plaintext |
+| Inter-node, cross-site | WireGuard | WireGuard | WireGuard | Plaintext |
+
+All profiles that use WireGuard employ ChaCha20-Poly1305 with Curve25519
+key exchange and BLAKE2s hashing.
 
 ### Identity and Authentication
 
@@ -2054,7 +2293,7 @@ spec:
 
 | Threat | Mitigation |
 |--------|------------|
-| Eavesdropping on inter-node traffic | WireGuard encryption (always on for inter-node traffic) |
+| Eavesdropping on inter-node traffic | WireGuard encryption (on for all inter-node traffic in `encrypted-overlay` and `encrypted-routable` profiles; cross-site only in `trusted-site`; see [Section 3](#3-deployment-profiles)) |
 | Unauthorized node joining mesh | Must authenticate to wirescale-control via mTLS; control validates against Kubernetes API |
 | Compromised node | Revoke by deleting WirescaleNode CRD; control rejects all peer requests for the revoked node; active peers on other nodes are torn down |
 | Control plane compromise | Attacker can disrupt peer discovery but cannot decrypt data plane traffic (no private keys in control). Existing peers persist. |
@@ -2066,7 +2305,7 @@ spec:
 
 ---
 
-## 13. Custom Resource Definitions
+## 14. Custom Resource Definitions
 
 ### WirescaleMesh (cluster-scoped, singleton)
 
@@ -2095,6 +2334,17 @@ spec:
   dnsDomain: "ws.cluster.internal"
   # MTU override (0 = auto-detect)
   mtu: 0
+  # Encryption deployment profile (see Section 3: Deployment Profiles)
+  # Valid values: "encrypted-overlay" (default) | "encrypted-routable" |
+  #               "trusted-site" | "development"
+  encryption:
+    profile: encrypted-overlay
+    # Site boundaries (required for trusted-site profile, ignored otherwise)
+    # sites:
+    #   - name: dc-east
+    #     clusters: ["cluster-1", "cluster-4"]
+    #   - name: dc-west
+    #     clusters: ["cluster-2"]
   # Control plane configuration
   controlPlane:
     # Address of wirescale-control gRPC service
@@ -2142,6 +2392,7 @@ status:
   allocatedv4Blocks: 12
   registeredClusters: 5      # known remote clusters
   gatewayNodes: 3
+  encryptionProfile: encrypted-overlay
 ```
 
 ### WirescaleNode (cluster-scoped, one per node)
@@ -2281,7 +2532,7 @@ status:
 
 ---
 
-## 14. Packet Flow Walkthrough
+## 15. Packet Flow Walkthrough
 
 ### Case 1: Pod-to-Pod, Same Node
 
@@ -2442,7 +2693,7 @@ Node-2: wg0 decrypt -> verify AllowedIPs -> route to Pod B
 
 ---
 
-## 15. Comparison with Existing Solutions
+## 16. Comparison with Existing Solutions
 
 | Feature | Wirescale | Tailscale K8s Operator | Cilium WireGuard | Calico WireGuard | Kilo |
 |---------|-----------|----------------------|------------------|------------------|------|
@@ -2484,7 +2735,7 @@ resolves individual nodes on demand.
 
 ---
 
-## 16. Implementation Phases
+## 17. Implementation Phases
 
 ### Phase 1: Control Plane and Core Mesh
 

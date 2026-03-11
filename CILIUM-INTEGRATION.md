@@ -82,7 +82,7 @@ and IPv4 compatibility for IPv6-only clusters.
 | **CLAT (per-pod IPv4 via TUN)** | Cilium has no CLAT support |
 | **Per-node stateless NAT64** | Cilium NAT46x64 is gateway-centric and stateful |
 | **DNS64 (CoreDNS plugin)** | Cilium does not provide DNS64 |
-| **Selective cross-site encryption** | Cilium WireGuard is all-or-nothing per cluster |
+| **Profile-based encryption** (`trusted-site`, `encrypted-routable`) | Cilium WireGuard is all-or-nothing per cluster |
 | **XDP ingress firewall for GUA pods** | Cilium host firewall is TC-based, not XDP |
 | **External peer mesh (non-k8s nodes)** | Cilium ClusterMesh is k8s-to-k8s only |
 
@@ -139,8 +139,8 @@ The cluster controller retains:
   pod identities
 - **External peer management** -- non-k8s nodes outside Cilium's scope
 - **NAT64/CLAT coordination** -- IPv4 compatibility layer
-- **Selective encryption decisions** -- which flows require cross-site
-  WireGuard
+- **Profile-based encryption decisions** -- which flows require WireGuard
+  per the active deployment profile
 
 ### Tier 3: Node Agent (`wirescale-agent`)
 
@@ -714,32 +714,36 @@ per-site sizes) and Wirescale handling cross-cluster WireGuard
 (on-demand, essential at fleet scale), each system operates in its
 optimal regime.
 
-### Selective Encryption
+### Profile-Based Encryption
 
-**Wirescale** supports four encryption modes:
-- `always` -- all inter-node traffic via WireGuard
-- `cross-site` -- same-site native, cross-site encrypted
-- `policy` -- per-flow encryption via policy
-- `never` -- no WireGuard
+**Wirescale** uses named deployment profiles to govern encryption scope
+(see [ARCHITECTURE.md Section 3](ARCHITECTURE.md#3-deployment-profiles)):
+- `encrypted-overlay` (default) -- all inter-node traffic via WireGuard
+- `encrypted-routable` -- GUA pods, all inter-node traffic via WireGuard
+- `trusted-site` -- intra-site plaintext, cross-site encrypted
+- `development` -- no WireGuard (dev/test only)
+
+Per-flow encryption overrides are available via `WirescalePolicy` resources
+with `encryption: required` on any profile.
 
 **Cilium** supports only:
 - All inter-node traffic encrypted (WireGuard enabled)
 - No encryption (WireGuard disabled)
 
-Cilium has no concept of site boundaries or selective encryption. In
+Cilium has no concept of site boundaries or profile-based encryption. In
 a multi-site deployment, this forces a choice:
 - Enable WireGuard: all traffic encrypted, including same-site
   (unnecessary ~20-40% throughput reduction for intra-site)
 - Disable WireGuard: no encryption anywhere, including cross-site
   (unacceptable for untrusted transit)
 
-**Resolution:** Disable Cilium WireGuard for intra-site traffic. Use
-wirescale-agent's cross-site WireGuard via signaling gateways for
-inter-site encryption:
+**Resolution:** Use the `trusted-site` deployment profile. Disable Cilium
+WireGuard for intra-site traffic. Wirescale-agent's cross-site WireGuard
+via signaling gateways handles inter-site encryption:
 
 ```
 Intra-site:  Cilium native routing, no encryption (line rate)
-Cross-site:  Wirescale on-demand WireGuard (site-to-site encryption)
+Cross-site:  Wirescale on-demand WireGuard (trusted-site profile)
 ```
 
 ### IPv4 Compatibility: CLAT + NAT64 + DNS64
@@ -1037,7 +1041,7 @@ compares per-node resource consumption as the deployment grows:
 | **Per-pod /128 routes** | wirescale-cni | Cilium CNI | Replaced |
 | **WireGuard (intra-cluster)** | wirescale-agent `wg0` (on-demand) | Cilium agent `cilium_wg0` (full-mesh) | Replaced |
 | **WireGuard (cross-cluster)** | wirescale-agent `wg0` (on-demand via control) | wirescale-agent `wg0` (on-demand via directory) | Updated (three-tier resolution) |
-| **Selective encryption** | wirescale-agent eBPF | Not available in Cilium | Wirescale still needed |
+| **Profile-based encryption** | wirescale-agent eBPF | Not available in Cilium | Wirescale still needed |
 | **L3/L4 policy** | wirescale-agent TC eBPF | Cilium TC eBPF | Replaced |
 | **L7 policy** | Not available | Cilium + Envoy | Added |
 | **FQDN egress** | Not available | Cilium DNS proxy | Added |
@@ -1065,7 +1069,7 @@ Functions moved to Cilium:          8  (CNI, IPAM, intra-cluster WG, intra-clust
                                         observability, bandwidth)
 Functions retained by Wirescale:    8  (CLAT, NAT64, DNS64, XDP firewall,
                                         cross-cluster WG, external peers,
-                                        time-bounded access, selective encryption)
+                                        time-bounded access, profile-based encryption)
 Functions added by Cilium:          3  (L7 policy, FQDN egress, bandwidth mgmt)
 Functions updated for three-tier:   3  (cross-cluster identity, multi-cluster,
                                         global directory)
@@ -1089,7 +1093,7 @@ Functions lost:                     0  (time-bounded access adapted via controll
 
 ### When to Use Wirescale Standalone
 
-- You need **selective cross-site encryption** (line rate intra-site)
+- You need **profile-based encryption** (`trusted-site` for line rate intra-site)
 - You want **simpler operations** (one agent, one CNI, one policy CRD)
 - You don't need L7 policy
 - You want the **lowest possible overhead** (no Envoy, no Hubble)
@@ -1117,8 +1121,9 @@ Functions lost:                     0  (time-bounded access adapted via controll
   with 100K identities each, this is 10M entries per node -- untenable.
 - **WireGuard at scale:** 10K+ WireGuard peers per node consumes ~4+ MB
   of memory and significant CPU for keepalive processing.
-- **No selective encryption:** Cilium cannot encrypt cross-site traffic
-  while leaving intra-site traffic at line rate.
+- **No profile-based encryption:** Cilium cannot encrypt cross-site traffic
+  while leaving intra-site traffic at line rate (requires Wirescale's
+  `trusted-site` deployment profile).
 - **No IPv4 compatibility:** No CLAT, no per-node NAT64, no DNS64.
 - **No external peers:** ClusterMesh is k8s-to-k8s only.
 
@@ -1126,9 +1131,10 @@ Functions lost:                     0  (time-bounded access adapted via controll
 
 - Your cluster is **dual-stack** (IPv4 + IPv6) -- no need for CLAT/NAT64
 - All applications are IPv6-native -- no IPv4 compatibility needed
-- Single-site, single-cluster deployment -- no cross-site encryption
+- Single-site, single-cluster deployment -- no cross-site encryption needed
 - No external non-k8s peers
-- Cilium's all-or-nothing WireGuard encryption is acceptable
+- Cilium's all-or-nothing WireGuard encryption is acceptable (no need for
+  Wirescale deployment profiles)
 - Cluster size is below ~1K nodes
 - Cross-cluster needs are met by ClusterMesh at your scale
 
@@ -1141,7 +1147,7 @@ Functions lost:                     0  (time-bounded access adapted via controll
 | Fabric-managed BGP | Yes | Yes | Yes |
 | WireGuard encryption | Yes | Yes | Yes |
 | On-demand WireGuard peering | Yes | No (full-mesh) | Yes (cross-cluster) |
-| Selective encryption (cross-site) | Yes | No | Yes |
+| Profile-based encryption (e.g., `trusted-site`) | Yes | No | Yes |
 | CLAT (per-pod IPv4) | Yes | No | Yes |
 | Per-node NAT64 | Yes | Gateway only | Yes |
 | DNS64 | Yes | External only | Yes |
