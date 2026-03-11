@@ -46,7 +46,7 @@
 5. [Route Override: Direct Tunnels](#5-route-override-direct-tunnels)
 6. [Three-Tier Control Hierarchy](#6-three-tier-control-hierarchy)
 7. [WireGuard as Encryption-Only Layer](#7-wireguard-as-encryption-only-layer)
-8. [Selective Encryption for Cross-Cluster Traffic](#8-selective-encryption-for-cross-cluster-traffic)
+8. [Selective Encryption via Deployment Profiles](#8-selective-encryption-via-deployment-profiles)
 9. [IPv4 Compatibility](#9-ipv4-compatibility)
 10. [Cross-Cluster Connectivity and Signaling Gateway](#10-cross-cluster-connectivity-and-signaling-gateway)
 11. [Scaling Analysis](#11-scaling-analysis)
@@ -595,7 +595,7 @@ controller for environments without fabric BGP.
 | Pod address assignment within /64 | Wirescale CNI |
 | Per-pod /128 host routes | Wirescale CNI (local only, not in BGP) |
 | Cross-cluster aggregate routes | Global directory -> controller -> agent |
-| Encryption policy | Wirescale agent |
+| Encryption (per deployment profile) | Wirescale agent |
 | Pod network policy | Wirescale agent (eBPF) |
 
 ### Cross-Cluster Route Distribution
@@ -1087,14 +1087,16 @@ int wirescale_egress(struct __sk_buff *skb) {
 }
 ```
 
-The `encrypt_map` is populated by the agent based on policy:
+The `encrypt_map` is populated by the agent based on the active deployment
+profile and any per-flow policy overrides:
 
-| Destination Prefix | Encrypt? | Reason |
-|-------------------|----------|--------|
-| Same cluster prefix | No (default) | Trusted fabric |
-| Remote cluster prefix | Yes | Cross-cluster = untrusted transit |
-| External (::/0) | Policy-dependent | Application-layer encryption may suffice |
-| Specific pod CIDR | Yes | Policy override (sensitive workload) |
+| Destination Prefix | `encrypted-routable` | `trusted-site` | `development` |
+|-------------------|:---:|:---:|:---:|
+| Same cluster prefix | Encrypt | No | No |
+| Same site, other cluster | Encrypt | No | No |
+| Remote cluster (cross-site) | Encrypt | Encrypt | No |
+| External (::/0) | Policy-dependent | Policy-dependent | No |
+| Specific pod CIDR (policy override) | Encrypt | Encrypt | No |
 
 ### WireGuard Configuration (On-Demand Encryption Mode)
 
@@ -1126,9 +1128,32 @@ kernel routes the inner packet to the destination pod.
 
 ---
 
-## 8. Selective Encryption for Cross-Cluster Traffic
+## 8. Selective Encryption via Deployment Profiles
 
-### Encryption Policy
+Encryption in routable-prefix mode is governed by deployment profiles
+(see [ARCHITECTURE.md Section 3](ARCHITECTURE.md#3-deployment-profiles)).
+The profile determines which traffic paths are encrypted and which MAY
+traverse the fabric in plaintext. With routable prefixes, WireGuard acts
+as a **pure encryption layer** -- routing is native; WireGuard provides
+confidentiality only when required by the profile.
+
+### Profile Applicability to Routable-Prefix Mode
+
+| Profile | Intra-Cluster | Cross-Cluster (same site) | Cross-Site | Typical Use |
+|---------|:---:|:---:|:---:|-------------|
+| `encrypted-routable` | WireGuard | WireGuard | WireGuard | GUA pods with full encryption |
+| `trusted-site` | Plaintext | Plaintext | WireGuard | Trusted DC fabric, multi-site |
+| `encrypted-overlay` | WireGuard | WireGuard | WireGuard | ULA overlay (not native routing) |
+| `development` | Plaintext | Plaintext | Plaintext | Dev/test only |
+
+The `encrypted-overlay` profile is the base architecture's default and uses
+WireGuard for both routing and encryption. It is listed here for
+completeness but does not take advantage of native fabric routing.
+
+For routable-prefix deployments, `encrypted-routable` and `trusted-site`
+are the recommended profiles.
+
+### Configuration
 
 ```yaml
 apiVersion: wirescale.io/v1alpha1
@@ -1137,19 +1162,10 @@ metadata:
   name: default
 spec:
   encryption:
-    # Mode: "always" | "cross-cluster" | "cross-site" | "never" | "policy"
-    mode: cross-cluster
+    # Deployment profile (see ARCHITECTURE.md Section 3)
+    profile: trusted-site
 
-    # Cluster boundaries (inferred from cluster prefix allocation):
-    clusters:
-      - name: cluster-1
-        prefix: "3fff:1234:0001::/48"
-      - name: cluster-2
-        prefix: "3fff:1234:0002::/48"
-      - name: cluster-3
-        prefix: "3fff:1234:0003::/48"
-
-    # Site boundaries (for cross-site mode):
+    # Site boundaries (required for trusted-site profile):
     sites:
       - name: dc-east
         clusters: ["cluster-1", "cluster-4"]
@@ -1157,36 +1173,15 @@ spec:
         clusters: ["cluster-2"]
       - name: dc-south
         clusters: ["cluster-3"]
-
-    # Traffic within a cluster: unencrypted (native routing)
-    # Traffic between clusters: WireGuard encrypted (direct tunnel after resolution)
-    # Traffic between sites: WireGuard encrypted (always)
-
-    # When mode is "policy", encryption is per-WirescalePolicy:
-    # Each WirescalePolicy can set `encryption: required`
 ```
 
-### Mode Details
+### Per-Flow Encryption Override
 
-**`always`:** All inter-node pod traffic goes through WireGuard, even
-within the same cluster. Equivalent to the base overlay architecture.
-Maximum security, lower performance for intra-cluster traffic.
-
-**`cross-cluster`:** Intra-cluster traffic routes natively (line rate).
-Cross-cluster traffic is encrypted via WireGuard using direct tunnels
-established after signaling-plane resolution. This is the recommended
-default for multi-cluster deployments.
-
-**`cross-site`:** Same as `cross-cluster` but the trust boundary is the
-physical site, not the cluster. Clusters co-located at the same site
-communicate unencrypted; traffic between sites is encrypted. Useful when
-multiple clusters share a trusted fabric within a single datacenter.
-
-**`never`:** No WireGuard at all. Pure native routing everywhere. Suitable
-when the entire network is trusted (single rack, MACsec-protected fabric)
-or when encryption is handled at the application layer (mTLS).
-
-**`policy`:** Per-flow encryption decisions based on WirescalePolicy:
+Independent of the active profile, individual flows MAY be encrypted via
+`WirescalePolicy` resources with `encryption: required`. Per-flow
+overrides MUST NOT weaken the profile's security invariants -- they can
+only strengthen them (see
+[ARCHITECTURE.md Section 3.7](ARCHITECTURE.md#3-deployment-profiles)).
 
 ```yaml
 apiVersion: wirescale.io/v1alpha1
@@ -1220,8 +1215,9 @@ spec:
 
 ### Cross-Cluster Encryption via Direct Tunnels
 
-The critical design choice: cross-cluster encryption uses **direct
-WireGuard tunnels between communicating hosts**, not gateway relay.
+In all profiles except `development`, cross-cluster traffic (when it
+crosses a site boundary) is encrypted via **direct WireGuard tunnels
+between communicating hosts**, not gateway relay.
 
 ```
 WRONG (gateway as data relay):
@@ -1240,15 +1236,14 @@ This means:
 - Each direct tunnel is point-to-point, encrypted end-to-end
 - Gateway failure does not disrupt established tunnels (only new resolution)
 
-### Performance Impact by Mode
+### Performance Impact by Profile
 
-| Mode | Intra-Cluster Throughput | Cross-Cluster Throughput | CPU Overhead |
-|------|-------------------------|--------------------------|-------------|
-| `never` | Line rate | Line rate (if direct path) | Minimal |
-| `cross-cluster` | Line rate | WireGuard (~10G/core, direct tunnel) | Cross-cluster only |
-| `cross-site` | Line rate (same site) | WireGuard (~10G/core, direct tunnel) | Cross-site only |
-| `policy` | Line rate (unless policy says encrypt) | Varies | Per-flow |
-| `always` | WireGuard limited | WireGuard limited | Every inter-node packet |
+| Profile | Intra-Cluster Throughput | Cross-Cluster Throughput | CPU Overhead |
+|---------|-------------------------|--------------------------|-------------|
+| `development` | Line rate | Line rate (if direct path) | Minimal |
+| `trusted-site` | Line rate (same site) | WireGuard (~10G/core, direct tunnel) | Cross-site only |
+| `encrypted-routable` | Line rate (eBPF redirect to wg0) | WireGuard (~10G/core, direct tunnel) | All inter-node |
+| `encrypted-overlay` | WireGuard limited | WireGuard limited | All inter-node |
 
 ---
 
@@ -1955,14 +1950,18 @@ The rate limiter runs in XDP using a BPF `LRU_HASH` map keyed by source
 
 ### Cross-Cluster Security Boundaries
 
-The hierarchical model introduces additional security boundaries:
+The hierarchical model introduces additional security boundaries. The
+encryption posture at each boundary depends on the active deployment
+profile (see [ARCHITECTURE.md Section 3](ARCHITECTURE.md#3-deployment-profiles)).
 
-1. **Intra-cluster:** Standard pod policy (eBPF on veths). No encryption
-   required by default (trusted fabric).
+1. **Intra-cluster:** Standard pod policy (eBPF on veths). In the
+   `trusted-site` and `development` profiles, intra-cluster traffic is
+   plaintext (trusted fabric). In `encrypted-routable`, intra-cluster
+   traffic is encrypted via WireGuard.
 
 2. **Cross-cluster, same organization:** Authenticated via control
-   federation (mutual TLS). Encrypted via direct WireGuard tunnels.
-   Policy enforced at both endpoints.
+   federation (mutual TLS). Encrypted via direct WireGuard tunnels in all
+   profiles except `development`. Policy enforced at both endpoints.
 
 3. **Cross-cluster, different organizations:** NOT supported without
    explicit federation configuration. The global directory MUST NOT
@@ -1984,7 +1983,7 @@ packet crossing from Cluster 1 to Cluster 2 passes through:
 ```
 Best for: Single-site production, 1K-10K hosts
 Routing: Fabric-managed BGP (eBGP host-to-ToR)
-Encryption: never or cross-site
+Profile: encrypted-routable (recommended) or development
 State per node: O(hosts) -- all /64s in the cluster
 Wirescale's role: IPAM, pod addressing, encryption, policy
 
@@ -1997,7 +1996,7 @@ No global directory needed for single-cluster deployments.
 ```
 Best for: Multiple teams or environments sharing a datacenter
 Routing: Fabric BGP within each cluster + aggregate routes between clusters
-Encryption: cross-cluster (different trust domains on shared fabric)
+Profile: encrypted-routable (different trust domains on shared fabric)
 State per node: O(local_hosts + clusters)
 Control: controller per cluster + global directory
 
@@ -2015,7 +2014,7 @@ Example:
 ```
 Best for: Geo-distributed production, 10K-100K+ hosts
 Routing: Fabric BGP per site, /48 per cluster on WAN
-Encryption: cross-cluster with direct tunnels after resolution
+Profile: trusted-site (line-rate intra-site, encrypted cross-site)
 Control: controller per cluster + global directory (replicated multi-region)
 State per node: O(local_hosts + clusters)
 
@@ -2035,7 +2034,8 @@ Example (3 sites, 10 clusters, 100K total hosts):
 Best for: Cloud-native deployments
 Routing: Cloud provider fabric (ENI prefix delegation on AWS,
          /96 from subnet on GCP, or custom routes via cloud API)
-Encryption: always or cross-VPC (cloud fabric may not be trusted)
+Profile: encrypted-routable (cloud fabric may not be trusted)
+         or trusted-site (if VPCs are within a single trusted region)
 IPv4: Dual-stack via cloud provider + NAT64 for gaps
 MTU: 1500 (common cloud default) or up to 9001 on AWS ENA
 
@@ -2049,7 +2049,8 @@ Note: Not all clouds support /64-per-host. AWS gives /80 per ENI.
 ```
 Best for: Development, testing, small deployments
 Routing: All hosts on one L2 segment, static routes or single ToR
-Encryption: never or always (depending on trust model)
+Profile: development (lab/test) or encrypted-routable (if trust model
+         requires encryption even on a single rack)
 IPv4: NAT64 or dual-stack
 MTU: 9000
 
@@ -2061,7 +2062,8 @@ Simplest deployment -- all pods reachable via L2 or single router hop.
 ```
 Best for: Large-scale production, planet-scale
 Routing: Fabric BGP per cluster, /48 per cluster on WAN backbone
-Encryption: cross-cluster with direct tunnels (signaling gateway model)
+Profile: trusted-site (line-rate intra-site, encrypted cross-site
+         via direct tunnels after signaling resolution)
 Control: controller per cluster + global directory (multi-region HA)
 State per node: O(local_hosts + clusters)
 
