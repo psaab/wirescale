@@ -661,8 +661,97 @@ they are actually handling.
   pointer. No packet ever sees a half-updated rule set.
 - **Graceful degradation:** If `wirescale-control` is unreachable, agents
   continue enforcing the last-known policy. Existing WireGuard sessions
-  and cached identities remain valid. Only new peer establishment and
-  new identity resolution are delayed until control recovers.
+  and cached connectivity hints remain valid. Only new peer establishment
+  and new identity resolution are delayed until control recovers.
+  Authorization state (access grants, revocation status) MUST NOT be
+  extended beyond its signed TTL -- see [Cached State
+  Classification](#cached-state-classification) below.
+
+### Cached State Classification
+
+Agents cache two fundamentally different classes of state. Conflating
+them creates a tension: stale routing data is harmless (self-heals on
+reconnect), but stale authorization data undermines revocation semantics.
+The classes MUST be treated differently during normal operation, control
+outages, and startup recovery.
+
+#### Class 1 -- Connectivity Hints (Safe to Cache / Restore)
+
+| Data | Source | Staleness Risk |
+|------|--------|----------------|
+| Peer endpoints (IP:port) | `wirescale-control` peer broker | Stale endpoint causes failed handshake; self-heals on reconnect |
+| WireGuard public keys | `wirescale-control` peer broker | Stale key causes failed handshake; self-heals on rekey |
+| Allowed CIDRs / routes | `wirescale-control` IPAM | Stale route causes misdelivery; self-heals on refresh |
+| Cluster topology (gateway endpoints, prefix allocations) | Global directory | Stale topology causes cross-cluster routing failure; self-heals on directory reconnect |
+| Identity-to-IP mappings (identity cache) | `wirescale-control` identity service | Stale mapping may delay policy enforcement; self-heals on TTL refresh |
+
+**Behavior during control outage:**
+
+- Agents MUST continue using cached connectivity hints.
+- Agents MUST NOT remove connectivity hint entries when control is
+  unreachable.
+- Agents SHOULD extend the TTL on connectivity hint entries during a
+  control outage to prevent unnecessary eviction.
+- On control reconnect, agents MUST refresh all stale connectivity hints
+  within `stale_refresh_window` (default: 30 seconds).
+
+**Startup restore behavior:**
+
+- Agents SHOULD restore connectivity hints from the persisted peer cache
+  on disk (`/var/lib/wirescale/peer-cache.json`).
+- Restored entries MUST be marked stale immediately.
+- Agents MUST refresh all restored connectivity hints within
+  `stale_refresh_window` (default: 30 seconds) after establishing a
+  control-plane connection.
+- If a restored entry is older than `max_stale_age` (default:
+  10 minutes), the agent MUST discard it.
+
+#### Class 2 -- Authorization State (NOT Safe to Cache Beyond Signed TTL)
+
+| Data | Source | Staleness Risk |
+|------|--------|----------------|
+| `WirescaleAccessGrant` validity | `wirescale-control` grant reconciler | Stale grant extends access beyond intended window; **violates revocation** |
+| Revocation status (node or cluster) | `wirescale-control` / global directory | Stale revocation status allows a revoked principal to maintain access; **security violation** |
+| Policy generation numbers | `wirescale-control` policy compiler | Stale generation allows outdated allow/deny rules; **policy bypass** |
+| Signed peer authorization tokens | `wirescale-control` peer broker | Stale token extends peering authorization beyond intended scope; **trust violation** |
+
+**Behavior during control outage:**
+
+- Agents MUST honor the signed TTL embedded in each authorization datum.
+- When an authorization entry's TTL expires, the agent MUST treat the
+  entry as invalid and **fail closed** -- deny the corresponding access.
+- Agents MUST NOT extend the TTL on authorization state during a control
+  outage. This is the critical difference from connectivity hints.
+- `WirescaleAccessGrant` rules MUST be removed from BPF policy maps
+  when their `expiresAt` timestamp passes, regardless of control-plane
+  availability.
+- If a node's revocation status cannot be confirmed because control is
+  unreachable, the agent MUST continue to serve existing WireGuard
+  sessions (the sessions are independently authenticated by WireGuard
+  rekey) but MUST NOT establish new peers whose authorization has
+  expired.
+
+**Startup restore behavior:**
+
+- Agents MUST NOT restore authorization state from disk.
+- On startup, the agent MUST obtain fresh authorization state from
+  `wirescale-control` before granting access based on access grants,
+  peer authorization tokens, or revocation status.
+- If the agent cannot reach `wirescale-control` at startup, it MUST
+  operate in a degraded mode where only connectivity hints (Class 1) are
+  used for existing peer sessions and all authorization-gated operations
+  (new access grants, new peer authorizations) are denied until control
+  is reachable.
+
+#### Summary Matrix
+
+| Property | Connectivity Hints | Authorization State |
+|----------|-------------------|---------------------|
+| Safe to cache beyond TTL during outage | YES (extend TTL) | **NO** (fail closed on expiry) |
+| Restore from disk on startup | YES (mark stale, refresh within 30 s) | **NO** (require fresh validation) |
+| Self-heals on reconnect | YES | N/A (must be re-issued) |
+| Staleness worst case | Failed handshake or misroute | **Unauthorized access or missed revocation** |
+| Normative requirement | SHOULD preserve | MUST NOT extend |
 
 ---
 
@@ -823,10 +912,7 @@ spec:
 
 > **See [EGRESS.md](EGRESS.md) sections 6--7** for the complete egress policy
 > engine, including FQDN allowlists, DNS snooping for IP resolution, SNI
-> filtering, and URL filtering. When Cilium is the CNI, internet egress
-> policy MUST use `CiliumNetworkPolicy` instead of `WirescaleEgressPolicy`
-> -- see [CILIUM-INTEGRATION.md §3](CILIUM-INTEGRATION.md#ownership-boundary-egress-fqdn-policy-and-observability)
-> for the ownership boundary.
+> filtering, and URL filtering.
 
 #### Default Deny with Explicit Allow
 
@@ -923,6 +1009,17 @@ status:
 4. Automatically revokes the rule at expiry (no human action needed)
 5. Updates the status to `expired`
 
+**Authorization state semantics:** `WirescaleAccessGrant` rules are
+classified as **authorization state** (see [Cached State
+Classification](#cached-state-classification)). The compiled BPF rules
+derived from an access grant carry the grant's `expiresAt` timestamp.
+Agents MUST remove these rules from the policy map when the timestamp
+passes, regardless of whether `wirescale-control` is reachable.
+Agents MUST NOT restore expired or unexpired access grant rules from
+disk on startup -- fresh validation from control is REQUIRED.
+This ensures that a revoked or expired grant cannot be resurrected by
+an agent restart or a control-plane outage.
+
 ---
 
 ## 7. Enforcement Engine
@@ -931,10 +1028,13 @@ status:
 
 The enforcement engine uses several BPF maps per node. Maps 1, 2, 3,
 and 6 incorporate cache semantics for the pull-based identity and peer
-model:
+model. Each map's entries are classified as either **connectivity hints**
+or **authorization state** per the [Cached State
+Classification](#cached-state-classification) -- this determines TTL
+extension behavior during control outages and disk restore eligibility.
 
 ```
-Map 1: identity_cache (LPM trie, per-node)
+Map 1: identity_cache (LPM trie, per-node)  [CONNECTIVITY HINT]
   Key:   IP prefix (e.g., fd00:1234:0003:0001::7/128)
   Value: {
     identity_id: u32,      // index into identity table
@@ -944,8 +1044,10 @@ Map 1: identity_cache (LPM trie, per-node)
   On cache miss: packet queued, agent queries wirescale-control,
                  inserts result with TTL
   On TTL expiry: entry becomes stale, refresh triggered on next access
+  Outage: TTL MAY be extended; entry SHOULD be preserved.
+  Startup: MAY be restored from disk (marked stale, refreshed within 30s).
 
-Map 2: identity_table (array, per-node)
+Map 2: identity_table (array, per-node)  [CONNECTIVITY HINT]
   Key:   identity_id (u32)
   Value: {
     cluster_id: u16,
@@ -957,8 +1059,10 @@ Map 2: identity_table (array, per-node)
   }
   Entries are cached from wirescale-control, not globally distributed.
   Populated on demand as identity_cache entries are resolved.
+  Outage: preserve existing entries.
+  Startup: MAY be restored from disk alongside identity_cache.
 
-Map 3: policy_map (hash, per-node)
+Map 3: policy_map (hash, per-node)  [MIXED -- see note]
   Key:   {
     src_identity: u32,
     dst_identity: u32,
@@ -970,10 +1074,16 @@ Map 3: policy_map (hash, per-node)
     action: u8,            // ALLOW=1, DROP=0, LOG=2
     flags: u8,             // audit, rate-limit
     policy_id: u16,        // for audit trail
-    generation: u32        // policy generation counter
+    generation: u32,       // policy generation counter
+    grant_expiry: u64      // 0 for static policy; ktime_ns for access grants
   }
   Only contains rules for LOCAL pods (received from control).
   On-demand rules for remote identities cached with TTL.
+  NOTE: Static policy rules (WirescalePolicy, NetworkPolicy) are
+  connectivity hints -- safe to preserve during outage. Rules derived
+  from WirescaleAccessGrant carry a non-zero grant_expiry and are
+  AUTHORIZATION STATE -- they MUST be removed on expiry even if
+  control is unreachable, and MUST NOT be restored from disk.
 
 Map 4: policy_map_shadow (same structure as policy_map)
   Used for atomic swap during policy updates.
@@ -982,7 +1092,7 @@ Map 5: active_map_selector (array, 1 entry)
   Key:   0
   Value: 0 or 1 (which policy_map is active)
 
-Map 6: peer_cache (hash, per-node)
+Map 6: peer_cache (hash, per-node)  [CONNECTIVITY HINT]
   Key:   destination /64 prefix
   Value: {
     wg_peer_index: u32,    // WireGuard peer index
@@ -991,6 +1101,8 @@ Map 6: peer_cache (hash, per-node)
   }
   Used to track active WireGuard peers for GC.
   Idle peers (no traffic beyond TTL) are candidates for removal.
+  Outage: TTL MAY be extended; entry SHOULD be preserved.
+  Startup: MAY be restored from disk (marked stale, refreshed within 30s).
 
 Map 7: connection_log (ringbuf, per-node)
   Used for async audit event delivery to userspace.
@@ -1025,8 +1137,11 @@ int wirescale_policy(struct __sk_buff *skb) {
         return TC_ACT_SHOT;  // Unknown source = drop
     }
 
-    // 3a. Check TTL -- stale entries still used (fail-open for
-    //     existing identities), agent refreshes asynchronously
+    // 3a. Check TTL -- connectivity-hint entries (identity-to-IP
+    //     mappings) are still used when stale (fail-open for routing),
+    //     and the agent refreshes asynchronously.
+    //     Authorization-gated entries (access grants, peer auth tokens)
+    //     MUST fail closed on TTL expiry -- see policy check in step 5.
     if (src_entry->ttl_expiry < bpf_ktime_get_ns())
         emit_ttl_refresh_event(skb, src_ip);
 
@@ -1605,10 +1720,7 @@ External peers (non-Kubernetes nodes) authenticate via:
 
 > **See [EGRESS.md](EGRESS.md) section 9** for egress-specific flow
 > observability, including per-connection FQDN-attributed logging and
-> outbound threat detection alerts. When Cilium is the CNI, Hubble owns
-> intra-cluster flow observability; Wirescale exports cross-cluster and
-> egress flows in Hubble-compatible format for a unified view.
-> See [CILIUM-INTEGRATION.md §3](CILIUM-INTEGRATION.md#ownership-boundary-egress-fqdn-policy-and-observability).
+> outbound threat detection alerts.
 
 ### Connection Logging
 
@@ -1743,6 +1855,12 @@ wirescale_peer_cache_size{node="worker-3"} 15
 wirescale_peer_cache_gc_total{node="worker-3"} 3
 wirescale_peer_establishment_latency_seconds{quantile="0.99"} 0.012
 
+# Authorization State (fail-closed tracking)
+wirescale_authz_expired_during_outage_total{node="worker-3"} 0
+wirescale_authz_grant_rules_active{node="worker-3"} 2
+wirescale_authz_grant_rules_expired_total{node="worker-3"} 5
+wirescale_authz_disk_restore_filtered_total{node="worker-3"} 0
+
 # Control-Plane gRPC
 wirescale_control_grpc_requests_total{method="GetIdentity"} 4523
 wirescale_control_grpc_requests_total{method="GetPeerInfo"} 187
@@ -1793,8 +1911,7 @@ wirescale_directory_ca_verifications_total{} 890
 
 The audit logs can be consumed by standard tools:
 
-- **Hubble** (Cilium's flow observability) -- Wirescale exports cross-cluster
-  and egress flows in Hubble-compatible protobuf format for unified visibility
+- **Hubble** (Cilium's flow observability) -- compatible log format
 - **Grafana** -- dashboards for policy decisions, throughput, peer health,
   cache hit rates, control-plane latency, cross-cluster flows
 - **Elasticsearch/Loki** -- searchable connection logs with identity attribution
@@ -1890,20 +2007,37 @@ If an attacker can cause control to serve wrong identity for an IP:
 If control becomes unavailable:
 
 - **Impact:** New peer establishment fails. New identity resolution fails.
-  Policy updates stop.
+  Policy updates stop. Authorization state cannot be refreshed.
 - **What continues working:**
   - Existing WireGuard sessions are unaffected (sessions are independent
     of control after handshake)
-  - Cached identities continue to resolve packets (stale entries used
-    beyond TTL during outage)
-  - Last-known policy continues to be enforced
+  - Cached connectivity hints (identity-to-IP mappings, peer endpoints,
+    routes) continue to resolve packets -- stale entries are extended
+    beyond TTL during outage
+  - Last-known static policy (WirescalePolicy, NetworkPolicy) continues
+    to be enforced
   - Intra-node pod communication is unaffected
+- **What fails closed:**
+  - `WirescaleAccessGrant` rules MUST be removed from BPF policy maps
+    when their `expiresAt` timestamp passes, even during a control outage.
+    Time-bounded access grants MUST NOT outlive their signed TTL.
+  - Peer authorization tokens MUST NOT be extended. New peer
+    establishment for peers whose authorization has expired is denied.
+  - Revocation status MUST be honored as last-known. If the last-known
+    status is "revoked," the agent MUST NOT re-admit the peer.
 - **Degradation behavior:**
-  - Agents MUST NOT remove cached entries when control is unreachable
-  - Agents SHOULD extend TTL on existing entries during control outage
+  - Agents MUST NOT remove cached connectivity hints when control is
+    unreachable
+  - Agents SHOULD extend TTL on connectivity hint entries during control
+    outage
+  - Agents MUST NOT extend TTL on authorization state entries during
+    control outage (see [Cached State
+    Classification](#cached-state-classification))
   - Agents MUST log control unavailability and expose it as a metric
   - New pods can still communicate with pods on the same node
   - New cross-node communication is delayed until control recovers
+  - Agents MUST expose `wirescale_authz_expired_during_outage_total` to
+    track authorization entries that expired while control was unavailable
 
 **T-DIRECTORY: Global directory compromise**
 
@@ -2235,6 +2369,9 @@ the three-tier control hierarchy.
 - [ ] Agent: background TTL refresh
 - [ ] Agent: targeted invalidation event handling
 - [ ] Agent: peer-on-demand establishment via control
+- [ ] Agent: cached state classification (connectivity hints vs authorization state)
+- [ ] Agent: fail-closed expiry for authorization state entries during control outage
+- [ ] Agent: disk restore filtering (restore connectivity hints only, discard authorization state)
 
 **Phase 3c: Pull-Based Policy Enforcement**
 - [ ] Control: policy compiler (NetworkPolicy -> BPF rules)
@@ -2257,6 +2394,8 @@ the three-tier control hierarchy.
 - [ ] WirescaleAccessGrant CRD
 - [ ] Approval workflow (status subresource)
 - [ ] Automatic expiry (control reconciliation loop)
+- [ ] Agent: grant_expiry field in policy_map; BPF-side expiry enforcement
+- [ ] Agent: MUST NOT restore access grant rules from disk on startup
 - [ ] CLI: `kubectl wirescale grant`
 
 **Phase 3f: Audit and Observability**

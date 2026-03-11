@@ -234,6 +234,8 @@ Metrics are exposed at two endpoints (see [SECURITY.md Section 12](SECURITY.md#1
 | HandshakeFailures | `handshake_failures_total` rate > 0 for 5 min | warning |
 | BPFMapNearFull | `identity_cache_size` / max > 80% or `policy_rules_total` / max > 80% | warning |
 | CertExpiringSoon | `certificate_expiry_seconds` < 7 days | warning |
+| AuthzExpiredDuringOutage | `wirescale_authz_expired_during_outage_total` rate > 0 for 5 min | warning |
+| AgentDegradedMode | `wirescale_agent_degraded_mode{reason="control_unreachable"}` == 1 for 2 min | critical |
 
 ### 3.4 Troubleshooting Runbook
 
@@ -287,9 +289,29 @@ cloud security groups allow bidirectional UDP on `listenPort`.
 | 3 | Check cross-cluster metrics and aggregate routes (`ip -6 route show \| grep 3fff:1234`) |
 | 4 | Check gateway node health and firewall rules |
 
-**Resolution:** If directory is unreachable, cached registrations remain
-valid for the heartbeat TTL (60 s). If gateways are unhealthy, verify
-labels and pods. If aggregate routes are missing, restart the agent.
+**Resolution:** If directory is unreachable, cached connectivity hint
+registrations remain valid (TTL extended). Cross-cluster authorization
+state follows fail-closed semantics on TTL expiry. If gateways are
+unhealthy, verify labels and pods. If aggregate routes are missing,
+restart the agent.
+
+#### Authorization Expiry During Control Outage
+
+`AuthzExpiredDuringOutage` or `AgentDegradedMode` alerts firing.
+
+| Step | Action |
+|------|--------|
+| 1 | Check control pod health: `kubectl -n wirescale-system get pods -l app=wirescale-control` |
+| 2 | Check `wirescale_authz_expired_during_outage_total` in agent metrics |
+| 3 | Check `wirescale_authz_grant_rules_active` -- if 0, all grants have expired |
+| 4 | Verify control is reachable: `grpcurl wirescale-control:9443 grpc.health.v1.Health/Check` |
+
+**Resolution:** This is expected behavior -- authorization state fails
+closed on TTL expiry to preserve revocation semantics. Restore control
+connectivity to reissue access grants. If access grants are critical
+during the outage, operators MUST restore control availability rather
+than attempt to extend grant lifetimes. The agent will automatically
+revalidate authorization state once control is reachable.
 
 ---
 
@@ -301,7 +323,18 @@ labels and pods. If aggregate routes are missing, restart the agent.
 |----------|---------|-------------|
 | **Critical** | Directory data (cluster registry, prefix allocations), CA private keys, CRD definitions | Federation-wide outage or security compromise |
 | **Derived** | Controller in-memory cache (pod/identity index, compiled policies) | ~30 s rebuild from Kubernetes API on restart |
-| **Ephemeral** | Agent peer cache, identity cache, BPF maps, WireGuard private keys | Peers re-established on demand within seconds |
+| **Ephemeral -- Connectivity Hints** | Peer endpoints, WireGuard public keys, allowed CIDRs, routes, identity-to-IP mappings, cluster topology | Peers re-established on demand within seconds. Safe to restore from disk. |
+| **Ephemeral -- Authorization State** | WirescaleAccessGrant validity, revocation status, peer authorization tokens, policy generation numbers | MUST NOT be restored from disk. Requires fresh control-plane validation. |
+| **Ephemeral -- Other** | WireGuard private keys, BPF map runtime state | Regenerated on agent startup; never persisted |
+
+> **Important:** The distinction between connectivity hints and
+> authorization state is critical for security. Connectivity hints are
+> safe to cache and restore because staleness only causes routing
+> failures that self-heal. Authorization state MUST fail closed on
+> expiry because staleness can extend access beyond intended bounds or
+> mask revocations. See [SECURITY.md: Cached State
+> Classification](SECURITY.md#cached-state-classification) for normative
+> requirements.
 
 ### 4.2 Backup Procedures
 
@@ -339,7 +372,17 @@ unless the API server itself is down.
 **Agent:** Kubernetes restarts the pod. The new agent generates a fresh
 keypair, registers with control, and repopulates caches on demand.
 Kernel-resident WireGuard sessions and BPF programs are unaffected
-during restart.
+during restart. On startup the agent restores **connectivity hints**
+(peer endpoints, public keys, routes, identity cache) from the
+persisted peer cache at `/var/lib/wirescale/peer-cache.json`, marks
+them stale, and refreshes them within 30 seconds. **Authorization
+state** (access grant rules, peer authorization tokens, revocation
+status) is NOT restored from disk -- the agent obtains fresh
+authorization state from `wirescale-control` before granting access
+to authorization-gated resources. If control is unreachable at startup,
+the agent operates in degraded mode: existing WireGuard sessions
+continue (authenticated by WireGuard rekey), but new
+authorization-gated operations are denied until control is reachable.
 
 ### 4.4 RPO/RTO Targets
 
@@ -347,7 +390,8 @@ during restart.
 |-----------|-----|-----|-------|
 | Directory (etcd) | <= 4 hours | <= 30 min | Snapshot restore + quorum |
 | Controller | 0 (stateless) | <= 2 min | Pod restart + cache rebuild |
-| Agent | 0 (ephemeral) | <= 30 s | Pod restart + key registration |
+| Agent (connectivity hints) | 0 (ephemeral) | <= 30 s | Pod restart + disk restore + stale refresh |
+| Agent (authorization state) | 0 (not persisted) | <= 30 s | Fresh validation from control required; fail closed until available |
 | CA keys | <= 24 hours | <= 1 hour | Encrypted backup restore |
 | CRDs (Velero) | <= 1 hour | <= 15 min | Velero restore |
 
@@ -356,12 +400,18 @@ during restart.
 Deploy directory etcd across an odd number of regions (3 or 5).
 
 **Quorum loss:** If quorum is lost, the directory rejects writes.
-Controllers fall back to cached data. Intra-cluster operations continue.
-Restore quorum by recovering members or `etcdctl member add`.
+Controllers fall back to cached connectivity hints (cluster topology,
+gateway endpoints, prefix allocations). Authorization state for
+cross-cluster operations (cluster revocation status, cross-cluster
+peer authorization tokens) MUST NOT be extended beyond its signed TTL.
+Intra-cluster operations continue. Restore quorum by recovering members
+or `etcdctl member add`.
 
 **Split-brain prevention:** etcd Raft ensures only the majority
 partition elects a leader. The minority partition returns errors.
-Controllers in the minority partition use cached directory data.
+Controllers in the minority partition use cached connectivity hints for
+directory data. Cross-cluster authorization state follows fail-closed
+semantics on TTL expiry.
 On partition heal, etcd reconciles automatically.
 
 **Recommended topology:**
@@ -387,6 +437,10 @@ A conformance suite MUST validate before any production release:
 - Cross-cluster connectivity: pods in `3fff:1234:0001::/48` reach pods in
   `3fff:1234:0002::/48` via on-demand WireGuard tunnels
 - Agent restart does not drop in-flight connections
+- Agent restart restores connectivity hints from disk and refreshes within 30 s
+- Agent restart does NOT restore authorization state from disk
+- WirescaleAccessGrant rules expire on schedule during control outage (fail closed)
+- Agent enters degraded mode when control is unreachable at startup
 - Controller failover within 10 s
 - 24-hour key rotation without handshake failures
 - NAT64/CLAT translation over IPv6-only underlay
@@ -414,9 +468,11 @@ rotation cycles.
 
 | Scenario | Expected Behavior |
 |----------|-------------------|
-| Agent-to-controller network partition | Existing peers/policies persist. New establishment fails gracefully. Auto-recovery on heal. |
+| Agent-to-controller network partition | Connectivity hints preserved (TTL extended). Authorization state fails closed on TTL expiry. New establishment denied. Auto-recovery on heal. |
 | Controller pod kill | Leader re-election < 5 s. Agents fail over. No data-plane impact. |
 | Node failure | Peers time out at WireGuard rekey (~2 min). Remote agents GC stale peers. No cascade. |
 | Certificate expiry | Handshake failures detected. Alert fires. Manual or auto-rotation restores connectivity. |
-| Directory quorum loss | Intra-cluster unaffected. Cross-cluster new peers blocked. Cached peers continue. |
+| Directory quorum loss | Intra-cluster unaffected. Cross-cluster new peers blocked. Cached connectivity hints continue. |
 | BPF map exhaustion | New lookups fail. Agent logs map-full. Alert fires. Increase map size and redeploy. |
+| Access grant expiry during control outage | Grant rules removed from BPF policy map at `expiresAt`. Access denied. `wirescale_authz_expired_during_outage_total` increments. Access restored only after control reconnect and fresh grant issuance. |
+| Agent restart with stale peer cache | Connectivity hints restored, marked stale, refreshed within 30 s. Authorization state NOT restored from disk. Agent enters degraded mode if control is unreachable. |

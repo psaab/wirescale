@@ -643,7 +643,9 @@ connection by a random interval drawn from `[0, startup_jitter_max]`
 (default: 5s for <= 1K nodes, 15s for <= 10K nodes; configurable via
 the `WirescaleAgent` CRD). During the jitter window the agent MUST
 still configure `wg0` and install routes from any persisted peer cache
-(see Pre-Warming below). Only the control-plane connection is deferred.
+(see Pre-Warming below) -- only connectivity hints are restored;
+authorization state is NOT loaded from disk. Only the control-plane
+connection is deferred.
 
 **Exponential backoff on cache misses.** When the agent's cache is cold,
 the first packets to many destinations trigger simultaneous cache misses.
@@ -661,7 +663,11 @@ The agent MUST rate-limit outbound queries to wirescale-control:
 circuit breaker:
 
 - While open, the agent MUST NOT send new queries. It MUST serve traffic
-  using whatever cached state exists (stale entries with extended TTL).
+  using whatever cached connectivity hints exist (stale entries with
+  extended TTL). Authorization state (access grants, peer authorization
+  tokens) MUST NOT have its TTL extended -- entries MUST fail closed on
+  expiry even while the circuit breaker is open. See
+  [SECURITY.md: Cached State Classification](SECURITY.md#cached-state-classification).
 - The agent MUST attempt a single probe query every 5 seconds.
 - After 3 consecutive successful probes, the circuit breaker closes and
   normal querying resumes.
@@ -686,24 +692,69 @@ triggers the agent's exponential backoff.
 #### Pre-Warming: Persisted Peer Cache
 
 To minimize cold-start latency, the agent SHOULD persist a snapshot of
-its peer and identity cache to local disk:
+its connectivity hint cache to local disk. **Only connectivity hints are
+eligible for disk persistence and startup restore.** Authorization state
+(access grant rules, peer authorization tokens, revocation status) MUST
+NOT be persisted or restored from disk -- see
+[SECURITY.md: Cached State Classification](SECURITY.md#cached-state-classification)
+for the full rationale and normative requirements.
 
 - **Snapshot frequency:** Every 60 seconds and on graceful shutdown.
-- **Snapshot contents:** WireGuard peer public keys, endpoints, allowed
-  CIDRs, and identity cache entries with remaining TTLs.
+- **Snapshot contents (connectivity hints only):**
+  - WireGuard peer public keys and endpoints
+  - Allowed CIDRs and routes
+  - Identity cache entries (IP-to-identity mappings) with remaining TTLs
+  - Cluster topology data (gateway endpoints, prefix allocations)
+- **Excluded from snapshot (authorization state):**
+  - `WirescaleAccessGrant`-derived policy rules
+  - Signed peer authorization tokens
+  - Revocation status records
+  - Policy generation numbers
 - **Snapshot location:** `/var/lib/wirescale/peer-cache.json` (or a
   configurable path).
 - **Recovery behavior:** On startup, the agent MUST load the snapshot
   and install WireGuard peers and routes immediately, before contacting
-  wirescale-control. Cached entries MUST be marked stale and refreshed
-  within `stale_refresh_window` (default: 30 seconds).
-- **Staleness bound:** If a cached entry is older than `max_stale_age`
-  (default: 10 minutes), the agent MUST discard it rather than install
-  a potentially-invalid peer.
+  wirescale-control. Restored connectivity hint entries MUST be marked
+  stale and refreshed within `stale_refresh_window` (default: 30
+  seconds). The agent MUST NOT install any authorization state from the
+  snapshot -- if authorization state entries are present in a snapshot
+  written by an older agent version, they MUST be silently discarded
+  and the discard MUST be counted via the
+  `wirescale_authz_disk_restore_filtered_total` metric.
+- **Staleness bound:** If a cached connectivity hint entry is older than
+  `max_stale_age` (default: 10 minutes), the agent MUST discard it
+  rather than install a potentially-invalid peer.
 
 Pre-warming reduces cold-start resolution from full cold-path latency
 (~7-15 ms intra-cluster, ~30-150 ms cross-cluster) to near-zero for
 previously-active peers.
+
+#### Startup Authorization Revalidation
+
+After restoring connectivity hints from disk and establishing a
+connection to `wirescale-control`, the agent MUST revalidate all
+authorization state from the control plane before granting access to
+authorization-gated resources:
+
+1. **Access grants:** The agent queries `wirescale-control` for all
+   active `WirescaleAccessGrant` rules that apply to local pods. Only
+   grants confirmed as valid by control are installed in the BPF policy
+   map. This query SHOULD be batched with the initial policy pull.
+2. **Peer authorization:** For each restored WireGuard peer, the agent
+   confirms the peer's authorization status with control. Peers whose
+   authorization has expired or been revoked MUST be removed.
+3. **Revocation status:** The agent fetches the current revocation list
+   from control. Any peer found on the revocation list MUST be removed
+   immediately, even if the peer's connectivity hints were successfully
+   restored.
+
+If `wirescale-control` is unreachable at startup, the agent MUST operate
+in degraded mode: connectivity hints are used for existing peer sessions
+(WireGuard handles authentication independently), but all
+authorization-gated operations (new access grants, new peer
+authorizations) MUST be denied until control becomes reachable. The
+agent MUST expose `wirescale_agent_degraded_mode{reason="control_unreachable"}`
+as a gauge metric while in this state.
 
 #### TCP SYN Retry Budget Interaction
 
