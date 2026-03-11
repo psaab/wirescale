@@ -48,9 +48,11 @@
    namespace, or entire cluster's egress within seconds. Rate limits
    cap bandwidth and connection rates per pod.
 
-5. **Line-rate performance.** NPTv6 translation, policy lookup, and
-   flow logging all happen in eBPF on the egress fast path. No
-   userspace proxy in the data plane for L3/L4 traffic.
+5. **Line-rate performance.** NPTv6 translation, verdict enforcement,
+   and rate limiting happen in eBPF on the per-packet fast path. All
+   intelligence (DNS parsing, SNI extraction, policy compilation,
+   flow enrichment) runs in a userspace daemon that writes pre-computed
+   verdicts to BPF maps. No userspace proxy in the data plane.
 
 ### Constraints
 
@@ -69,18 +71,27 @@
 
 ## 2. Egress Data Path Overview
 
-Outbound internet traffic traverses a layered pipeline. Each layer is
-an eBPF program or a kernel fast-path operation.
+Outbound internet traffic traverses a layered pipeline. eBPF handles
+only the per-packet fast path (translation, verdict enforcement, rate
+limiting). All intelligence — DNS parsing, SNI extraction, FQDN policy
+compilation, flow enrichment, anomaly detection — runs in a userspace
+daemon that writes pre-computed verdicts to BPF maps.
+
+### 2.1 Data Path (eBPF — Per Packet)
 
 ```
 Pod (ULA fd00:1234:0001:0042::5)
   │
-  ├─ [1] TC egress on pod veth ─────────── Egress policy check
-  │       • identity_cache lookup (source pod)
-  │       • egress_policy_map lookup (dest IP → FQDN → verdict)
-  │       • DENY → drop + log; ALLOW → continue
-  │       • connection_log ring buffer entry (5-tuple + FQDN + verdict)
-  │       • rate_limit_map check (per-pod token bucket)
+  ├─ [1a] TC egress on pod veth ────────── Verdict enforcement
+  │       • quarantine bit check (instant kill switch)
+  │       • egress_ip_policy LPM lookup (pod_id + dest_ip → verdict)
+  │       • DENY → drop; ALLOW → rate limit check → continue
+  │       • emit flow record to ring buffer (5-tuple, verdict, pkt_len)
+  │
+  ├─ [1b] TC ingress on pod veth ────────── Packet mirror (async)
+  │       • UDP src port 53 → copy DNS response to mirror ring buffer
+  │       • TCP dst 443 + SYN → copy ClientHello to mirror ring buffer
+  │       • TC_ACT_OK always (never blocks — mirror is advisory)
   │
   ├─ [2] Host routing table ────────────── Route selection
   │       • Mesh destination → wg0 (WireGuard, no NPTv6)
@@ -107,6 +118,67 @@ Return path is the reverse: physical NIC TC ingress → destination
 CGNAT address `100.64.H.P` arithmetically maps back to pod IPv6
 `fd00:1234:CCCC:HHHH::P` → SIIT-DC reverse IPv4→IPv6 → host routing
 → pod veth.
+
+### 2.2 Control Path (Userspace Daemon)
+
+The wirescale-agent runs a userspace egress daemon that owns all
+intelligence. eBPF programs are thin verdict executors; the daemon
+is the brain.
+
+```
+wirescale-agent userspace daemon
+  │
+  ├─ DNS mirror consumer ──────── Read mirrored DNS packets from ring buffer
+  │                                Parse with real DNS library (compression,
+  │                                EDNS0, CNAME chains, TCP DNS — all handled)
+  │                                → Update IP→FQDN mapping (userspace table)
+  │                                → Install per-IP verdicts in egress_ip_policy map
+  │                                → Remove entries on TTL expiry
+  │
+  ├─ SNI mirror consumer ──────── Read mirrored ClientHellos from ring buffer
+  │                                Extract SNI with real TLS parser
+  │                                → Supplement IP→FQDN mapping
+  │                                → Emit SNI metrics
+  │
+  ├─ Flow log consumer ────────── Drain flow record ring buffer
+  │                                Enrich 5-tuple records with FQDN context
+  │                                → Export to Hubble / IPFIX / JSON / OTEL
+  │
+  ├─ Policy compiler ──────────── Watch WirescaleEgressPolicy CRDs
+  │                                Compile FQDN + CIDR rules to BPF maps
+  │                                Recompile on DNS changes (new IPs for domain)
+  │
+  ├─ Threat intel loader ──────── Fetch feeds periodically
+  │                                → Update threat_intel_ip BPF map
+  │
+  └─ Anomaly detector ─────────── Read flow stats + counters
+                                   Detect fan-out, bandwidth spikes, retry storms
+                                   → Set quarantine bits in BPF maps
+```
+
+### 2.3 Why This Split
+
+| Concern | Where | Rationale |
+|---------|-------|-----------|
+| Packet translation (NPTv6, SIIT-DC) | eBPF | Pure arithmetic, ~15-25 instructions, no branching |
+| Verdict enforcement | eBPF | Single map lookup, must be per-packet |
+| Rate limiting | eBPF | Token bucket decrement, must be per-packet |
+| Quarantine check | eBPF | Single bit check, must be instant |
+| Flow record emit | eBPF | Per-packet, but only 5-tuple — no enrichment |
+| DNS parsing | **Userspace** | DNS compression pointers, EDNS0, CNAME chains, TCP DNS — fragile in eBPF, trivial in userspace |
+| SNI extraction | **Userspace** | TLS record fragmentation, QUIC CRYPTO frames, ECH — fragile in eBPF, trivial in userspace |
+| FQDN→IP mapping | **Userspace** | Needs TTL tracking, wildcard matching, multi-IP domains |
+| Policy compilation | **Userspace** | CRD watch, FQDN resolution, complex rule merging |
+| Flow enrichment | **Userspace** | Join 5-tuple with FQDN context, format for export |
+| Anomaly detection | **Userspace** | Statistical analysis, sliding windows, threshold tuning |
+| Threat intel loading | **Userspace** | Feed fetching, parsing, deduplication |
+
+**Result:** eBPF programs are trivially simple (~50 instructions for
+enforcement, ~15-25 for translation). All complex parsing and logic
+lives in a userspace daemon that is easy to test, debug, and update
+without reloading eBPF programs. The packet mirror ring buffer is the
+bridge — eBPF copies interesting packets at near-zero cost, userspace
+processes them with real libraries.
 
 ---
 
@@ -363,8 +435,9 @@ kind.
 SIIT-DC traffic passes through the same egress policy pipeline as NPTv6:
 
 1. Pod sends to `64:ff9b::C0A8:0101` (synthesized AAAA for `192.168.1.1`).
-2. TC egress on pod veth: egress policy check against the **original
-   FQDN** (looked up from `dns_fqdn_map`, see §5). If denied, drop.
+2. TC egress on pod veth: egress policy check against pre-computed
+   verdict in `egress_ip_policy` (installed by userspace from DNS
+   resolution, see §5). If no ALLOW entry, drop.
 3. Host routing: `64:ff9b::/96` routes to `nat64` interface.
 4. TC on `nat64`: stateless SIIT-DC IPv6→IPv4 translation.
 
@@ -409,74 +482,99 @@ pods can reach — by name, not by chasing ephemeral IPs.
 
 ### 5.1 DNS Snooping Architecture
 
-Every DNS response transiting a pod's veth is parsed by an eBPF program
-to build a real-time mapping of IP addresses to FQDNs:
+DNS response parsing runs **entirely in userspace**. The eBPF program
+on pod veths is a trivial packet mirror — it copies DNS responses to
+a ring buffer without attempting to parse them. The userspace daemon
+parses responses with a real DNS library (handling compression pointers,
+EDNS0, CNAME chains, TCP DNS segments, and malformed packets properly)
+and writes pre-computed verdicts to BPF maps.
 
 ```
 Pod queries "api.stripe.com" via CoreDNS
   → CoreDNS resolves: 52.204.1.100, 52.204.1.101
   → DNS response transits pod veth
-  → TC ingress eBPF on veth parses DNS response:
-      dns_fqdn_map.update(52.204.1.100 → "api.stripe.com", TTL=300s)
-      dns_fqdn_map.update(52.204.1.101 → "api.stripe.com", TTL=300s)
-  → Subsequent packets to 52.204.1.100 can be attributed to "api.stripe.com"
+  → TC ingress eBPF: UDP src port 53 → copy packet to mirror ring buffer
+  → Userspace daemon reads ring buffer, parses DNS response:
+      fqdn_table["api.stripe.com"] = {52.204.1.100, 52.204.1.101, TTL=300s}
+      ip_table[52.204.1.100] = "api.stripe.com"
+  → Userspace checks pod's egress policy for "api.stripe.com"
+  → If allowed: install egress_ip_policy[pod_id, 52.204.1.100] = ALLOW
+  → On TTL expiry: remove the entry
+  → Subsequent packets to 52.204.1.100 hit the pre-computed ALLOW in eBPF
 ```
 
-**BPF map: `dns_fqdn_map`** (LRU hash, per-node)
+**IP→FQDN mapping** is a userspace hash table (not a BPF map):
 
 ```
-Key:   destination IPv6 address (16 bytes) or IPv4-mapped (16 bytes)
-Value: { fqdn[256], ttl_expiry, source_pod_id, query_timestamp }
-Max entries: 65,536 (configurable)
+Key:   destination IP address
+Value: { fqdn, ttl_expiry, source_pod_id, query_timestamp }
+Capacity: 65,536+ entries per node (limited only by daemon memory)
 ```
 
-### 5.2 DNS Response Parsing in eBPF
+Because the mapping lives in userspace, it can handle arbitrary FQDN
+lengths, multi-level CNAME chains, wildcard matching, and TTL-based
+garbage collection without any eBPF verifier constraints.
 
-The TC ingress program on each pod veth inspects UDP port 53 responses:
+### 5.2 eBPF Packet Mirror (TC Ingress on Pod Veth)
+
+The eBPF program is deliberately minimal — it identifies interesting
+packets and copies them to a ring buffer. No parsing.
 
 ```c
-SEC("tc/dns_snoop")
-int dns_response_snoop(struct __sk_buff *skb) {
-    /* Only inspect UDP src port 53 (DNS responses) */
-    if (!is_udp_sport_53(skb))
-        return TC_ACT_OK;
-
-    struct dns_header *dns = get_dns_header(skb);
-    if (dns->qr != 1)          /* Not a response */
-        return TC_ACT_OK;
-    if (dns->ancount == 0)      /* No answers */
-        return TC_ACT_OK;
-
-    /* Parse question section to extract FQDN */
-    char fqdn[256];
-    int off = parse_dns_question(skb, fqdn, sizeof(fqdn));
-
-    /* Walk answer RRs, extract A/AAAA records */
-    for (int i = 0; i < MIN(dns->ancount, MAX_RR_PARSE); i++) {
-        struct dns_rr rr;
-        off = parse_dns_rr(skb, off, &rr);
-        if (rr.type == DNS_TYPE_AAAA || rr.type == DNS_TYPE_A) {
-            struct fqdn_entry entry = {
-                .ttl_expiry = bpf_ktime_get_ns() + rr.ttl * 1e9,
-                .source_pod = get_pod_identity(skb),
-            };
-            __builtin_memcpy(entry.fqdn, fqdn, sizeof(fqdn));
-            bpf_map_update_elem(&dns_fqdn_map, &rr.rdata, &entry, BPF_ANY);
-        }
+SEC("tc/pkt_mirror")
+int mirror_interesting_packets(struct __sk_buff *skb) {
+    /* Mirror DNS responses (UDP src port 53) */
+    if (is_udp_sport_53(skb)) {
+        bpf_perf_event_output(skb, &packet_mirror, BPF_F_CURRENT_CPU,
+                              skb->data, MIN(skb->len, MAX_MIRROR_LEN));
     }
-    return TC_ACT_OK;
+
+    /* Mirror TLS ClientHello (TCP dst 443, first packet) */
+    if (is_tcp_dport_443(skb) && is_syn_or_first_data(skb)) {
+        bpf_perf_event_output(skb, &packet_mirror, BPF_F_CURRENT_CPU,
+                              skb->data, MIN(skb->len, MAX_MIRROR_LEN));
+    }
+
+    return TC_ACT_OK;  /* always pass — mirror is advisory */
 }
 ```
 
-**Verifier constraints:** DNS parsing is bounded (max 8 RRs parsed,
-max 256-byte name, max 512-byte UDP or 4096-byte TCP). Compression
-pointers are followed up to 4 hops. Malformed responses are passed
-through without map updates.
+**~15 eBPF instructions.** No DNS parsing. No TLS parsing. No map
+updates. The mirror ring buffer is per-CPU to avoid contention. Packets
+that don't match either check pass through with zero overhead.
 
-### 5.3 DNS-over-HTTPS/TLS (DoH/DoT) Handling
+### 5.3 Userspace DNS Processing
 
-eBPF cannot inspect encrypted DNS. Pods using DoH/DoT bypass the DNS
-snooping layer. Mitigations:
+The daemon reads mirrored DNS packets and processes them with full
+library support:
+
+1. **Parse DNS response** — handles compression pointers (arbitrary
+   depth), EDNS0 OPT records, CNAME/DNAME chains, TCP DNS segments
+   that span multiple packets, and gracefully rejects malformed data.
+
+2. **Update IP→FQDN table** — for each A/AAAA record, store the
+   mapping with TTL. This table is the ground truth for FQDN
+   attribution across the node.
+
+3. **Install egress verdicts** — for each resolved IP, check all
+   matching pods' egress policies. If pod P allows domain D and D
+   resolves to IP X, install `egress_ip_policy[P, X] = ALLOW` in
+   the BPF map. The eBPF enforcement path sees a pre-computed
+   verdict — no FQDN logic in eBPF at all.
+
+4. **TTL-driven cleanup** — when a DNS entry's TTL expires, the daemon
+   removes the corresponding `egress_ip_policy` entries. If the domain
+   resolves to new IPs, the old entries are replaced atomically.
+
+**Latency:** DNS response processing completes in <1ms (parse + map
+update). Since the application waits for the DNS response before
+sending data, the verdict is in the BPF map before the first data
+packet arrives. No race condition in practice.
+
+### 5.4 DNS-over-HTTPS/TLS (DoH/DoT) Handling
+
+Encrypted DNS bypasses the packet mirror (the eBPF program cannot
+see inside TLS). Mitigations:
 
 - **CoreDNS enforcement:** The cluster's CoreDNS SHOULD be the only
   permitted DNS resolver. Egress policy SHOULD deny UDP/TCP port 53
@@ -484,17 +582,19 @@ snooping layer. Mitigations:
   providers (configurable blocklist).
 - **Redirect policy:** The agent MAY install a DNAT rule redirecting
   all port-53 traffic to CoreDNS (transparent DNS proxy).
-- **Unsnooped traffic:** Packets to IPs not in `dns_fqdn_map` are
-  flagged as `fqdn: <unknown>` in logs. Policy can be configured to
+- **Unsnooped traffic:** Packets to IPs not in the userspace FQDN
+  table are logged as `fqdn: <unknown>`. Policy can be configured to
   deny traffic to unknown FQDNs (strict mode) or allow-and-log
-  (permissive mode).
+  (permissive mode). In strict mode, only IPs resolved through
+  observable DNS and installed as verdicts in `egress_ip_policy`
+  are allowed.
 
-### 5.4 DNS Query Logging
+### 5.5 DNS Query Logging
 
-In addition to response snooping, the agent logs DNS queries:
+The daemon logs all observed DNS queries and responses:
 
 ```
-dns_query_log ring buffer entry:
+dns_log_entry:
   { timestamp, pod_id, namespace, query_name, query_type,
     response_code, resolved_ips[], ttl, latency_ns }
 ```
@@ -557,83 +657,81 @@ spec:
       log: true              # log denied attempts
 ```
 
-### 6.3 Compilation to eBPF Maps
+### 6.3 Compilation to BPF Maps (Userspace)
 
-The wirescale-agent compiles FQDN rules into two BPF maps:
-
-**`egress_fqdn_policy`** (hash map, per-node):
-```
-Key:   { pod_identity, fqdn_hash }
-Value: { action (allow/deny/log), ports_bitmap, rate_limit_id }
-```
+The daemon compiles all policy into a single BPF map:
 
 **`egress_ip_policy`** (LPM trie, per-node):
 ```
 Key:   { pod_identity, destination_ip_prefix }
-Value: { action, ports_bitmap, fqdn_hash (for attribution), rate_limit_id }
+Value: { action (allow/deny), ports_bitmap, rate_limit_id }
 ```
 
-When DNS snooping populates `dns_fqdn_map` with resolved IPs, the
-agent installs corresponding entries in `egress_ip_policy` with the
-FQDN hash for attribution. When the DNS TTL expires, the agent removes
-the IP entries. This means:
+The daemon populates this map from two sources:
+
+1. **Static CIDR rules** — installed directly from the CRD. Example:
+   `deny pod_X ::/0` installs as a catch-all DENY entry.
+
+2. **DNS-derived entries** — when the daemon's DNS parser resolves
+   `api.stripe.com` to `52.204.1.100` and pod X allows that FQDN,
+   the daemon installs `egress_ip_policy[pod_X, 52.204.1.100] = ALLOW`.
+   When the DNS TTL expires, the daemon removes the entry.
+
+This means:
 
 - **FQDN changes propagate automatically.** If `api.stripe.com` changes
-  IPs, the new DNS response updates the maps.
+  IPs, the new DNS response updates the map.
 - **Stale IPs are removed.** No risk of allowing traffic to a reused IP
   that previously belonged to an allowed domain.
-- **No manual IP management.** Operators write domain names; the system
+- **No manual IP management.** Operators write domain names; the daemon
   handles the rest.
+- **eBPF sees only IPs and verdicts.** No FQDN hashing, no string
+  matching, no DNS logic in the kernel.
 
 ### 6.4 eBPF Enforcement (TC Egress on Pod Veth)
+
+The enforcement program is deliberately simple — one map lookup for
+the verdict, one for rate limiting, one ring buffer write. No FQDN
+logic. No DNS map. No string operations. ~50 instructions total.
 
 ```c
 SEC("tc/egress_policy")
 int egress_check(struct __sk_buff *skb) {
-    struct pod_identity *pod = lookup_identity(skb->ifindex);
+    __u32 ifindex = skb->ifindex;
+    struct pod_identity *pod = bpf_map_lookup_elem(&identity_cache, &ifindex);
+    if (!pod)
+        return TC_ACT_OK;       /* unknown veth — pass */
+
+    /* 1. Quarantine check (instant kill switch — single bit) */
+    struct rate_state *rl = bpf_map_lookup_elem(&egress_rate_limit, &pod->id);
+    if (rl && rl->quarantine)
+        return TC_ACT_SHOT;
+
+    /* 2. Policy verdict (single LPM trie lookup — pre-computed by userspace) */
     struct ipv6hdr *ip6 = get_ipv6_hdr(skb);
     __u16 dport = get_l4_dport(skb);
+    struct egress_key key = { .pod_id = pod->id, .addr = ip6->daddr };
+    struct egress_value *v = bpf_map_lookup_elem(&egress_ip_policy, &key);
 
-    /* 1. Check CIDR policy (LPM trie — catches broad deny rules) */
-    struct egress_ip_key key = { .pod_id = pod->id, .addr = ip6->daddr };
-    struct egress_ip_value *cidr_v = bpf_map_lookup_elem(&egress_ip_policy, &key);
-
-    if (cidr_v) {
-        if (cidr_v->action == DENY) {
-            log_egress_decision(skb, pod, DENY, cidr_v->fqdn_hash);
+    if (v && v->action == ALLOW && port_matches(v->ports_bitmap, dport)) {
+        /* 3. Rate limit check (token bucket decrement) */
+        if (rl && !token_bucket_allow(rl, skb->len))
             return TC_ACT_SHOT;
-        }
-        if (cidr_v->action == ALLOW && port_matches(cidr_v->ports_bitmap, dport)) {
-            log_egress_decision(skb, pod, ALLOW, cidr_v->fqdn_hash);
-            check_rate_limit(skb, pod, cidr_v->rate_limit_id);
-            return TC_ACT_OK;
-        }
-    }
-
-    /* 2. Lookup FQDN from dns_fqdn_map */
-    struct fqdn_entry *fqdn = bpf_map_lookup_elem(&dns_fqdn_map, &ip6->daddr);
-
-    /* 3. If destination has no FQDN mapping — policy decision */
-    if (!fqdn) {
-        /* Unknown destination: apply unknown-dest policy */
-        return apply_unknown_dest_policy(skb, pod);
-    }
-
-    /* 4. Check FQDN policy */
-    struct egress_fqdn_key fkey = { .pod_id = pod->id, .fqdn_hash = hash(fqdn->fqdn) };
-    struct egress_fqdn_value *fv = bpf_map_lookup_elem(&egress_fqdn_policy, &fkey);
-
-    if (fv && fv->action == ALLOW && port_matches(fv->ports_bitmap, dport)) {
-        log_egress_decision(skb, pod, ALLOW, fkey.fqdn_hash);
-        check_rate_limit(skb, pod, fv->rate_limit_id);
+        /* 4. Emit minimal flow record */
+        emit_flow_record(skb, pod->id, ALLOW);
         return TC_ACT_OK;
     }
 
     /* 5. Default: deny */
-    log_egress_decision(skb, pod, DENY, fkey.fqdn_hash);
+    emit_flow_record(skb, pod->id, DENY);
     return TC_ACT_SHOT;
 }
 ```
+
+Compare with the previous design which had 5 map lookups (identity,
+CIDR policy, dns_fqdn_map, FQDN policy hash, rate limit) and computed
+FQDN hashes in eBPF. This version has 3 map lookups and zero string
+operations.
 
 ### 6.5 Policy Modes
 
@@ -650,51 +748,57 @@ int egress_check(struct __sk_buff *skb) {
 
 ### 7.1 TLS SNI Inspection
 
-For HTTPS traffic (port 443), the eBPF program inspects the TLS
-ClientHello to extract the Server Name Indication (SNI) field. This
-provides FQDN-level visibility even when DNS snooping missed the
-resolution (DoH, cached, hardcoded IP).
+SNI extraction runs **in userspace**, not eBPF. The packet mirror
+(§5.2) already copies TLS ClientHello packets to the mirror ring
+buffer. The daemon's SNI consumer parses them with a real TLS library.
 
-```c
-SEC("tc/sni_inspect")
-int sni_extract(struct __sk_buff *skb) {
-    /* Only inspect TCP SYN or first data packet on port 443 */
-    if (!is_tcp_dport_443(skb) || !is_client_hello(skb))
-        return TC_ACT_OK;
+**Flow:**
 
-    char sni[256];
-    int sni_len = parse_tls_client_hello_sni(skb, sni, sizeof(sni));
-    if (sni_len <= 0)
-        return TC_ACT_OK;
-
-    /* Update dns_fqdn_map with SNI (supplements DNS snooping) */
-    struct fqdn_entry entry = {
-        .ttl_expiry = bpf_ktime_get_ns() + SNI_TTL_NS,
-        .source_pod = get_pod_identity(skb),
-        .source = FQDN_SOURCE_SNI,
-    };
-    __builtin_memcpy(entry.fqdn, sni, sizeof(sni));
-    bpf_map_update_elem(&dns_fqdn_map, &dest_addr, &entry, BPF_NOEXIST);
-
-    /* Enforce FQDN policy against SNI */
-    return enforce_fqdn_policy(skb, sni);
-}
 ```
+ClientHello arrives at pod veth
+  → TC ingress eBPF: TCP dst 443 + SYN/first-data → copy to mirror ring buffer
+  → Packet passes through to egress enforcement (not blocked by mirror)
+  → Userspace daemon reads ClientHello from ring buffer
+  → Parse TLS record layer → extract SNI extension
+  → Supplement IP→FQDN table: ip_table[dest_ip] = sni_name
+  → Emit wirescale_egress_sni_extractions_total metric
+```
+
+**Why userspace for SNI:**
+- TLS ClientHello parsing in eBPF is fragile: record layer
+  fragmentation, multiple extensions with variable-length fields,
+  TLS 1.3 vs 1.2 format differences, QUIC CRYPTO frames.
+- In userspace, a battle-tested TLS parser handles all edge cases.
+- SNI is not on the blocking path for most traffic — DNS snooping
+  is the primary enforcement mechanism. If the pod resolved the FQDN
+  through DNS, the IP already has a pre-computed verdict in
+  `egress_ip_policy`. SNI provides supplementary attribution for:
+  - IPs that weren't resolved through observable DNS
+  - Audit enrichment (confirm the SNI matches the DNS-resolved FQDN)
+  - Detection of domain fronting (SNI doesn't match DNS)
+
+**Latency:** The ClientHello mirror adds no latency to the connection —
+the packet passes through to enforcement immediately. SNI processing
+is async. If the IP was already authorized via DNS, the connection
+proceeds at line rate. If the IP was not authorized (hardcoded IP,
+bypassed DNS), it's already denied by policy before SNI processing
+completes.
 
 **Limitations:**
 - Encrypted Client Hello (ECH) hides the SNI. Detection: the outer
   SNI is a cloudflare-ech.example.com stub. Policy can deny ECH
   connections or allow-and-flag.
-- QUIC Initial packets carry SNI in the QUIC CRYPTO frame. The parser
-  MUST handle both TLS-over-TCP and QUIC-over-UDP ClientHellos.
-- SNI parsing adds ~100-200ns per connection setup (first packet only).
+- QUIC Initial packets carry SNI in the QUIC CRYPTO frame. The
+  userspace parser handles both TLS-over-TCP and QUIC-over-UDP.
+- Domain fronting: the daemon compares SNI against DNS-resolved FQDNs
+  and flags mismatches.
 
 ### 7.2 URL-Level Filtering (L7 Proxy)
 
-eBPF operates at L3/L4 and can extract SNI, but cannot inspect HTTP
-request paths, headers, or POST bodies. For URL-level filtering
-(`/api/v1/transfer` vs `/api/v1/status`), a userspace L7 proxy is
-required.
+The eBPF+userspace pipeline operates at L3/L4 and can extract SNI, but
+cannot inspect HTTP request paths, headers, or POST bodies. For
+URL-level filtering (`/api/v1/transfer` vs `/api/v1/status`), a
+dedicated L7 proxy is required.
 
 **Architecture:**
 
@@ -706,8 +810,8 @@ Pod → TC egress (L3/L4 policy) → [if L7 inspection needed] → redirect to L
 
 **When to use L7 proxy:**
 
-| Requirement | L3/L4 eBPF | L7 Proxy |
-|-------------|-----------|----------|
+| Requirement | L3/L4 (eBPF + userspace) | L7 Proxy |
+|-------------|--------------------------|----------|
 | FQDN allowlist (domain level) | Yes (DNS+SNI) | Yes |
 | Port/protocol filtering | Yes | Yes |
 | URL path filtering | No | Yes |
@@ -716,9 +820,9 @@ Pod → TC egress (L3/L4 policy) → [if L7 inspection needed] → redirect to L
 | mTLS to external services | No | Yes |
 
 **L7 proxy is optional.** Most workloads need only FQDN+port filtering
-(handled entirely in eBPF at line rate). L7 proxy is deployed only for
-workloads that require URL-level control. This avoids imposing proxy
-overhead on all traffic.
+(handled by the eBPF+userspace pipeline at line rate). L7 proxy is
+deployed only for workloads that require URL-level control. This avoids
+imposing proxy overhead on all traffic.
 
 **Selective redirection:**
 
@@ -833,7 +937,9 @@ processing cycle.
 
 ### 8.4 Automatic Containment (Circuit Breaker)
 
-The agent can detect anomalous egress patterns and auto-quarantine:
+The userspace daemon monitors flow records and detects anomalous egress
+patterns. All circuit breaker logic runs in userspace — when triggered,
+it sets the quarantine bit in the BPF map (§8.3):
 
 | Signal | Threshold | Action |
 |--------|-----------|--------|
@@ -853,32 +959,41 @@ positives disrupting production.
 
 ### 9.1 Connection Log
 
-Every egress connection is logged to a per-CPU ring buffer consumed
-by the wirescale-agent userspace daemon:
+eBPF emits **minimal flow records** to a per-CPU ring buffer — just
+the 5-tuple, verdict, and packet length. The userspace daemon enriches
+these with FQDN context, SNI, pod metadata, and namespace before
+export.
 
-```
-struct egress_flow_log {
+**eBPF flow record** (emitted per-packet, ~48 bytes):
+
+```c
+struct egress_flow_record {
     __u64 timestamp_ns;
     __u32 pod_identity;
-    __u8  direction;           /* egress */
-    __u8  verdict;             /* allow, deny, throttle, quarantine */
+    __u8  verdict;             /* allow, deny, quarantine */
     __u8  protocol;            /* TCP, UDP, SCTP */
-    __u8  ip_version;          /* 4, 6 */
-    __u8  fqdn[256];           /* resolved FQDN or "<unknown>" */
-    __u8  fqdn_source;         /* dns_snoop, sni, manual, unknown */
-    union {
-        __be32 ipv4;
-        struct in6_addr ipv6;
-    } src_addr, dst_addr;
     __be16 src_port, dst_port;
-    __u64 bytes_out;           /* (updated on connection close) */
-    __u64 bytes_in;
-    __u64 duration_ns;
-    __u32 rate_limit_id;
-    __u16 sni_len;
-    __u8  sni[256];            /* TLS SNI if extracted */
+    struct in6_addr src_addr, dst_addr;
+    __u32 pkt_len;
 };
 ```
+
+**Userspace enriched record** (exported to Hubble/IPFIX/JSON/OTEL):
+
+```
+{
+    timestamp, pod_id, pod_name, namespace, service_account,
+    verdict, protocol, src_addr, dst_addr, src_port, dst_port,
+    fqdn,              /* from userspace IP→FQDN table */
+    fqdn_source,       /* dns, sni, unknown */
+    sni,               /* from SNI mirror consumer */
+    bytes_out, bytes_in, duration_ns,
+    threat_category     /* from threat intel lookup */
+}
+```
+
+The split keeps the eBPF record tiny (no 256-byte FQDN/SNI strings)
+and moves all enrichment to userspace where it's trivial.
 
 ### 9.2 Metrics (Prometheus)
 
@@ -892,8 +1007,8 @@ wirescale_egress_packets_total{pod, namespace, protocol, verdict}
 
 # DNS
 wirescale_dns_queries_total{pod, namespace, query_name, query_type, rcode}
-wirescale_dns_fqdn_map_size{node}
-wirescale_dns_fqdn_map_evictions_total{node}
+wirescale_dns_fqdn_table_size{node}
+wirescale_dns_mirror_drops_total{node}
 
 # Rate limiting
 wirescale_egress_rate_limited_total{pod, namespace, limit_type}
@@ -958,8 +1073,8 @@ Pre-built Grafana dashboards:
 
 ### 10.1 Threat Intelligence Integration
 
-The agent loads threat intelligence feeds into eBPF maps for real-time
-blocking:
+The userspace daemon loads threat intelligence feeds into BPF maps for
+real-time blocking:
 
 **BPF map: `threat_intel_ip`** (LPM trie, per-node):
 ```
@@ -1024,38 +1139,61 @@ spec:
 
 ### 11.1 eBPF Pipeline Cost Budget
 
-Every egress packet traverses the pipeline. The budget at 10 Gbps
-(~14.8 Mpps at 64B, ~1.2 Mpps at 1KB typical):
+Every egress packet traverses the eBPF enforcement path. With the
+userspace split, the per-packet eBPF work is minimal:
 
 | Stage | Cost | Notes |
 |-------|------|-------|
-| Identity lookup | ~10 ns | Hash map, O(1) |
-| Egress CIDR policy (LPM) | ~30 ns | LPM trie, O(prefix_len) |
-| FQDN map lookup | ~15 ns | Hash map, O(1) |
-| FQDN policy lookup | ~15 ns | Hash map, O(1) |
+| Quarantine check | ~5 ns | Hash map, single bit |
+| Policy verdict (LPM) | ~30 ns | Single LPM trie lookup (pre-computed) |
+| Port match | ~5 ns | Bitmap check |
 | Rate limit check | ~10 ns | Per-CPU token bucket |
-| Connection log write | ~20 ns | Per-CPU ring buffer, non-blocking |
+| Flow record emit | ~15 ns | Per-CPU ring buffer, 48-byte record |
 | NPTv6 translation | ~15 ns | 32-bit rewrite + 16-bit checksum |
-| SIIT-DC translation | ~20 ns | Stateless header swap, no state table (IPv4 path) |
-| **Total (fast path)** | **~115-120 ns** | **~8.3-8.7 Mpps single core** |
+| SIIT-DC translation | ~20 ns | Stateless header swap (IPv4 path only) |
+| **Total (fast path)** | **~80-85 ns** | **~11.8-12.5 Mpps single core** |
+
+Compared to the previous design (~115-120ns with 5 map lookups and
+FQDN hashing in eBPF), the userspace split reduces per-packet cost
+by ~30% and eliminates the two most complex eBPF operations (DNS map
+lookup and FQDN hash computation).
 
 At 1KB average packet size, 10 Gbps = ~1.2 Mpps, well within a
-single core's budget. At 64B packets (worst case), 8.7 Mpps per core
-sustains ~4.5 Gbps — additional cores via RSS handle higher rates.
+single core's budget. At 64B packets (worst case), 12.5 Mpps per core
+sustains ~6.4 Gbps — additional cores via RSS handle higher rates.
 
-### 11.2 DNS Snooping Cost
+### 11.2 Packet Mirror Cost
 
-DNS snooping runs on the ingress path only for UDP port 53 responses.
-DNS response rate is orders of magnitude lower than data packet rate
-(~10-100 DNS responses/sec per pod vs ~100K+ data packets/sec). The
-cost of DNS parsing (~500ns per response) is negligible.
+The TC ingress mirror program runs on all pod veth traffic but does
+useful work only for DNS responses and TLS ClientHellos — a tiny
+fraction of total packets:
 
-### 11.3 SNI Extraction Cost
+| Traffic type | Rate | Mirror cost | Notes |
+|-------------|------|-------------|-------|
+| DNS responses | ~10-100/sec/pod | ~200 ns each | `bpf_perf_event_output` copy |
+| TLS ClientHellos | ~100-1K/sec/pod | ~300 ns each | Larger packet copy |
+| All other traffic | ~100K+/sec/pod | ~5 ns each | Port check → skip |
 
-TLS ClientHello parsing runs only on the **first packet** of each TLS
-connection (TCP SYN+data or standalone ClientHello). At ~100-200ns per
-extraction and ~1000 new connections/sec per pod, total cost is ~0.1-0.2
-ms/sec — invisible.
+Total mirror overhead: <0.01% of CPU. The mirror path never blocks —
+if the ring buffer is full, the copy is silently dropped and the
+packet passes through normally.
+
+### 11.3 Userspace Processing Cost
+
+DNS and SNI processing run in the userspace daemon, off the packet
+hot path. Their cost is measured in wall-clock time, not per-packet
+eBPF budget:
+
+| Operation | Latency | Rate | CPU impact |
+|-----------|---------|------|------------|
+| DNS response parse + map update | ~50-200 µs | ~1K/sec/node | <1% core |
+| SNI extraction | ~10-50 µs | ~10K/sec/node | <1% core |
+| Flow record enrichment | ~5-10 µs | ~100K/sec/node | ~10% core |
+| Policy recompilation (on DNS change) | ~1-5 ms | ~100/sec/node | <1% core |
+
+The daemon processes these asynchronously using epoll on the ring
+buffer file descriptors. Total daemon CPU usage: <0.5 cores at
+moderate load.
 
 ### 11.4 GRO/GSO Amortization
 
@@ -1192,16 +1330,16 @@ Pod (fd00:1234:0001:0042::5) runs: curl https://api.stripe.com/v1/charges
    CoreDNS → upstream: only A record exists (52.204.1.100)
    CoreDNS DNS64: synthesize AAAA → 64:ff9b::34cc:0164
    Response transits pod veth:
-     TC ingress eBPF: dns_fqdn_map[64:ff9b::34cc:0164] = "api.stripe.com"
+     TC ingress eBPF: copies DNS packet to mirror ring buffer
+     Userspace daemon: parses response, resolves "api.stripe.com" → 64:ff9b::34cc:0164
+     Daemon checks: pod 0x1234 allows "api.stripe.com" on port 443
+     Daemon installs: egress_ip_policy[0x1234, 64:ff9b::34cc:0164] = ALLOW, port 443
 
 2. TCP SYN to 64:ff9b::34cc:0164:443
    TC egress on pod veth:
-     identity_cache: pod = payments/payment-service (identity 0x1234)
-     dns_fqdn_map[64:ff9b::34cc:0164] → "api.stripe.com"
-     egress_fqdn_policy[0x1234, hash("api.stripe.com")] → ALLOW, port 443
+     egress_ip_policy[0x1234, 64:ff9b::34cc:0164] → ALLOW, port 443
      rate_limit check → OK
-     connection_log: {pod=0x1234, fqdn="api.stripe.com", dest=64:ff9b::34cc:0164,
-                      port=443, verdict=ALLOW}
+     flow_record: {pod=0x1234, dest=64:ff9b::34cc:0164, port=443, verdict=ALLOW}
      → TC_ACT_OK
 
 3. Host routing
@@ -1228,18 +1366,19 @@ Pod (fd00:1234:0001:0042::5) runs: git clone https://github.com/org/repo
    Pod → CoreDNS: "github.com AAAA?"
    CoreDNS → upstream: AAAA 2606:50c0:8003::1
    Response transits pod veth:
-     TC ingress eBPF: dns_fqdn_map[2606:50c0:8003::1] = "github.com"
+     TC ingress eBPF: copies DNS packet to mirror ring buffer
+     Userspace daemon: parses response, resolves "github.com" → 2606:50c0:8003::1
+     Daemon checks: pod 0x5678 allows "github.com" on port 443
+     Daemon installs: egress_ip_policy[0x5678, 2606:50c0:8003::1] = ALLOW, port 443
 
 2. TCP SYN to 2606:50c0:8003::1:443
    TC egress on pod veth:
-     identity_cache: pod = ci/builder (identity 0x5678)
-     dns_fqdn_map[2606:50c0:8003::1] → "github.com"
-     egress_fqdn_policy[0x5678, hash("github.com")] → ALLOW, port 443
-     SNI extraction: "github.com" (confirms DNS mapping)
+     egress_ip_policy[0x5678, 2606:50c0:8003::1] → ALLOW, port 443
      rate_limit check → OK
-     connection_log: {pod=0x5678, fqdn="github.com", sni="github.com",
-                      dest=2606:50c0:8003::1, port=443, verdict=ALLOW}
+     flow_record: {pod=0x5678, dest=2606:50c0:8003::1, port=443, verdict=ALLOW}
      → TC_ACT_OK
+   Mirror: copies ClientHello to ring buffer → userspace extracts SNI "github.com"
+           (confirms DNS mapping, enriches flow log)
 
 3. Host routing
    Default route → dev nptv6
@@ -1263,18 +1402,17 @@ Pod (fd00:1234:0001:0042::5) runs: curl https://suspicious-domain.xyz
 1. DNS resolution
    Pod → CoreDNS: "suspicious-domain.xyz AAAA?"
    Response: AAAA 2a01:dead::1
-   dns_fqdn_map[2a01:dead::1] = "suspicious-domain.xyz"
+   Packet mirror → userspace daemon parses DNS response
+   Daemon checks: pod 0x1234 has no policy allowing "suspicious-domain.xyz"
+   Daemon does NOT install ALLOW entry in egress_ip_policy
 
 2. TCP SYN to 2a01:dead::1:443
    TC egress on pod veth:
-     identity_cache: pod = payments/payment-service (identity 0x1234)
-     egress_ip_policy: no CIDR match
-     dns_fqdn_map[2a01:dead::1] → "suspicious-domain.xyz"
-     egress_fqdn_policy[0x1234, hash("suspicious-domain.xyz")] → NOT FOUND
-     Strict mode: no explicit allow → DENY
-     connection_log: {pod=0x1234, fqdn="suspicious-domain.xyz",
-                      dest=2a01:dead::1, port=443, verdict=DENY}
+     egress_ip_policy[0x1234, 2a01:dead::1] → NOT FOUND
+     No match → DENY (default deny)
+     flow_record: {pod=0x1234, dest=2a01:dead::1, port=443, verdict=DENY}
      → TC_ACT_SHOT
+   Userspace enriches flow log: fqdn="suspicious-domain.xyz"
 
    Pod receives: connection refused / timeout
 ```
@@ -1286,11 +1424,11 @@ Compromised pod (fd00:1234:0001:0042::9) begins port scanning
 
 1. Pod sends TCP SYNs to 500+ unique destinations in 60 seconds
 
-2. TC egress counts unique destinations per pod:
-   egress_fanout_counter[pod=0x9999] increments per unique dest IP
+2. Flow record ring buffer captures each connection attempt:
+   flow_record: {pod=0x9999, dest=..., verdict=ALLOW/DENY}
 
-3. Agent userspace reads fanout counter every 10 seconds:
-   Detects: 500+ unique dests in window → threshold exceeded
+3. Userspace daemon aggregates flow records, counts unique dests:
+   Detects: 500+ unique dests in 60s window → threshold exceeded
 
 4. Agent sets quarantine bit:
    egress_rate_limit[pod=0x9999].quarantine = 1
@@ -1321,7 +1459,7 @@ cleanly via ownership boundaries.
 | Intra-cluster encryption | Cilium WireGuard (cilium_wg0) | Not involved |
 | Cross-cluster connectivity | Not involved | Wirescale WireGuard (wg0) |
 | **Egress to internet** | **CiliumNetworkPolicy egress rules (optional)** | **WirescaleEgressPolicy (primary)** |
-| DNS snooping | Cilium DNS proxy (L7) | Wirescale eBPF (L3/L4) |
+| DNS snooping | Cilium DNS proxy (L7) | Wirescale packet mirror → userspace |
 | NPTv6 translation | Not involved | Wirescale nptv6 interface |
 | NAT64 translation | Not involved | Wirescale nat64 interface |
 | Egress gateway | CiliumEgressGateway (if used) | WirescaleEgressGateway |
@@ -1361,18 +1499,28 @@ enforcement source.
 
 | Map | Type | Key | Value | Max Entries | Purpose |
 |-----|------|-----|-------|-------------|---------|
-| `dns_fqdn_map` | LRU hash | dest IP (16B) | fqdn + metadata | 65,536 | IP→FQDN mapping from DNS snooping |
-| `egress_fqdn_policy` | Hash | pod_id + fqdn_hash | action + ports | 32,768 | Compiled FQDN allowlist |
-| `egress_ip_policy` | LPM trie | pod_id + IP prefix | action + fqdn_hash | 65,536 | Compiled CIDR rules + DNS-derived entries |
+| `identity_cache` | Hash | ifindex (u32) | pod identity | 256 | Map veth to pod identity |
+| `egress_ip_policy` | LPM trie | pod_id + IP prefix | action + ports_bitmap | 65,536 | Pre-computed verdicts (CIDR + DNS-derived) |
 | `egress_rate_limit` | Hash | pod_id | token buckets + quarantine | 16,384 | Per-pod rate limiting and quarantine |
-| `egress_flow_log` | Per-CPU ring | — | flow record | 6 MB/CPU | Connection logging |
+| `egress_flow_log` | Per-CPU ring | — | flow record (48B) | 4 MB/CPU | Minimal 5-tuple flow logging |
+| `packet_mirror` | Per-CPU ring | — | raw packet bytes | 2 MB/CPU | DNS response + TLS ClientHello mirror to userspace |
 | `threat_intel_ip` | LPM trie | IP prefix | category + feed_id | 1,000,000 | Threat intelligence IP blocklist |
-| `threat_intel_fqdn` | Hash | fqdn_hash | category + feed_id | 100,000 | Threat intelligence FQDN blocklist |
-| `egress_fanout_counter` | Per-CPU hash | pod_id | unique_dest_count | 16,384 | Anomaly detection (connection fan-out) |
 
-Total per-node memory: ~85 MB (dominated by threat_intel_ip at 1M entries × 64B ≈ 64MB).
-Note: no conntrack or NAT state table. SIIT-DC translation is fully stateless —
-pod identity is derived arithmetically from the CGNAT address (zero map lookups).
+**Removed from eBPF** (now userspace-only):
+
+| Data | Where it lives | Why |
+|------|---------------|-----|
+| IP→FQDN mapping | Userspace hash table | DNS parsing too complex for eBPF |
+| FQDN policy rules | Userspace (compiled to `egress_ip_policy` via DNS) | Wildcard matching, TTL tracking |
+| SNI→FQDN mapping | Userspace hash table | TLS parsing too complex for eBPF |
+| FQDN threat intel | Userspace hash table | String matching + feed management |
+| Fan-out counters | Userspace counters | Anomaly detection logic is userspace |
+
+Total BPF map memory per-node: ~70 MB (dominated by threat_intel_ip
+at 1M entries × 64B ≈ 64MB). The flow log and packet mirror ring
+buffers add ~6 MB/CPU. No conntrack or NAT state table. SIIT-DC
+translation is fully stateless — pod identity is derived arithmetically
+from the CGNAT address (zero map lookups).
 
 ---
 
@@ -1381,8 +1529,8 @@ pod identity is derived arithmetically from the CGNAT address (zero map lookups)
 | Phase | Scope | Deliverables |
 |-------|-------|-------------|
 | **1** | NPTv6 + basic egress | `nptv6` interface, ULA↔GUA translation, default route, basic CIDR egress policy |
-| **2** | DNS snooping + FQDN policy | `dns_fqdn_map`, DNS response parser, `WirescaleEgressPolicy` with FQDN rules |
+| **2** | DNS snooping + FQDN policy | Packet mirror ring buffer, userspace DNS parser, `WirescaleEgressPolicy` with FQDN rules |
 | **3** | Rate limiting + quarantine | Token buckets, `kubectl wirescale quarantine`, `WirescaleEgressQuota` |
-| **4** | SNI extraction + observability | TLS ClientHello parser, flow export (Hubble, IPFIX, JSON), Grafana dashboards |
+| **4** | SNI extraction + observability | Userspace TLS ClientHello parser, flow export (Hubble, IPFIX, JSON), Grafana dashboards |
 | **5** | Threat intelligence + auto-response | Threat feed ingestion, `threat_intel_*` maps, `WirescaleThreatResponse` CRD |
 | **6** | L7 proxy (optional) | Envoy sidecar integration, URL-level filtering, `proxy` action in policy |

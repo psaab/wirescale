@@ -1474,7 +1474,8 @@ aggregation, minimal per-node state).
    (`3fff:1234:CCCC:ffff::/108`) and is placement-independent.
 
 See [EGRESS.md](EGRESS.md) Section 5 for DNS interception and FQDN resolution
-used in egress policy enforcement, including DNS snooping and IP-to-FQDN mapping.
+used in egress policy enforcement, including the packet mirror to userspace
+architecture for DNS parsing and IP-to-FQDN mapping.
 
 ---
 
