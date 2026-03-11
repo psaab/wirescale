@@ -823,7 +823,10 @@ spec:
 
 > **See [EGRESS.md](EGRESS.md) sections 6--7** for the complete egress policy
 > engine, including FQDN allowlists, DNS snooping for IP resolution, SNI
-> filtering, and URL filtering.
+> filtering, and URL filtering. When Cilium is the CNI, internet egress
+> policy MUST use `CiliumNetworkPolicy` instead of `WirescaleEgressPolicy`
+> -- see [CILIUM-INTEGRATION.md §3](CILIUM-INTEGRATION.md#ownership-boundary-egress-fqdn-policy-and-observability)
+> for the ownership boundary.
 
 #### Default Deny with Explicit Allow
 
@@ -1602,7 +1605,10 @@ External peers (non-Kubernetes nodes) authenticate via:
 
 > **See [EGRESS.md](EGRESS.md) section 9** for egress-specific flow
 > observability, including per-connection FQDN-attributed logging and
-> outbound threat detection alerts.
+> outbound threat detection alerts. When Cilium is the CNI, Hubble owns
+> intra-cluster flow observability; Wirescale exports cross-cluster and
+> egress flows in Hubble-compatible format for a unified view.
+> See [CILIUM-INTEGRATION.md §3](CILIUM-INTEGRATION.md#ownership-boundary-egress-fqdn-policy-and-observability).
 
 ### Connection Logging
 
@@ -1787,7 +1793,8 @@ wirescale_directory_ca_verifications_total{} 890
 
 The audit logs can be consumed by standard tools:
 
-- **Hubble** (Cilium's flow observability) -- compatible log format
+- **Hubble** (Cilium's flow observability) -- Wirescale exports cross-cluster
+  and egress flows in Hubble-compatible protobuf format for unified visibility
 - **Grafana** -- dashboards for policy decisions, throughput, peer health,
   cache hit rates, control-plane latency, cross-cluster flows
 - **Elasticsearch/Loki** -- searchable connection logs with identity attribution

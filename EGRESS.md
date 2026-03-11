@@ -1449,49 +1449,80 @@ Compromised pod (fd00:1234:0001:0042::9) begins port scanning
 ## 14. Interaction with Cilium
 
 When Cilium is the intra-cluster CNI, the egress pipeline integrates
-cleanly via ownership boundaries.
+via a clear ownership boundary. There is no ambiguity about which
+component owns what. See [CILIUM-INTEGRATION.md §3](CILIUM-INTEGRATION.md#ownership-boundary-egress-fqdn-policy-and-observability)
+for the authoritative ownership definition.
 
 ### 14.1 Ownership Split
 
 | Concern | Cilium | Wirescale |
 |---------|--------|-----------|
-| Intra-cluster pod-to-pod policy | CiliumNetworkPolicy | Defers to Cilium |
-| Intra-cluster encryption | Cilium WireGuard (cilium_wg0) | Not involved |
-| Cross-cluster connectivity | Not involved | Wirescale WireGuard (wg0) |
-| **Egress to internet** | **CiliumNetworkPolicy egress rules (optional)** | **WirescaleEgressPolicy (primary)** |
-| DNS snooping | Cilium DNS proxy (L7) | Wirescale packet mirror → userspace |
+| Intra-cluster pod-to-pod policy | `CiliumNetworkPolicy` | Defers to Cilium |
+| Intra-cluster encryption | Cilium WireGuard (`cilium_wg0`) | Not involved |
+| Cross-cluster connectivity | Not involved | Wirescale WireGuard (`wg0`) |
+| **Internet egress policy** | **`CiliumNetworkPolicy` egress rules (primary authority)** | **Not involved in policy** |
+| **Internet egress translation** | Not involved | **NPTv6 (ULA→GUA) + NAT64 (IPv4)** |
+| FQDN resolution for policy | Cilium DNS proxy (L7) | Not involved (Cilium owns DNS policy) |
+| DNS64 (NAT64 synthesis) | Not involved | CoreDNS dns64 plugin (translation, not policy) |
 | NPTv6 translation | Not involved | Wirescale nptv6 interface |
 | NAT64 translation | Not involved | Wirescale nat64 interface |
-| Egress gateway | CiliumEgressGateway (if used) | WirescaleEgressGateway |
+| Egress gateway | `CiliumEgressGateway` (if used) | `WirescaleEgressGateway` (translation only) |
 
-### 14.2 Coexistence Strategy
+**Key principle:** Cilium owns the policy decision ("is this pod allowed
+to reach this destination?"). Wirescale owns the translation mechanics
+("how does this pod's ULA address become routable on the internet?").
+There is exactly one policy authority for internet egress:
+`CiliumNetworkPolicy`.
 
-**Option A: Wirescale-only egress (recommended)**
+### 14.2 Coexistence: Single Policy Authority
 
-Cilium handles intra-cluster L3/L4 policy. Wirescale handles all
-internet-bound egress via its own policy engine, NPTv6, NAT64, and
-observability. CiliumNetworkPolicy egress rules are not used for
-internet traffic.
+When Cilium is the CNI, `CiliumNetworkPolicy` egress rules are the
+sole internet egress policy authority. Operators MUST use
+`CiliumNetworkPolicy` (or `CiliumClusterwideNetworkPolicy`) with
+`toFQDNs`, `toCIDR`, or `toEntities` rules to control internet-bound
+traffic. `WirescaleEgressPolicy` MUST NOT be used for internet egress
+in this configuration.
 
-Rationale: Wirescale's FQDN resolution integrates with DNS snooping
-and the threat intelligence pipeline. Running two independent egress
-policy engines creates confusing ordering and potential conflicts.
+Wirescale's role in the egress path is limited to:
 
-**Option B: Layered egress**
+1. **NPTv6 translation** -- rewriting ULA source addresses to GUA so
+   packets are routable on the public internet (§3).
+2. **NAT64 translation** -- converting IPv6 packets to IPv4 for
+   IPv4-only internet destinations (§4).
+3. **Egress flow export** -- emitting Hubble-compatible flow records
+   with FQDN attribution and SNI extraction (§9).
+4. **Threat intelligence** -- supplementary IP blocklists applied at
+   the translation boundary as a defense-in-depth layer beneath
+   Cilium's policy (§10).
+5. **Rate limiting** -- per-pod bandwidth and connection-rate caps at
+   the translation boundary (§8).
 
-Both Cilium and Wirescale enforce egress policy. Cilium's
-CiliumNetworkPolicy applies first (TC on pod veth, Cilium-owned).
-Wirescale's WirescaleEgressPolicy applies second (TC on nptv6/nat64
-interfaces). This provides defense-in-depth but increases operational
-complexity.
+Cilium's TC eBPF program on the pod veth enforces the policy verdict
+before the packet ever reaches Wirescale's translation interfaces.
+Wirescale's translation programs do not duplicate the policy decision.
+
+**When Cilium is NOT present:** `WirescaleEgressPolicy` is the primary
+internet egress authority, as described in sections 6--8 of this
+document.
 
 ### 14.3 Hubble Integration
 
-Wirescale flow logs are exported in Hubble-compatible protobuf format.
-Hubble Relay aggregates flows from both Cilium (intra-cluster) and
-Wirescale (cross-cluster + egress) into a unified flow stream. Hubble
-UI shows end-to-end flow visibility without distinguishing the
+Wirescale flow logs MUST be exported in Hubble-compatible protobuf
+format. Hubble Relay aggregates flows from both Cilium (intra-cluster)
+and Wirescale (cross-cluster + egress) into a unified flow stream.
+Hubble UI shows end-to-end flow visibility without distinguishing the
 enforcement source.
+
+| Flow type | Source | Appears in Hubble |
+|-----------|--------|-------------------|
+| Intra-cluster pod-to-pod | Cilium agent | Yes (native) |
+| Cross-cluster pod-to-pod | Wirescale agent | Yes (via Hubble-compatible export) |
+| Internet egress | Wirescale agent | Yes (via Hubble-compatible export) |
+
+Wirescale's supplementary observability -- FQDN-attributed connection
+logs, SNI extraction, threat detection alerts -- is available via
+additional export formats (IPFIX, JSON, OpenTelemetry) as described in
+§9.3. These MAY also be surfaced as enriched Hubble flow annotations.
 
 ---
 

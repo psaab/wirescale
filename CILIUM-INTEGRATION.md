@@ -89,8 +89,11 @@ and IPv4 compatibility for IPv6-only clusters.
 ### Net Result
 
 ```
-Cilium:      CNI + intra-cluster WireGuard + L3-L7 policy + Hubble + bandwidth
-Wirescale:   Cross-cluster connectivity + CLAT/NAT64/DNS64 + signaling gateways
+Cilium:      CNI + intra-cluster WireGuard + L3-L7 policy + FQDN egress
+             authority + Hubble (intra-cluster) + bandwidth
+Wirescale:   Cross-cluster connectivity + egress translation (NPTv6/NAT64)
+             + CLAT/DNS64 + signaling gateways + Hubble-compatible egress
+             and cross-cluster flow export
 Fabric:      BGP routing for rack /64 and pod /64 (unchanged)
 ```
 
@@ -287,9 +290,85 @@ Tier 3 -- agent -> control:
   TTL cache, NOT CRD watches)
 ```
 
-> **See also:** [EGRESS.md §14](EGRESS.md#14-interaction-with-cilium) defines the
-> egress ownership split when Cilium is the CNI -- Cilium handles intra-cluster
-> policy and L7, Wirescale handles internet egress via NPTv6/NAT64.
+### Ownership Boundary: Egress, FQDN Policy, and Observability
+
+When Cilium and Wirescale are deployed together, operators MUST be able
+to answer a single question without ambiguity: **"Which policy CRD do I
+use for internet egress?"** This section defines the authoritative
+ownership boundary.
+
+#### Internet Egress Policy
+
+**When Cilium is present (Cilium + Wirescale deployment):**
+
+- **`CiliumNetworkPolicy` egress rules are the primary internet egress
+  authority.** Operators MUST use `CiliumNetworkPolicy` (namespace-scoped)
+  or `CiliumClusterwideNetworkPolicy` (cluster-scoped) to control which
+  pods can reach which internet destinations. This includes FQDN-based
+  egress rules (Cilium's DNS proxy resolves domains and dynamically
+  allows connections to resolved IPs).
+
+- **Wirescale provides the translation layer.** Wirescale's NPTv6
+  translates ULA pod addresses to GUA for IPv6 internet access.
+  Wirescale's NAT64/DNS64 provides IPv4 internet access. These are
+  data-plane functions that operate beneath Cilium's policy layer.
+  `WirescaleEgressPolicy` MUST NOT be used for internet egress when
+  Cilium is the CNI.
+
+- **Rationale:** Operators already know Cilium policy. A single policy
+  CRD for all egress (intra-cluster and internet) eliminates confusion.
+  Cilium's DNS proxy integrates natively with `CiliumNetworkPolicy`
+  FQDN rules, providing a unified policy-to-enforcement path.
+
+**When Cilium is NOT present (standalone Wirescale deployment):**
+
+- **`WirescaleEgressPolicy` is the primary internet egress authority.**
+  Wirescale's own egress policy engine (see [EGRESS.md §6](EGRESS.md#6-egress-policy-engine))
+  handles FQDN resolution via DNS snooping, compiles rules to BPF maps,
+  and enforces verdicts at the NPTv6/NAT64 boundary.
+
+#### FQDN Resolution
+
+| Deployment | FQDN Resolution Mechanism | Policy CRD |
+|------------|--------------------------|------------|
+| Cilium + Wirescale | Cilium DNS proxy (L7, Envoy-based) | `CiliumNetworkPolicy` with `toFQDNs` |
+| Wirescale standalone | Wirescale packet mirror + userspace DNS parser | `WirescaleEgressPolicy` with `fqdns` |
+
+When Cilium is present, Cilium's DNS proxy is the sole DNS policy
+enforcement point for intra-cluster and internet-bound DNS. Wirescale
+MUST NOT run its own DNS snooping for internet egress policy in this
+configuration. Wirescale's DNS64 plugin (for NAT64 IPv4 synthesis) is
+unaffected -- it operates at the CoreDNS level, not the policy level.
+
+#### Observability
+
+| Flow Type | Owner | Export |
+|-----------|-------|--------|
+| Intra-cluster (pod-to-pod, same cluster) | Cilium Hubble | Native Hubble events |
+| Cross-cluster (pod-to-pod, different clusters) | Wirescale | Hubble-compatible protobuf via Hubble Relay |
+| Internet egress (pod-to-internet) | Wirescale | Hubble-compatible protobuf via Hubble Relay |
+
+Hubble Relay aggregates flows from both sources into a unified stream.
+Hubble UI and `hubble observe` display all flows without distinguishing
+the enforcement source. Wirescale MUST emit egress and cross-cluster
+flow records in Hubble's protobuf format so that operators have a single
+observability pane.
+
+Wirescale's supplementary egress observability (FQDN-attributed
+connection logs, SNI extraction, threat detection alerts) is available
+via its own export pipeline (IPFIX, JSON, OpenTelemetry) and MAY also
+be surfaced through Hubble Relay as enriched flow annotations.
+
+#### Quick Reference: "Which CRD Do I Use?"
+
+| I want to... | Cilium + Wirescale | Wirescale standalone |
+|--------------|-------------------|---------------------|
+| Allow pod egress to `api.stripe.com:443` | `CiliumNetworkPolicy` with `toFQDNs` | `WirescaleEgressPolicy` with `fqdns` |
+| Deny all internet egress by default | `CiliumNetworkPolicy` with deny-all egress | `WirescaleEgressPolicy` with `defaultAction: deny` |
+| Allow pod-to-pod within cluster | `CiliumNetworkPolicy` | `WirescalePolicy` |
+| Allow pod-to-pod cross-cluster | `CiliumNetworkPolicy` (intra-cluster hops) + Wirescale mesh policy | `WirescalePolicy` |
+| Rate-limit egress bandwidth per pod | Cilium bandwidth manager (EDT+BBR) | `WirescaleEgressPolicy` `rateLimits` |
+| Quarantine a compromised pod | `CiliumNetworkPolicy` deny rule | `kubectl wirescale quarantine` |
 
 ---
 
@@ -398,7 +477,16 @@ resources with TTL-based cleanup.
 
 ### Observability
 
-Hubble replaces Wirescale's custom audit:
+Hubble replaces Wirescale's custom audit for **intra-cluster flows**.
+Wirescale retains observability ownership for **cross-cluster and
+internet egress flows**, exporting them in Hubble-compatible format so
+that all flows appear in a single Hubble stream.
+
+| Flow type | Observability owner | Export mechanism |
+|-----------|-------------------|-----------------|
+| Intra-cluster (pod-to-pod) | Hubble (Cilium) | Native Hubble events |
+| Cross-cluster (pod-to-pod) | Wirescale | Hubble-compatible protobuf |
+| Internet egress | Wirescale | Hubble-compatible protobuf |
 
 | Capability | Wirescale Audit | Hubble |
 |-----------|----------------|--------|
@@ -408,6 +496,7 @@ Hubble replaces Wirescale's custom audit:
 | UI | None | hubble-ui |
 | Drop reasons | Policy ID only | 30+ detailed reason codes |
 | Prometheus metrics | Custom (wirescale-agent) | Built-in (`hubble_*` metrics) |
+| Egress FQDN attribution | Yes (userspace enrichment) | No (requires Wirescale export) |
 
 Wirescale's deny-only audit logging MAY continue alongside Hubble for
 environments where Hubble's always-on tracing overhead is unacceptable.
@@ -415,7 +504,8 @@ The two use separate event pipelines and do not conflict.
 
 > **See also:** [EGRESS.md §9.3](EGRESS.md#93-flow-export) describes
 > Hubble-compatible egress flow export so that egress events appear in Hubble
-> alongside Cilium's intra-cluster flows.
+> alongside Cilium's intra-cluster flows. The ownership boundary is defined
+> in [§3 Ownership Boundary](#ownership-boundary-egress-fqdn-policy-and-observability).
 
 ---
 
@@ -1040,7 +1130,7 @@ compares per-node resource consumption as the deployment grows:
 | **Selective encryption** | wirescale-agent eBPF | Not available in Cilium | Wirescale still needed |
 | **L3/L4 policy** | wirescale-agent TC eBPF | Cilium TC eBPF | Replaced |
 | **L7 policy** | Not available | Cilium + Envoy | Added |
-| **FQDN egress** | Not available | Cilium DNS proxy | Added |
+| **FQDN egress** | WirescaleEgressPolicy (DNS snooping) | Cilium DNS proxy | Replaced (Cilium is authority) |
 | **CLAT (per-pod IPv4)** | wirescale-agent | wirescale-agent | Unchanged |
 | **NAT64** | wirescale-agent (per-node) | wirescale-agent (per-node) | Unchanged |
 | **DNS64** | CoreDNS dns64 plugin | CoreDNS dns64 plugin | Unchanged |
@@ -1050,7 +1140,8 @@ compares per-node resource consumption as the deployment grows:
 | **Cross-cluster identity** | Pull-based via wirescale-control | Pull-based via global directory | Updated (three-tier) |
 | **Policy CRD** | WirescalePolicy | CiliumNetworkPolicy | Replaced |
 | **Time-bounded access** | WirescaleAccessGrant | Not available | Wirescale still needed |
-| **Observability** | Custom BPF ringbuf | Hubble | Replaced (richer) |
+| **Observability (intra-cluster)** | Custom BPF ringbuf | Hubble | Replaced (richer) |
+| **Observability (egress + cross-cluster)** | Custom BPF ringbuf | Wirescale Hubble-compatible export | Retained (Hubble-compatible) |
 | **Bandwidth management** | Not available | Cilium EDT + BBR | Added |
 | **External peers** | WirescaleExternalPeer | WirescaleExternalPeer (via control) | Unchanged |
 | **Multi-cluster identity** | Federated wirescale-control | Via global directory + control | Updated (three-tier) |
@@ -1060,16 +1151,19 @@ compares per-node resource consumption as the deployment grows:
 ### Summary Scorecard
 
 ```
-Functions moved to Cilium:          8  (CNI, IPAM, intra-cluster WG, intra-cluster
+Functions moved to Cilium:          9  (CNI, IPAM, intra-cluster WG, intra-cluster
                                         policy, intra-cluster identity, routes,
-                                        observability, bandwidth)
-Functions retained by Wirescale:    8  (CLAT, NAT64, DNS64, XDP firewall,
+                                        observability, FQDN egress authority,
+                                        bandwidth)
+Functions retained by Wirescale:    9  (CLAT, NAT64, DNS64, XDP firewall,
                                         cross-cluster WG, external peers,
-                                        time-bounded access, selective encryption)
-Functions added by Cilium:          3  (L7 policy, FQDN egress, bandwidth mgmt)
+                                        time-bounded access, selective encryption,
+                                        egress translation + supplementary observability)
+Functions added by Cilium:          2  (L7 policy, bandwidth mgmt)
 Functions updated for three-tier:   3  (cross-cluster identity, multi-cluster,
                                         global directory)
-Functions lost:                     0  (time-bounded access adapted via controller)
+Functions lost:                     0  (time-bounded access adapted via controller;
+                                        FQDN egress replaced by Cilium DNS proxy)
 ```
 
 ---
@@ -1079,8 +1173,8 @@ Functions lost:                     0  (time-bounded access adapted via controll
 ### When to Use Cilium + Wirescale (Recommended for Most Deployments)
 
 - You need **L7 policy** (HTTP path filtering, gRPC method control)
-- You need **FQDN-based egress control** (allow only specific domains)
-- You need **Hubble** for deep network observability
+- You need **FQDN-based egress control** via `CiliumNetworkPolicy` `toFQDNs`
+- You need **Hubble** for unified intra-cluster + egress flow observability
 - You need **bandwidth management** (per-pod rate limiting)
 - You need **IPv4 compatibility** in IPv6-only clusters (CLAT/NAT64)
 - You want **netkit** performance improvements (Linux 6.8+)
@@ -1147,10 +1241,10 @@ Functions lost:                     0  (time-bounded access adapted via controll
 | DNS64 | Yes | External only | Yes |
 | L3/L4 policy | Yes | Yes | Yes (Cilium) |
 | L7 policy | No | Yes | Yes (Cilium) |
-| FQDN egress | No | Yes | Yes (Cilium) |
+| FQDN egress | Yes (Wirescale) | Yes | Yes (Cilium) |
 | Time-bounded access | Yes | No | Yes (Wirescale) |
 | XDP ingress firewall | Yes | No (TC-based) | Yes (Wirescale) |
-| Hubble observability | No | Yes | Yes (Cilium) |
+| Hubble observability | No | Yes | Yes (Cilium intra-cluster + Wirescale egress/cross-cluster) |
 | Bandwidth management | No | Yes | Yes (Cilium) |
 | External non-k8s peers | Yes | No | Yes (Wirescale) |
 | Cross-cluster identity (on-demand) | Yes | No (full sync) | Yes (Wirescale) |
