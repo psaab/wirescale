@@ -107,7 +107,8 @@ Cilium integration affects each tier differently.
 
 ### Tier 1: Global Directory (`wirescale-directory`)
 
-The global directory is the root of trust for cross-cluster operations.
+The global directory is the discovery service for cross-cluster operations
+(trust is rooted in the offline federation root CA, not the directory).
 It maintains O(clusters) state:
 
 ```
