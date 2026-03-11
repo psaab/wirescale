@@ -7,6 +7,14 @@
 > after signaling-plane resolution -- the gateway is a control waypoint,
 > not a data-plane bottleneck.
 >
+> **Addressing mode guidance:** The ULA overlay (`fd00::/8`) is the
+> recommended default for most deployments. GUA routable mode
+> (`2000::/3`) is an **advanced configuration** that makes every pod
+> potentially reachable from the internet and MUST NOT be enabled without
+> satisfying the preflight safety gates defined in Section 2.5 of this
+> document. See also [SECURITY.md](SECURITY.md) and
+> [OPERATIONS.md](OPERATIONS.md) for related operational requirements.
+>
 > Status: design document for hierarchical routable-prefix mode. Treat
 > statements as target architecture unless explicitly tied to implementation
 > artifacts.
@@ -32,6 +40,7 @@
 
 1. [The /64-per-Host Model](#1-the-64-per-host-model)
 2. [Hierarchical Prefix Allocation](#2-hierarchical-prefix-allocation)
+   - 2.5 [Prerequisites and Safety Gates for GUA Mode](#25-prerequisites-and-safety-gates-for-gua-mode)
 3. [Two-Level Routing Architecture](#3-two-level-routing-architecture)
 4. [BGP Aggregation Across Sites](#4-bgp-aggregation-across-sites)
 5. [Route Override: Direct Tunnels](#5-route-override-direct-tunnels)
@@ -42,7 +51,7 @@
 10. [Cross-Cluster Connectivity and Signaling Gateway](#10-cross-cluster-connectivity-and-signaling-gateway)
 11. [Scaling Analysis](#11-scaling-analysis)
 12. [Packet Flow Walkthroughs](#12-packet-flow-walkthroughs)
-13. [Security: Internet-Routable Pods](#13-security-internet-routable-pods)
+13. [Security: Internet-Routable Pods (Advanced Mode)](#13-security-internet-routable-pods-advanced-mode)
 14. [Deployment Topologies](#14-deployment-topologies)
 15. [Comparison: ULA Overlay vs Hierarchical GUA](#15-comparison-ula-overlay-vs-hierarchical-gua)
 
@@ -308,6 +317,202 @@ IPAM is authoritative and no other device shares the link:
 ```bash
 sysctl -w net.ipv6.conf.eth0.accept_dad=0    # inside pod netns
 ```
+
+---
+
+### 2.5 Prerequisites and Safety Gates for GUA Mode
+
+> **GUA routable-prefix mode is an advanced configuration.** When GUA
+> prefixes are assigned to pods, every pod address is potentially
+> reachable from the global internet. A misconfiguration in policy,
+> firewall, or route advertisement can expose workloads that were never
+> intended to be internet-facing. ULA overlay mode (`fd00::/8`) is the
+> recommended default because pods are unreachable from outside the mesh
+> by construction.
+
+Operators MUST NOT enable GUA mode until **all** of the following
+preflight safety gates are satisfied. `wirescale-control` MUST enforce
+these gates programmatically: if any gate fails, the controller MUST
+reject the `WirescaleMesh` configuration that requests GUA addressing
+and MUST emit a `GUAPreflightFailed` event with a description of the
+failing gate.
+
+#### Gate 1: Cluster-Wide Default-Deny Ingress Baseline
+
+A cluster-scoped `WirescalePolicy` (or equivalent set of per-namespace
+`NetworkPolicy` objects covering every namespace) MUST enforce
+default-deny on ingress for all pods **before** GUA prefixes are
+advertised.
+
+`wirescale-control` MUST verify that:
+
+- A cluster-scoped default-deny ingress `WirescalePolicy` exists with
+  `podSelector: {}` and `policyTypes: ["Ingress"]`, **or**
+- Every namespace in the cluster contains a `NetworkPolicy` or
+  `WirescalePolicy` that selects all pods and specifies `Ingress` in
+  `policyTypes` with no blanket allow-all ingress rule.
+
+If the baseline is removed or weakened while GUA mode is active,
+`wirescale-control` MUST emit a `GUABaselineDegraded` critical alert
+and SHOULD block creation of new external ingress rules until the
+baseline is restored.
+
+```yaml
+# Required baseline -- MUST exist before GUA enablement
+apiVersion: wirescale.io/v1alpha1
+kind: WirescalePolicy
+metadata:
+  name: wirescale-default-deny-ingress
+  labels:
+    wirescale.io/system: "true"
+    wirescale.io/gua-prerequisite: "true"
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+  # No ingress rules = deny all inbound by default
+```
+
+#### Gate 2: XDP Ingress Firewall Health on All Eligible Nodes
+
+The XDP ingress firewall program (see [Section 13](#13-security-internet-routable-pods-advanced-mode))
+MUST be loaded and healthy on **every** node that will receive a GUA pod
+prefix.
+
+`wirescale-control` MUST verify that:
+
+- Every node reports `xdpFirewallStatus: healthy` in its
+  `WirescaleNode` status.
+- The XDP program hash matches the expected known-good hash (see
+  [SECURITY.md Section 14](SECURITY.md#14-bpf-map-access-control) for
+  BPF integrity verification).
+- The `external_ingress_map` BPF map is loaded and the default action
+  is `DROP` (not `PASS`).
+
+If any node fails the XDP health check, `wirescale-control` MUST NOT
+allocate a GUA pod /64 to that node. The node MAY still participate in
+the cluster using ULA addressing if a dual-stack or fallback
+configuration is available.
+
+Operators SHOULD monitor the metric
+`wirescale_xdp_firewall_healthy_nodes / wirescale_total_gua_nodes` and
+alert if the ratio drops below 1.0.
+
+#### Gate 3: Route Advertisement Scope Verification
+
+GUA pod prefixes MUST NOT be advertised beyond the intended scope.
+Accidental global announcement of per-host /64 routes (instead of the
+aggregate /48) can expose the cluster's internal topology and bypass
+perimeter controls.
+
+`wirescale-control` MUST verify that:
+
+- The `WirescaleMesh` configuration specifies an explicit
+  `routeAdvertisement.scope` value. The allowed values are:
+  - `fabric-only` -- /64 routes stay within the cluster fabric; only the
+    covering /48 is announced to the WAN. This is the RECOMMENDED
+    default for GUA mode.
+  - `site` -- /48 is announced to site-internal BGP peers but not to
+    upstream transit providers.
+  - `global` -- /48 is announced to upstream transit. This value
+    requires `routeAdvertisement.acknowledgeGlobalExposure: true`.
+- The `routeAdvertisement.scope` field MUST NOT be omitted when
+  `addressing.mode` is `gua`.
+
+The controller MUST NOT install aggregate routes toward upstream
+gateways until this gate is satisfied. Operators SHOULD additionally
+verify out-of-band (using fabric BGP looking glasses or route
+monitoring) that per-host /64 routes are not leaking beyond the cluster
+fabric.
+
+```yaml
+apiVersion: wirescale.io/v1alpha1
+kind: WirescaleMesh
+metadata:
+  name: default
+spec:
+  addressing:
+    mode: gua                          # Advanced mode -- triggers preflight
+    clusterPrefix: "3fff:1234:0001::/48"
+  routeAdvertisement:
+    scope: fabric-only                 # RECOMMENDED default
+    # scope: global                    # Requires acknowledgeGlobalExposure
+    # acknowledgeGlobalExposure: true  # Operator explicitly accepts risk
+```
+
+#### Gate 4: Namespace-Level Opt-In for External Reachability
+
+Even after cluster-level GUA enablement, individual namespaces MUST
+NOT receive externally reachable prefixes unless the namespace is
+explicitly opted in.
+
+Namespaces MUST carry the label
+`wirescale.io/external-reachable: "true"` before `wirescale-control`
+will compile external ingress rules for pods in that namespace. Pods in
+namespaces without this label:
+
+- Still receive GUA addresses (for outbound and intra-mesh connectivity).
+- Are protected by the XDP ingress firewall, which drops all external
+  inbound traffic to their addresses regardless of any `WirescalePolicy`
+  `ipBlock` rules that reference `::/0`.
+
+`wirescale-control` MUST reject `WirescalePolicy` resources that
+specify external ingress (`ipBlock` with non-cluster CIDRs) if the
+target namespace does not have the opt-in label, and MUST emit a
+`NamespaceNotExternalReachable` warning event.
+
+```yaml
+# Opt-in: allow the 'production' namespace to define external ingress rules
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: production
+  labels:
+    wirescale.io/external-reachable: "true"
+```
+
+#### Gate 5: Controller-Side Preflight Aggregation
+
+`wirescale-control` MUST run all gates (1--4) as a single preflight
+check whenever:
+
+- A `WirescaleMesh` resource is created or updated with
+  `addressing.mode: gua`.
+- A node is added to a cluster that is already in GUA mode.
+- A periodic reconciliation loop runs (RECOMMENDED interval: 5 minutes).
+
+If **any** gate fails:
+
+- The controller MUST set the `WirescaleMesh` status condition
+  `GUAPreflightPassed` to `False` with a human-readable message
+  identifying the failing gate(s).
+- The controller MUST NOT allocate new GUA pod /64 prefixes.
+- The controller MUST NOT compile external ingress rules into XDP maps.
+- Existing GUA allocations and running pods are NOT disrupted (no
+  retroactive teardown), but the operator is on notice to remediate.
+
+```
+Preflight summary (wirescale-control log on GUA enablement):
+
+  [PREFLIGHT] Gate 1 (default-deny baseline):       PASS
+  [PREFLIGHT] Gate 2 (XDP firewall health):          PASS  (142/142 nodes healthy)
+  [PREFLIGHT] Gate 3 (route advertisement scope):    PASS  (scope=fabric-only)
+  [PREFLIGHT] Gate 4 (namespace opt-in):             PASS  (2 namespaces opted in)
+  [PREFLIGHT] Gate 5 (aggregate check):              PASS
+  [PREFLIGHT] GUA mode enabled for 3fff:1234:0001::/48
+```
+
+#### Quick Reference: ULA vs GUA Mode Selection
+
+| Criterion | ULA Overlay (Default) | GUA Routable (Advanced) |
+|-----------|----------------------|------------------------|
+| Pod reachability from internet | Not possible | Possible (when policy allows) |
+| Preflight gates required | No | Yes -- all five gates MUST pass |
+| Default-deny baseline required before enablement | SHOULD | MUST |
+| XDP ingress firewall required | Optional (defense in depth) | MUST be healthy on all GUA nodes |
+| Route advertisement scope | N/A (overlay) | MUST be explicitly configured |
+| Namespace opt-in for external ingress | N/A | MUST be labeled per namespace |
+| Recommended for | Most deployments, shared/untrusted infra | Bare-metal DCs with full fabric control |
 
 ---
 
@@ -1576,19 +1781,36 @@ Tunnel was idle for > 5 minutes and was GC'd.
 
 ---
 
-## 13. Security: Internet-Routable Pods
+## 13. Security: Internet-Routable Pods (Advanced Mode)
+
+> **GUA routable-prefix mode is an advanced configuration.** The
+> preflight safety gates in [Section 2.5](#25-prerequisites-and-safety-gates-for-gua-mode)
+> MUST be satisfied before GUA mode is enabled. ULA overlay is the
+> recommended default for most deployments.
 
 ### The Critical Difference
 
 With ULA pods behind a WireGuard overlay, pods are invisible to the
 internet by construction. With GUA pods, **every pod is reachable from
 the internet** unless routing and firewalls block it. This makes policy
-enforcement **mandatory for basic security.**
+enforcement **mandatory for basic security.** The risk profile of GUA
+mode depends on multiple safeguards being correct simultaneously:
+default-deny policy, XDP ingress firewalls, route advertisement scope,
+and namespace-level opt-in. A failure in **any one** of these layers
+can expose workloads to the public internet.
+
+For this reason, GUA mode is classified as an advanced configuration
+that requires explicit opt-in and verified preflight gates (see
+[Section 2.5](#25-prerequisites-and-safety-gates-for-gua-mode)).
+Operators SHOULD start with ULA overlay and migrate to GUA only after
+the security posture is validated.
 
 ### Mandatory Default-Deny
 
-Recommended baseline in GUA mode: install a cluster-wide default-deny
-ingress policy for all pods:
+`wirescale-control` MUST NOT enable GUA addressing unless a
+cluster-wide default-deny ingress baseline is verified (Gate 1 in
+[Section 2.5](#25-prerequisites-and-safety-gates-for-gua-mode)).
+The baseline policy:
 
 ```yaml
 # Example baseline policy (cluster operator applied)
@@ -1607,20 +1829,29 @@ spec:
   # No ingress rules = deny all inbound by default
 ```
 
-When this baseline is enabled:
+When this baseline is active:
 - Pod-to-pod communication within the cluster: **blocked** until explicitly
-  allowed by a WirescalePolicy or NetworkPolicy
-- Inbound from the internet: **blocked** by default
-- Outbound from pods: **allowed** by default (can be restricted per-policy)
+  allowed by a WirescalePolicy or NetworkPolicy.
+- Inbound from the internet: **blocked** by default.
+- Outbound from pods: **allowed** by default (can be restricted per-policy).
 
-Operational requirement:
+Normative requirements for GUA mode:
 - Production deployments with internet-routable pod prefixes MUST enforce
   explicit ingress policy before exposing workloads externally.
-- Platform defaults SHOULD include cluster-wide deny-baseline policy and
+- Platform defaults MUST include the cluster-wide deny-baseline policy and
   narrowly scoped allow rules.
+- Namespace-level opt-in (Gate 4 in
+  [Section 2.5](#25-prerequisites-and-safety-gates-for-gua-mode)) MUST be
+  satisfied before external ingress rules are compiled for a namespace.
+- The XDP ingress firewall (Gate 2) MUST be healthy on every node before
+  any external traffic is admitted.
+- Removal of the default-deny baseline while GUA mode is active MUST
+  trigger a `GUABaselineDegraded` critical alert.
 
 ### Ingress Firewall (eBPF on Physical NIC)
 
+The XDP ingress firewall is a **mandatory prerequisite** for GUA mode
+(Gate 2 in [Section 2.5](#25-prerequisites-and-safety-gates-for-gua-mode)).
 In addition to per-pod policy on veths, the agent installs an XDP program
 on the physical NIC that drops traffic to pod addresses from outside the
 cluster unless it matches an explicit allow rule:
@@ -1662,8 +1893,10 @@ pods before traffic even reaches the kernel stack.
 
 ### Exposing Services (Explicit Ingress)
 
-To allow external traffic to reach a pod, a `WirescalePolicy` with
-external ingress MUST be created:
+To allow external traffic to reach a pod, **two** conditions MUST be
+met: the pod's namespace MUST carry the `wirescale.io/external-reachable:
+"true"` label (Gate 4), and a `WirescalePolicy` with external ingress
+MUST be created:
 
 ```yaml
 apiVersion: wirescale.io/v1alpha1
@@ -1870,27 +2103,32 @@ Requires:
 
 ### When to Use Which
 
-**Use ULA + WireGuard Overlay when:**
+**Use ULA + WireGuard Overlay when (RECOMMENDED DEFAULT):**
 - Running on shared/untrusted infrastructure (public cloud, multi-tenant)
 - No control over the network fabric (can't get pod /64 routes installed)
 - IPv6 globally routable space not available
 - Maximum security is more important than maximum performance
 - Small scale (< 1,000 nodes)
+- The team has not yet validated the GUA preflight safety gates
 
-**Use Flat GUA + Native Routing when:**
+**Use Flat GUA + Native Routing when (ADVANCED -- requires preflight gates):**
 - Single cluster, single site
 - Full control over the network fabric (BGP routing for pod /64s)
 - Performance is critical (financial trading, HPC, media streaming)
 - No cross-cluster communication needed
 - Scale up to ~10,000 nodes per cluster
+- All GUA preflight safety gates pass (see
+  [Section 2.5](#25-prerequisites-and-safety-gates-for-gua-mode))
 
-**Use Hierarchical GUA + On-Demand Peering when:**
+**Use Hierarchical GUA + On-Demand Peering when (ADVANCED -- requires preflight gates):**
 - Multiple clusters across one or more sites
 - Operating at 10,000+ total nodes
 - Per-node state MUST remain bounded regardless of fleet growth
 - Cross-cluster encryption is required but gateway relay is a bottleneck
 - The deployment spans multiple sites or regions
 - Gateway should be signaling-only, not a data-plane chokepoint
+- All GUA preflight safety gates pass (see
+  [Section 2.5](#25-prerequisites-and-safety-gates-for-gua-mode))
 
 **Use both simultaneously (hybrid) when:**
 - Some clusters use GUA (datacenter, bare metal)

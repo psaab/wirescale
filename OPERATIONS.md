@@ -15,6 +15,9 @@
 - [ARCHITECTURE.md](ARCHITECTURE.md) -- Core architecture (three-tier hierarchy, on-demand peering)
 - [PERFORMANCE.md](PERFORMANCE.md) -- Line-rate performance engineering
 - [SECURITY.md](SECURITY.md) -- Network security, identity model, Prometheus metrics (Section 12)
+- [ROUTABLE-PREFIX.md](ROUTABLE-PREFIX.md) -- GUA routable-prefix design
+  (Section 2.5 defines the preflight safety gates that Section 6 below
+  operationalizes)
 
 ---
 
@@ -25,6 +28,7 @@
 3. [Monitoring and Alerting](#3-monitoring-and-alerting)
 4. [Backup and Disaster Recovery](#4-backup-and-disaster-recovery)
 5. [Testing Strategy](#5-testing-strategy)
+6. [GUA Mode Preflight Checklist](#6-gua-mode-preflight-checklist)
 
 ---
 
@@ -420,3 +424,115 @@ rotation cycles.
 | Certificate expiry | Handshake failures detected. Alert fires. Manual or auto-rotation restores connectivity. |
 | Directory quorum loss | Intra-cluster unaffected. Cross-cluster new peers blocked. Cached peers continue. |
 | BPF map exhaustion | New lookups fail. Agent logs map-full. Alert fires. Increase map size and redeploy. |
+| GUA preflight gate regression | `GUABaselineDegraded` alert fires. New external ingress rules blocked. Existing traffic unaffected. Remediate and re-verify. |
+
+---
+
+## 6. GUA Mode Preflight Checklist
+
+> GUA routable-prefix mode is an **advanced configuration** where every
+> pod receives a globally routable IPv6 address. Before enabling GUA
+> mode, operators MUST complete the preflight checklist below.
+> `wirescale-control` enforces these gates programmatically, but
+> operators SHOULD also perform the manual verification steps to confirm
+> end-to-end correctness.
+>
+> **ULA overlay (`fd00::/8`) is the RECOMMENDED default.** Only proceed
+> with GUA enablement after the security posture is validated. See
+> [ROUTABLE-PREFIX.md Section 2.5](ROUTABLE-PREFIX.md#25-prerequisites-and-safety-gates-for-gua-mode)
+> for the normative gate definitions and
+> [SECURITY.md](SECURITY.md#gua-routable-prefix-mode-advanced-security-posture)
+> for the threat model context.
+
+### 6.1 Pre-Enablement Checklist
+
+Complete **every** item before setting `addressing.mode: gua` in the
+`WirescaleMesh` resource.
+
+#### Gate 1: Default-Deny Ingress Baseline
+
+| # | Step | Command / Verification | Expected Result |
+|---|------|----------------------|-----------------|
+| 1.1 | Verify cluster-scoped default-deny policy exists | `kubectl get wirescalepolicy wirescale-default-deny-ingress -o yaml` | Policy exists with `podSelector: {}`, `policyTypes: ["Ingress"]`, no ingress rules |
+| 1.2 | OR verify per-namespace coverage | `kubectl get networkpolicy -A -o json \| jq '[.items[] \| select(.spec.policyTypes \| index("Ingress"))] \| length'` | Count equals total namespace count (every namespace covered) |
+| 1.3 | Verify no blanket allow-all ingress rules exist | `kubectl get wirescalepolicy -A -o json \| jq '.items[] \| select(.spec.ingress[]?.from[]?.ipBlock?.cidr == "::/0")'` | No results (or only in namespaces with `wirescale.io/external-reachable: "true"`) |
+| 1.4 | Confirm controller reports gate passed | `kubectl get wirescalemesh default -o jsonpath='{.status.conditions[?(@.type=="GUAPreflightPassed")].status}'` | `True` |
+
+#### Gate 2: XDP Ingress Firewall Health
+
+| # | Step | Command / Verification | Expected Result |
+|---|------|----------------------|-----------------|
+| 2.1 | Verify all nodes report XDP healthy | `kubectl get wirescalenodes -o jsonpath='{range .items[*]}{.metadata.name}{"\t"}{.status.xdpFirewallStatus}{"\n"}{end}'` | Every node shows `healthy` |
+| 2.2 | Verify XDP program hash matches known-good | `kubectl wirescale xdp-status --verify-hash` | `OK: all nodes match expected hash` |
+| 2.3 | Verify default XDP action is DROP | On each node: `bpftool prog show \| grep wirescale_ingress_firewall` and verify the `external_ingress_map` default is DROP | Program loaded, default action = DROP |
+| 2.4 | Check firewall health ratio | `curl -s :9091/metrics \| grep wirescale_xdp_firewall_healthy_nodes` | `wirescale_xdp_firewall_healthy_nodes / wirescale_total_gua_nodes == 1.0` |
+
+#### Gate 3: Route Advertisement Scope
+
+| # | Step | Command / Verification | Expected Result |
+|---|------|----------------------|-----------------|
+| 3.1 | Verify `routeAdvertisement.scope` is set | `kubectl get wirescalemesh default -o jsonpath='{.spec.routeAdvertisement.scope}'` | `fabric-only` (RECOMMENDED), `site`, or `global` |
+| 3.2 | If scope is `global`, verify acknowledgment | `kubectl get wirescalemesh default -o jsonpath='{.spec.routeAdvertisement.acknowledgeGlobalExposure}'` | `true` |
+| 3.3 | Verify /64 routes do NOT leak beyond fabric | Check fabric BGP looking glass or route monitoring tool | Per-host /64 routes visible only within cluster fabric; only the aggregate /48 visible at site border or upstream |
+| 3.4 | Verify aggregate /48 is correctly announced | `ip -6 route show \| grep <cluster-prefix>` on a border router or peer | Single /48 aggregate present |
+
+#### Gate 4: Namespace Opt-In
+
+| # | Step | Command / Verification | Expected Result |
+|---|------|----------------------|-----------------|
+| 4.1 | List namespaces opted in for external reachability | `kubectl get ns -l wirescale.io/external-reachable=true` | Only namespaces that intentionally host internet-facing services |
+| 4.2 | Verify non-opted-in namespaces have no external ingress rules | `kubectl get wirescalepolicy -A -o json \| jq '.items[] \| select(.spec.ingress[]?.from[]?.ipBlock?) \| .metadata.namespace' \| sort -u` | All listed namespaces are in the opted-in set from 4.1 |
+| 4.3 | Verify controller rejects external ingress for non-opted-in namespaces | Create a test `WirescalePolicy` with `ipBlock.cidr: "::/0"` in a non-opted-in namespace | Rejected with `NamespaceNotExternalReachable` event |
+
+#### Gate 5: Controller Preflight Aggregation
+
+| # | Step | Command / Verification | Expected Result |
+|---|------|----------------------|-----------------|
+| 5.1 | Verify all gates pass in controller status | `kubectl get wirescalemesh default -o jsonpath='{.status.conditions[?(@.type=="GUAPreflightPassed")]}'` | `status: "True"`, `reason: "AllGatesPassed"` |
+| 5.2 | Check controller logs for preflight summary | `kubectl logs -n wirescale-system -l app=wirescale-control \| grep PREFLIGHT` | All five gates show `PASS` |
+| 5.3 | Verify no `GUAPreflightFailed` events | `kubectl get events -n wirescale-system --field-selector reason=GUAPreflightFailed` | No events |
+
+### 6.2 Post-Enablement Verification
+
+After setting `addressing.mode: gua` and confirming the preflight
+passes:
+
+| # | Step | Command / Verification | Expected Result |
+|---|------|----------------------|-----------------|
+| 6.1 | Verify pods receive GUA addresses | `kubectl get pods -A -o wide \| grep 3fff:` | Pods show GUA addresses from the cluster prefix |
+| 6.2 | Verify intra-cluster connectivity | `kubectl exec -it test-pod -- ping6 -c 3 <pod-on-another-node>` | 0% packet loss |
+| 6.3 | Verify external inbound is blocked by default | From an external host: `nc -6 -z <pod-gua-address> 8080` | Connection refused or timeout (XDP drops) |
+| 6.4 | Verify opted-in namespace allows external ingress | Create `WirescalePolicy` allowing `::/0` on port 443 in an opted-in namespace, then connect from external host | Connection succeeds on port 443 only |
+| 6.5 | Verify non-opted-in namespace blocks external ingress | From an external host: `nc -6 -z <pod-in-non-opted-ns> 443` | Connection refused or timeout |
+| 6.6 | Verify outbound IPv6 works without SNAT | `kubectl exec -it test-pod -- curl -6 -s https://ipv6.icanhazip.com` | Returns the pod's GUA address |
+
+### 6.3 Ongoing Monitoring for GUA Mode
+
+The following alerts MUST be configured when GUA mode is active, in
+addition to the standard alerts in Section 3.3:
+
+| Alert | Condition | Severity | Action |
+|-------|----------|----------|--------|
+| `GUABaselineDegraded` | Default-deny ingress policy removed or weakened | critical | Restore baseline immediately; new external ingress rules blocked until resolved |
+| `XDPFirewallUnhealthy` | Any GUA node reports `xdpFirewallStatus != healthy` | critical | Investigate node; controller will not allocate new GUA prefixes to unhealthy nodes |
+| `GUAPreflightFailed` | Controller preflight check fails on reconciliation | warning | Identify failing gate from controller logs; remediate before next node addition |
+| `RouteLeakDetected` | Per-host /64 routes observed outside cluster fabric (requires external route monitoring integration) | critical | Withdraw leaked routes immediately; verify fabric BGP filters |
+| `UnauthorizedExternalIngress` | External ingress policy compiled for a namespace without `wirescale.io/external-reachable` label | warning | Should not occur if controller enforcement is working; investigate controller state |
+
+### 6.4 Rollback: GUA to ULA
+
+If GUA mode must be disabled (security incident, misconfiguration, or
+operational decision):
+
+| Step | Action | Impact |
+|------|--------|--------|
+| 1 | Update `WirescaleMesh`: set `addressing.mode: ula` | Controller stops allocating GUA prefixes for new pods |
+| 2 | Cordon and drain nodes one at a time | Pods are rescheduled with ULA addresses; existing GUA pods continue until drained |
+| 3 | Verify no GUA pods remain | `kubectl get pods -A -o wide \| grep 3fff:` returns no results |
+| 4 | Withdraw GUA aggregate from BGP | Remove /48 announcement from site border routers |
+| 5 | Verify ULA connectivity | Intra-cluster: pods use `fd00:1234:` addresses; cross-cluster: WireGuard tunnels |
+
+Rolling back does NOT require cluster downtime. The drain process
+migrates pods incrementally. Cross-cluster connectivity is maintained
+through WireGuard tunnels using ULA addressing throughout the
+rollback.
