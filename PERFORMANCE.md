@@ -25,7 +25,7 @@
 7. [State Scaling Analysis](#7-state-scaling-analysis)
 8. [Hierarchical Prefix Aggregation and Forwarding](#8-hierarchical-prefix-aggregation-and-forwarding)
 9. [Cross-Cluster Performance](#9-cross-cluster-performance)
-10. [Signaling Gateway Performance](#10-signaling-gateway-performance)
+10. [Gateway Performance: Signaling and Relay](#10-gateway-performance-signaling-and-relay)
 11. [Control Plane Scalability](#11-control-plane-scalability)
 12. [Kernel Tuning](#12-kernel-tuning)
 13. [Hardware Acceleration](#13-hardware-acceleration)
@@ -568,9 +568,12 @@ probe packet.
 
 ### Cold Path: Cross-Cluster (Signaling Resolution Chain)
 
-Cross-cluster cold paths traverse the full three-tier hierarchy. The
-signaling gateway handles initial resolution only -- it is NOT in the
-steady-state data path:
+Cross-cluster cold paths traverse the full three-tier hierarchy. In
+direct mode, the signaling gateway handles initial resolution only and is
+not in the steady-state data path. In relay mode (when nodes lack mutual
+reachability), the gateway also forwards encrypted data -- see
+[Section 10](#10-gateway-performance-signaling-and-relay) for relay
+performance characteristics:
 
 ```
 Cross-cluster cold path:
@@ -593,10 +596,13 @@ Cross-cluster cold path:
 | 6 | WireGuard handshake (cross-site RTT) | ~10-100 ms |
 | **Total** | **Cross-cluster cold path** | **~30-150 ms** |
 
-After the cold path completes, the WireGuard tunnel operates directly
-between the source and destination nodes. All subsequent packets take the
-warm path with zero signaling overhead. The signaling gateway and
-directory are never touched again for this peer pair.
+After the cold path completes, the WireGuard tunnel operates between the
+source and destination nodes. In direct mode, all subsequent packets take
+the warm path with zero signaling overhead -- the signaling gateway and
+directory are not touched again for this peer pair. In relay mode (when
+direct reachability is unavailable), the relay gateway forwards encrypted
+packets, adding ~0.1-2 ms of latency per hop (see
+[Section 10.4](#104-relay-slo-targets)).
 
 ### Peer Garbage Collection
 
@@ -1129,9 +1135,12 @@ With hierarchical prefix aggregation:
 ## 9. Cross-Cluster Performance
 
 Wirescale supports cross-cluster communication through the three-tier
-control hierarchy with signaling gateways. The performance characteristics
-differ from same-cluster communication in cold-path latency only -- the
-steady-state data path is identical.
+control hierarchy with signaling gateways. In direct mode (the default when
+nodes have mutual reachability), performance characteristics differ from
+same-cluster communication in cold-path latency only -- the steady-state
+data path is identical. In relay mode (when nodes lack mutual reachability),
+the relay gateway adds ~0.1-2 ms of forwarding latency per packet (see
+[Section 10](#10-gateway-performance-signaling-and-relay)).
 
 ### Cross-Cluster Cold Path (Detailed)
 
@@ -1173,14 +1182,21 @@ to same-cluster encrypted performance at the same physical distance.
 WireGuard does not distinguish between same-cluster and cross-cluster
 peers -- the crypto overhead is the same.
 
-**Critical property: the signaling gateway is NOT in the data path.**
-After the initial resolution, the WireGuard tunnel runs directly between
-the two nodes. This means:
+**Critical property: in direct mode, the signaling gateway is NOT in the
+data path.** In relay mode (when nodes lack mutual reachability), the
+gateway forwards encrypted data -- see [Section 10](#10-gateway-performance-signaling-and-relay)
+for relay performance targets and capacity planning.
+In direct mode, after the initial resolution, the WireGuard tunnel runs
+directly between the two nodes. This means:
 
 - No throughput bottleneck at the gateway
 - No added latency in steady state
 - No single point of failure for established flows
 - No bandwidth overhead proportional to cross-cluster traffic volume
+
+In relay mode, the gateway forwards encrypted packets on the steady-state
+path. Relay gateways MUST be sized for the expected relay traffic volume
+(see [Section 10.3](#103-relay-capacity-targets)).
 
 ### Cross-Cluster Identity Resolution
 
@@ -1209,28 +1225,31 @@ latency to established flows.
 
 ---
 
-## 10. Signaling Gateway Performance
+## 10. Gateway Performance: Signaling and Relay
 
-The signaling gateway handles cross-cluster peer resolution requests. It
-is a control-plane component only -- it never touches data-plane packets.
+Gateways serve two roles: **signaling** (cross-cluster peer resolution) and
+**relay** (data forwarding for nodes without mutual reachability). The
+performance characteristics differ fundamentally between these modes.
 
-### Signaling Gateway Is NOT a Data-Path Component
+### 10.1 Direct Mode vs. Relay Mode Performance
 
-This distinction is critical for understanding the performance model:
+| Property | Direct Mode (signaling-only) | Relay Mode (data forwarding) |
+|----------|---------------------------|----------------------------|
+| Gateway data-path role | None after initial resolution | Active relay for duration of peer session |
+| Throughput limit | N/A (gateway off data path) | Gateway NIC + CPU bound |
+| Latency overhead | Zero after resolution | ~0.1-2 ms additional per hop |
+| Gateway scaling driver | New-flow rate (resolutions/sec) | Aggregate relay traffic volume |
+| Failure impact | Only new connections affected | Relayed sessions disrupted (direct peers unaffected) |
 
-| Property | Traditional VPN Gateway | Wirescale Signaling Gateway |
-|----------|----------------------|---------------------------|
-| Data path | All cross-cluster traffic flows through | Never in data path |
-| Throughput limit | Gateway bandwidth caps cross-cluster | No throughput limit |
-| Latency impact | Added hop on every packet | Zero after initial resolution |
-| Scaling model | Scale with traffic volume | Scale with new-flow rate only |
-| Failure impact | All cross-cluster traffic drops | Only new connections affected |
+Direct mode is the default and SHOULD be the dominant mode in well-peered
+networks. Relay mode is a first-class supported mode for environments where
+direct node-to-node reachability is unavailable.
 
-### Signaling Load Model
+### 10.2 Signaling Performance
 
-The gateway handles signaling traffic only: cross-cluster peer resolution
-requests and responses. The load is proportional to the rate of new
-cross-cluster connections, NOT to the volume of cross-cluster traffic.
+The signaling function handles cross-cluster peer resolution requests.
+Signaling load is proportional to the rate of new cross-cluster connections,
+NOT to the volume of cross-cluster traffic.
 
 | Metric | Estimate |
 |--------|---------|
@@ -1241,7 +1260,7 @@ cross-cluster connections, NOT to the volume of cross-cluster traffic.
 | Bandwidth (burst) | < 5 MB/s |
 | CPU per resolution | < 0.1 ms (metadata lookup + auth check) |
 
-### Signaling Gateway Sizing
+**Signaling gateway sizing:**
 
 | Fleet Scale | Clusters | Peak Resolutions/sec | Recommended Replicas |
 |-----------|---------|---------------------|---------------------|
@@ -1250,21 +1269,171 @@ cross-cluster connections, NOT to the volume of cross-cluster traffic.
 | Large | 50-200 | ~20K | 5-10 |
 | Hyperscale | 200-1000 | ~100K | 10-20 |
 
-The gateway scales horizontally. Each replica handles ~10K resolutions/sec.
-State is minimal (O(clusters) directory entries) and can be replicated
-across all instances.
+Each signaling replica handles ~10K resolutions/sec. State is minimal
+(O(clusters) directory entries) and can be replicated across all instances.
 
-### Failure Modes
+### 10.3 Relay Capacity Targets
+
+When gateways operate in relay mode, they forward encrypted WireGuard
+packets between nodes. Relay capacity MUST be planned based on the expected
+volume of relayed traffic.
+
+**Throughput per relay node:**
+
+| Link Speed | Target Relay Throughput | CPU Cores | Notes |
+|-----------|----------------------|-----------|-------|
+| 10 Gbps NIC | 8 Gbps sustained | 2-4 | WireGuard re-encap overhead |
+| 25 Gbps NIC | 20 Gbps sustained | 4-8 | GRO/GSO batching critical |
+| 100 Gbps NIC | 60-80 Gbps sustained | 8-16 | Multi-queue RSS required |
+
+**Maximum relayed connections per gateway node:**
+
+| Metric | Target |
+|--------|--------|
+| Max concurrent relay sessions | 10,000 per gateway node |
+| Memory per relay session | ~4 KB (WireGuard peer state + forwarding entry) |
+| Total relay state memory | ~40 MB at 10K sessions |
+| Session establishment rate | ~1,000 new relay sessions/sec |
+
+**Relay gateway sizing (by relayed traffic volume):**
+
+| Deployment Profile | Expected Relay % | Relay Throughput | Recommended Gateways |
+|-------------------|-----------------|-----------------|---------------------|
+| Flat network (all direct) | < 1% | Minimal | 2-3 (signaling only) |
+| Hybrid (some NAT) | 5-15% | 1-10 Gbps aggregate | 3-5 (relay-capable) |
+| Enterprise (heavy NAT) | 30-60% | 10-50 Gbps aggregate | 5-10 (relay-sized) |
+| Fully NATed (all relay) | 100% | Matches total cross-cluster BW | 10+ (scale with traffic) |
+
+### 10.4 Relay SLO Targets
+
+| Metric | Direct Mode | Relay Mode | Budget |
+|--------|------------|------------|--------|
+| Steady-state latency overhead | 0 ms (no gateway hop) | < 2 ms additional | WireGuard encap/decap at relay |
+| Cold-path establishment | ~30-65 ms | ~35-75 ms | +5-10 ms for relay allocation |
+| Throughput per flow | Line rate (WireGuard limited) | Line rate minus relay overhead | ~5-10% overhead from extra hop |
+| Packet loss during relay failover | N/A | < 0.1% (sub-second failover) | HA relay with session state sync |
+
+**Latency breakdown for relayed path:**
+```
+Relay-mode latency overhead (per packet, steady state):
+  Source node encrypt:           ~5 μs (same as direct)
+  Source -> relay (network):     ~0.05-1 ms (intra-DC or intra-region)
+  Relay forwarding (no decrypt): ~10-50 μs (kernel forwarding, opaque)
+  Relay -> destination (network): ~0.05-1 ms
+  Destination decrypt:           ~5 μs (same as direct)
+  Total additional vs direct:    ~0.1-2 ms
+```
+
+The relay gateway does NOT decrypt or re-encrypt traffic. It forwards
+opaque WireGuard ciphertext, so the relay forwarding cost is limited to
+kernel packet forwarding overhead (~10-50 us per packet).
+
+### 10.5 Relay Overload and Fairness
+
+Relay gateways MUST implement admission control and per-source fairness
+to prevent a single node or cluster from monopolizing relay capacity.
+
+**Per-source rate limiting:**
+- Each relay gateway MUST enforce a configurable per-source bandwidth limit
+  (default: 1 Gbps per source node).
+- Rate limiting MUST be implemented at the kernel level (TC or eBPF) to
+  avoid userspace overhead.
+- When a source exceeds its rate limit, excess packets MUST be dropped with
+  a counter increment (not queued indefinitely).
+
+**Admission control:**
+- Relay gateways MUST reject new relay session requests when:
+  - Active relay session count exceeds `maxSessionsPerNode` (default 10,000)
+  - Aggregate relay throughput exceeds `maxRelayThroughputBps` (default 10 Gbps)
+- Rejection MUST include a backpressure signal so the requesting agent can
+  retry on a different relay gateway.
+- Control MUST implement relay gateway selection with capacity awareness:
+  prefer gateways with lower utilization, same-region locality, and
+  available session headroom.
+
+**Fairness policy:**
+| Resource | Limit | Enforcement |
+|----------|-------|-------------|
+| Bandwidth per source node | Configurable (default 1 Gbps) | TC/eBPF rate limiter |
+| Sessions per source node | Configurable (default 1,000) | Control-plane admission |
+| Aggregate throughput per gateway | Configurable (default 10 Gbps) | TC shaping + admission control |
+| Session establishment rate | 1,000/sec per gateway | Control-plane throttle |
+
+### 10.6 Relay Observability
+
+Operators MUST have visibility into the split between direct and relayed
+traffic to detect misconfigurations, network changes, and capacity issues.
+
+**Gateway relay metrics (exposed at `:9090/metrics` on gateway nodes):**
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `wirescale_relay_active_sessions` | gauge | Current number of active relay sessions |
+| `wirescale_relay_sessions_total` | counter | Total relay sessions established |
+| `wirescale_relay_bytes_total{direction="rx\|tx"}` | counter | Total bytes relayed |
+| `wirescale_relay_utilization_ratio` | gauge | Current relay throughput / max capacity |
+| `wirescale_relay_rejected_sessions_total` | counter | Sessions rejected due to capacity |
+| `wirescale_relay_per_source_bytes{source="<node>"}` | counter | Bytes relayed per source (top-N) |
+| `wirescale_relay_session_duration_seconds` | histogram | Duration of relay sessions |
+
+**Agent peer-mode metrics (exposed at `:9090/metrics` on all nodes):**
+
+| Metric | Type | Description |
+|--------|------|-------------|
+| `wirescale_peer_mode{mode="direct\|relay"}` | gauge | Peers by connection mode |
+| `wirescale_relay_promotion_attempts_total` | counter | Attempts to upgrade relay -> direct |
+| `wirescale_relay_promotion_successes_total` | counter | Successful relay -> direct upgrades |
+| `wirescale_relay_fallback_total` | counter | Times agent fell back to relay after direct failure |
+
+### 10.7 Relay Failover and HA
+
+Relay gateways MUST be deployed with high availability. A relay gateway
+failure MUST NOT cause permanent loss of relayed connections.
+
+**Relay HA model:**
+- Each cluster MUST deploy a minimum of 2 relay-capable gateway nodes.
+- Relay session state (which source-destination pairs are relayed through
+  which gateway) MUST be tracked by `wirescale-control`.
+- When a relay gateway fails, control MUST reassign affected relay sessions
+  to a surviving gateway within the failover budget.
+
+**Failover behavior:**
+
+| Failure | Detection | Recovery Time | Data Impact |
+|---------|-----------|--------------|-------------|
+| Single relay gateway crash | WireGuard handshake timeout (~5s) | < 10s (session reassignment) | Packet loss during reassignment |
+| Relay gateway graceful drain | Pre-announced via control | < 2s (coordinated migration) | Near-zero packet loss |
+| All relay gateways fail | Control detects all unhealthy | Manual intervention required | Relayed sessions down; direct sessions unaffected |
+| Network partition (relay unreachable) | Handshake timeout | Agent retries alternate gateway | Packet loss during retry |
+
+**Failover flow:**
+```
+1. Relay gateway G1 becomes unreachable
+2. Affected nodes detect WireGuard handshake failure (~5s timeout)
+3. Agents report relay failure to control
+4. Control selects alternate relay gateway G2
+5. Control coordinates new relay setup on G2
+6. Agents reconfigure WireGuard peer endpoint to G2
+7. Relayed traffic resumes through G2
+```
+
+**Graceful drain:**
+Before planned maintenance, a relay gateway SHOULD be drained:
+1. Mark gateway as draining (remove from relay selection pool)
+2. Control reassigns existing relay sessions to other gateways
+3. Wait for all sessions to migrate (timeout: 30s)
+4. Gateway can be safely terminated
+
+### 10.8 Signaling Failure Modes
 
 | Failure | Impact | Recovery |
 |---------|--------|----------|
-| Gateway replica fails | Load redistributes to remaining replicas | Automatic via load balancer |
-| All gateways fail | New cross-cluster connections fail | Existing tunnels continue working |
-| Gateway slow (> 100 ms) | Cross-cluster cold path degrades | Circuit breaker; cached resolutions still work |
+| Signaling replica fails | Load redistributes to remaining replicas | Automatic via load balancer |
+| All signaling gateways fail | New cross-cluster connections fail | Existing direct tunnels and relay sessions continue |
+| Signaling slow (> 100 ms) | Cross-cluster cold path degrades | Circuit breaker; cached resolutions still work |
 
-Existing WireGuard tunnels are unaffected by gateway failures because the
-gateway is not in the data path. Only new cross-cluster peer establishments
-require the gateway.
+Existing WireGuard tunnels (both direct and relayed) are unaffected by
+signaling failures. Only new peer establishment requires signaling.
 
 ---
 
@@ -1685,7 +1854,9 @@ independent of fleet size. FIB entries scale with local host count plus
 cluster count, not with total hosts or pod count (see
 [Section 8](#8-hierarchical-prefix-aggregation-and-forwarding)).
 
-### Target: Signaling Gateway Performance
+### Target: Gateway Performance (Signaling and Relay)
+
+**Signaling targets:**
 
 | Metric | Target |
 |--------|--------|
@@ -1694,7 +1865,19 @@ cluster count, not with total hosts or pod count (see
 | Resolution throughput (per replica) | > 10K/sec |
 | Steady-state bandwidth | < 100 KB/s per cluster |
 | Burst bandwidth (failover) | < 5 MB/s per cluster |
-| Data-plane overhead | Zero (not in path) |
+| Direct-mode data-plane overhead | Zero (not in path) |
+
+**Relay targets:**
+
+| Metric | Target |
+|--------|--------|
+| Relay latency overhead (per hop) | < 2 ms |
+| Relay throughput (per gateway, 25G NIC) | > 20 Gbps sustained |
+| Max concurrent relay sessions (per gateway) | 10,000 |
+| Relay session establishment rate | > 1,000/sec |
+| Relay failover (session reassignment) | < 10 s |
+| Relay-to-direct promotion success rate | > 80% (for transient NAT) |
+| Relay gateway utilization (healthy) | < 70% sustained |
 
 ---
 
