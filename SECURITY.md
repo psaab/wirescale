@@ -14,7 +14,10 @@
 **See also:**
 - [ARCHITECTURE.md](ARCHITECTURE.md) -- Core architecture (ULA overlay model)
 - [PERFORMANCE.md](PERFORMANCE.md) -- Line-rate performance engineering
-- [ROUTABLE-PREFIX.md](ROUTABLE-PREFIX.md) -- Globally routable /64-per-host design
+- [ROUTABLE-PREFIX.md](ROUTABLE-PREFIX.md) -- Globally routable /64-per-host
+  design (GUA mode is advanced; see Section 2.5 for preflight safety gates)
+- [OPERATIONS.md](OPERATIONS.md) -- Operations guide (Section 6 for GUA
+  preflight checklist)
 - [CILIUM-INTEGRATION.md](CILIUM-INTEGRATION.md) -- Architecture comparison with Cilium as CNI
 - [CILIUM-SECURITY-GAPS.md](CILIUM-SECURITY-GAPS.md) -- Security isolation
   gaps in Cilium-only deployments and how Wirescale closes them
@@ -90,6 +93,44 @@ Normative baseline:
   by agents and MUST be refreshed on TTL expiry.
 - No agent MUST watch or receive state for pods that are not involved in active
   flows on that node.
+
+### GUA Routable-Prefix Mode: Advanced Security Posture
+
+GUA mode (globally routable pod addresses from `2000::/3`) is classified
+as an **advanced configuration** in Wirescale. When GUA prefixes are
+assigned to pods, every pod is potentially reachable from the public
+internet. The security of the deployment depends on multiple safeguards
+being correct simultaneously -- default-deny ingress policy, XDP
+ingress firewalls, route advertisement scope control, and namespace-level
+opt-in. A failure in any single layer can result in unintended internet
+exposure.
+
+**ULA overlay mode (`fd00::/8`) is the RECOMMENDED default** for most
+deployments. In ULA mode, pods are unreachable from outside the mesh by
+construction -- no amount of policy misconfiguration can expose them to
+the internet.
+
+GUA mode MUST NOT be enabled without satisfying the preflight safety
+gates defined in [ROUTABLE-PREFIX.md Section 2.5](ROUTABLE-PREFIX.md#25-prerequisites-and-safety-gates-for-gua-mode).
+The gates are enforced by `wirescale-control` and include:
+
+1. **Verified cluster-wide default-deny ingress baseline** -- a
+   cluster-scoped `WirescalePolicy` denying all inbound traffic MUST
+   exist before GUA prefixes are advertised.
+2. **Verified XDP ingress firewall health** -- the XDP program MUST be
+   loaded, healthy, and hash-verified on every node receiving a GUA
+   prefix.
+3. **Verified route advertisement scope** -- the operator MUST
+   explicitly declare whether /48 aggregates are announced to fabric
+   only, site-internal peers, or global transit.
+4. **Namespace-level opt-in** -- namespaces MUST be explicitly labeled
+   before external ingress rules are compiled for their pods.
+5. **Controller-side preflight check** -- `wirescale-control` MUST
+   block GUA enablement if any gate fails and MUST emit a
+   `GUAPreflightFailed` event.
+
+See also: [OPERATIONS.md](OPERATIONS.md) for the operational preflight
+checklist.
 
 ### Layered Defense
 
@@ -1957,6 +1998,8 @@ TIMESTAMP           ACTION  SRC_CLUSTER  SRC                DST_CLUSTER  DST    
 | T17 | Cluster CA compromise | All nodes/pods in that cluster can be impersonated | Blast radius limited to the compromised cluster. Global directory can revoke the cluster. Other clusters are unaffected. CA rotation procedure restores trust. |
 | T18 | Supply chain attack on agent container image loads malicious eBPF | TC program returns `TC_ACT_OK` unconditionally, bypassing all policy enforcement | Image signing, eBPF hash verification, runtime audit, read-only filesystem |
 | T19 | Pull model concentrates communication metadata at wirescale-control | Complete communication graph observable at a single point | Query log retention limits, access control, optional anonymization |
+| T20 | GUA mode enabled without preflight gates (T-GUA-UNGUARDED) | Pods exposed to internet without adequate ingress protection | GUA is classified as advanced mode. `wirescale-control` MUST enforce preflight safety gates (default-deny baseline, XDP firewall health, route advertisement scope, namespace opt-in) before allowing GUA addressing. See [ROUTABLE-PREFIX.md Section 2.5](ROUTABLE-PREFIX.md#25-prerequisites-and-safety-gates-for-gua-mode). |
+| T21 | Accidental /64 route leak to global BGP (T-GUA-ROUTE-LEAK) | Internal cluster topology exposed; per-host routes reachable from internet, bypassing aggregate-level perimeter controls | Route advertisement scope MUST be explicitly declared. `wirescale-control` validates scope before installing aggregate routes. Operators MUST verify out-of-band that /64 routes do not leak beyond the cluster fabric. See Gate 3 in [ROUTABLE-PREFIX.md Section 2.5](ROUTABLE-PREFIX.md#25-prerequisites-and-safety-gates-for-gua-mode). |
 
 > **See [EGRESS.md](EGRESS.md) section 10** for threat detection and
 > automated response specific to outbound traffic, including C2 beaconing,
