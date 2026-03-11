@@ -192,7 +192,37 @@ Maps MUST be sized at agent startup (no live resize without BPF reload).
 | `connection_log` (ring buffer) | 8 MB ring | 8 MB |
 | **Total** | | **~11.6 MB** |
 
-### 2.5 Scaling Decision Table
+### 2.5 Gateway Sizing (Signaling and Relay)
+
+Gateway nodes serve two roles: signaling (cross-cluster peer resolution) and
+relay (data forwarding for nodes without mutual reachability). Sizing depends
+on which role dominates.
+
+**Signaling-only sizing** (all nodes have mutual reachability):
+
+| Clusters | Peak Resolutions/sec | Recommended Gateways | CPU/Gateway | Memory/Gateway |
+|---------|---------------------|---------------------|-------------|----------------|
+| 5-10 | ~500 | 2-3 | 0.5 cores | 256 MB |
+| 10-50 | ~5K | 3-5 | 1 core | 512 MB |
+| 50-200 | ~20K | 5-10 | 2 cores | 1 GB |
+
+**Relay-capable sizing** (some nodes behind NAT/firewall):
+
+| Expected Relay % | Aggregate Relay BW | Recommended Gateways | NIC Speed | CPU/Gateway | Memory/Gateway |
+|-----------------|-------------------|---------------------|-----------|-------------|----------------|
+| < 5% | < 1 Gbps | 2-3 | 10 Gbps | 2 cores | 512 MB |
+| 5-15% | 1-10 Gbps | 3-5 | 25 Gbps | 4-8 cores | 1 GB |
+| 30-60% | 10-50 Gbps | 5-10 | 25-100 Gbps | 8-16 cores | 2 GB |
+| 100% (all relay) | Matches cross-cluster BW | 10+ | 100 Gbps | 16+ cores | 4 GB |
+
+**Memory estimate for relay:** `base (128 MB) + relay_sessions * 4 KB`.
+At 10,000 concurrent relay sessions, relay state requires ~40 MB.
+
+Operators MUST monitor `wirescale_relay_utilization_ratio` on each gateway
+node. Sustained utilization above 70% indicates the need for additional
+relay capacity.
+
+### 2.6 Scaling Decision Table
 
 | Signal | Threshold | Action |
 |--------|----------|--------|
@@ -202,6 +232,10 @@ Maps MUST be sized at agent startup (no live resize without BPF reload).
 | `identity_cache_evictions` rate rising | Sustained 30 min | Increase `identityCache.maxEntries` |
 | Any BPF map > 80% full | Any occurrence | Increase map size, redeploy agents |
 | Cross-cluster query p99 > 200 ms | Sustained 5 min | Add directory replicas, check network |
+| Relay utilization > 70% | Sustained 10 min | Add relay gateway nodes or increase NIC speed |
+| Relay sessions > 80% of max | Any occurrence | Increase `relay.maxSessionsPerNode` or add gateways |
+| Relay-to-direct promotion rate < 50% | Sustained 1 hour | Investigate NAT/firewall; likely permanent relay needed |
+| `wirescale_relay_rejected_sessions_total` rising | Any sustained rate | Add relay gateways; capacity exhausted |
 
 ---
 
@@ -209,12 +243,17 @@ Maps MUST be sized at agent startup (no live resize without BPF reload).
 
 ### 3.1 Prometheus Metrics Reference
 
-Metrics are exposed at two endpoints (see [SECURITY.md Section 12](SECURITY.md#12-audit-and-observability)):
+Metrics are exposed at three endpoints (see [SECURITY.md Section 12](SECURITY.md#12-audit-and-observability)):
 
 - **`wirescale-agent`** at `:9090/metrics` -- WireGuard peers, policy
-  decisions, identity cache, peer cache, NAT64, cross-cluster flows.
+  decisions, identity cache, peer cache, NAT64, cross-cluster flows,
+  peer mode (direct vs relay), relay promotion attempts.
 - **`wirescale-control`** at `:9091/metrics` -- nodes, identities, policy
-  compilations, peer authorizations, gRPC server, directory health.
+  compilations, peer authorizations, gRPC server, directory health,
+  relay session allocation.
+- **`wirescale-gateway`** at `:9090/metrics` (on gateway nodes) -- relay
+  active sessions, bytes relayed, utilization ratio, rejected sessions,
+  per-source relay bandwidth.
 
 ### 3.2 Health Thresholds
 
@@ -227,6 +266,11 @@ Metrics are exposed at two endpoints (see [SECURITY.md Section 12](SECURITY.md#1
 | Policy update p99 | < 1 s | 1-5 s | > 5 s |
 | BPF map utilization | < 60% | 60-80% | > 80% |
 | Directory query p99 | < 50 ms | 50-200 ms | > 200 ms |
+| Relay utilization ratio | < 50% | 50-70% | > 70% |
+| Relay session count (% of max) | < 60% | 60-80% | > 80% |
+| Relay-to-direct promotion rate | > 80% | 50-80% | < 50% |
+| Relay latency overhead | < 1 ms | 1-2 ms | > 2 ms |
+| Relayed peer fraction (per node) | < 10% | 10-30% | > 30% |
 
 ### 3.3 Recommended Alerts
 
@@ -240,6 +284,13 @@ Metrics are exposed at two endpoints (see [SECURITY.md Section 12](SECURITY.md#1
 | CertExpiringSoon | `certificate_expiry_seconds` < 7 days | warning |
 | AuthzExpiredDuringOutage | `wirescale_authz_expired_during_outage_total` rate > 0 for 5 min | warning |
 | AgentDegradedMode | `wirescale_agent_degraded_mode{reason="control_unreachable"}` == 1 for 2 min | critical |
+| RelayUtilizationHigh | `wirescale_relay_utilization_ratio` > 0.7 for 10 min | warning |
+| RelayUtilizationCritical | `wirescale_relay_utilization_ratio` > 0.9 for 5 min | critical |
+| RelaySessionsNearMax | `wirescale_relay_active_sessions` / max > 80% for 5 min | warning |
+| RelaySessionsRejected | `wirescale_relay_rejected_sessions_total` rate > 0 for 5 min | critical |
+| RelayPromotionLow | promotion success / attempts < 50% for 1 hour | warning |
+| HighRelayedPeerFraction | `wirescale_peer_mode{mode="relay"}` / total peers > 30% for 30 min | warning |
+| RelayGatewayDown | Gateway node with relay sessions becomes unreachable | critical |
 
 ### 3.4 Troubleshooting Runbook
 
@@ -284,6 +335,59 @@ identity misses cause drops, check controller health.
 Restart agent to force peer re-establishment if keys are stale. Verify
 cloud security groups allow bidirectional UDP on `listenPort`.
 
+#### High Relay Utilization or Relay Session Rejections
+
+Relay utilization alerts or session rejection counters firing.
+
+| Step | Action |
+|------|--------|
+| 1 | Check relay gateway health: `kubectl -n wirescale-system get pods -l wirescale.io/gateway=true` |
+| 2 | Check relay metrics: `curl <gateway-ip>:9090/metrics \| grep wirescale_relay` |
+| 3 | Identify top relay consumers: check `wirescale_relay_per_source_bytes` for hotspots |
+| 4 | Check if relay-to-direct promotion is working: `curl <agent-ip>:9090/metrics \| grep relay_promotion` |
+| 5 | Verify per-source rate limits are configured: check WirescaleMesh `.spec.gateways.relay.perSourceRateLimitBps` |
+
+**Resolution:** If utilization is high, add relay gateway nodes or increase
+NIC speed. If a single source dominates, investigate why it cannot establish
+direct tunnels (check NAT type, firewall rules, VPC peering). If promotion
+rate is low, the NAT/firewall condition may be permanent -- size relay
+capacity accordingly.
+
+#### Nodes Stuck in Relay Mode
+
+Nodes that should be able to establish direct tunnels are relaying instead.
+
+| Step | Action |
+|------|--------|
+| 1 | Check node NAT type: `kubectl get wirescalenode <node> -o jsonpath='{.status.natType}'` |
+| 2 | Verify UDP 51820 reachability between nodes: `nc -u -z <remote-endpoint> 51820` |
+| 3 | Check relay promotion attempts: `curl <agent-ip>:9090/metrics \| grep relay_promotion` |
+| 4 | Check for asymmetric firewall rules blocking inbound UDP |
+| 5 | Check cloud security groups / VPC peering configuration |
+
+**Resolution:** If the NAT type is "symmetric" or "unknown", direct tunnels
+may not be possible -- relay is the correct behavior. If the NAT type is
+"full-cone" or "restricted" but direct tunnels still fail, check for
+firewall rules or security groups blocking bidirectional UDP on the
+WireGuard port. Fix the network path or accept relay as the steady state
+and provision relay capacity accordingly.
+
+#### Relay Gateway Failover
+
+A relay gateway node has failed and relayed sessions need reassignment.
+
+| Step | Action |
+|------|--------|
+| 1 | Verify gateway pod status: `kubectl -n wirescale-system get pods -l wirescale.io/gateway=true` |
+| 2 | Check if control is reassigning sessions: `kubectl logs -n wirescale-system deploy/wirescale-control \| grep relay` |
+| 3 | Check affected nodes: `kubectl get wirescalenodes -o json \| jq '.items[] \| select(.status.relayedPeers > 0)'` |
+| 4 | Verify remaining gateways have capacity: check `wirescale_relay_utilization_ratio` on surviving gateways |
+
+**Resolution:** If control is reassigning sessions automatically, wait for
+completion (< 10s). If reassignment is stuck, restart the control pod. If
+all relay gateways are down, relayed sessions are unavailable until at least
+one gateway recovers -- direct sessions are unaffected.
+
 #### Cross-Cluster Connectivity Loss
 
 | Step | Action |
@@ -316,6 +420,11 @@ connectivity to reissue access grants. If access grants are critical
 during the outage, operators MUST restore control availability rather
 than attempt to extend grant lifetimes. The agent will automatically
 revalidate authorization state once control is reachable.
+**Resolution:** If directory is unreachable, cached registrations remain
+valid for the heartbeat TTL (60 s). If gateways are unhealthy, verify
+labels and pods. If aggregate routes are missing, restart the agent. For
+nodes using relay mode, also check relay gateway health and capacity --
+relay gateway failure disrupts relayed sessions but not direct tunnels.
 
 ---
 
@@ -445,6 +554,15 @@ A conformance suite MUST validate before any production release:
 - Agent restart does NOT restore authorization state from disk
 - WirescaleAccessGrant rules expire on schedule during control outage (fail closed)
 - Agent enters degraded mode when control is unreachable at startup
+- Cross-cluster connectivity (direct mode): pods in `3fff:1234:0001::/48`
+  reach pods in `3fff:1234:0002::/48` via on-demand direct WireGuard tunnels
+- Cross-cluster connectivity (relay mode): pods behind simulated NAT reach
+  remote-cluster pods via relay gateway with end-to-end encryption preserved
+- Relay-to-direct promotion: when direct reachability is restored, agent
+  upgrades from relay to direct within the configured promotion interval
+- Relay failover: when a relay gateway fails, affected sessions are
+  reassigned to a surviving gateway within 10 s
+- Agent restart does not drop in-flight connections (direct or relayed)
 - Controller failover within 10 s
 - 24-hour key rotation without handshake failures
 - NAT64/CLAT translation over IPv6-only underlay
@@ -464,7 +582,12 @@ rotation cycles.
 | Intra-cluster peer setup p99 | < 15 ms | Fail if > 20 ms |
 | Identity resolution (miss) p99 | < 10 ms | Fail if > 15 ms |
 | XDP throughput (64B packets) | > 5 Mpps | Fail if < 4 Mpps |
-| WireGuard throughput (1400B, single flow) | > 5 Gbps | Fail if < 4 Gbps |
+| WireGuard throughput (1400B, single flow, direct) | > 5 Gbps | Fail if < 4 Gbps |
+| WireGuard throughput (1400B, single flow, relay) | > 4 Gbps | Fail if < 3 Gbps |
+| Relay latency overhead (per hop) | < 1 ms | Fail if > 2 ms |
+| Relay session establishment | < 50 ms | Fail if > 100 ms |
+| Relay-to-direct promotion latency | < 65 s (1 cycle) | Fail if > 120 s |
+| Relay failover (session reassignment) | < 10 s | Fail if > 15 s |
 | Agent memory (100 peers) | < 80 MB | Fail if > 120 MB |
 | Policy propagation p99 | < 1 s | Fail if > 2 s |
 
@@ -592,3 +715,7 @@ Rolling back does NOT require cluster downtime. The drain process
 migrates pods incrementally. Cross-cluster connectivity is maintained
 through WireGuard tunnels using ULA addressing throughout the
 rollback.
+| Relay gateway failure | Control reassigns relayed sessions to surviving gateways (< 10 s). Direct sessions unaffected. |
+| All relay gateways fail | Relayed sessions disrupted. Direct sessions unaffected. Manual intervention to restore relay capacity. |
+| Relay-to-direct network change | Agent detects direct reachability on next promotion cycle (60 s). Upgrades to direct mode automatically. |
+| Relay gateway overload | Per-source rate limits enforce fairness. Excess sessions rejected with backpressure. Agent retries on alternate gateway. |

@@ -131,7 +131,7 @@ in an IPv6-only Kubernetes cluster:
 | **Central authentication, decentralized forwarding** | The control plane (wirescale-control and wirescale-directory) handles authentication, authorization, peer brokering, and identity resolution. The data plane (WireGuard on each node) handles encryption and forwarding with no central mediation. Control plane failure does not break existing connections. |
 | **On-demand peering, not full mesh** | Nodes establish WireGuard peers only when traffic requires it. Idle peers are garbage-collected. A node with 50 active communication partners holds 50 peers, not 10,000. |
 | **Hierarchical prefix aggregation** | Each cluster is allocated a contiguous prefix. Intra-cluster routing uses per-host /64 routes. Cross-cluster routing uses one aggregate route per remote cluster. Total per-node route state: O(local_hosts + clusters). |
-| **Signaling gateways, not data-path gateways** | Cross-cluster gateways handle signaling (initial peer resolution) only. Data flows directly between source and destination nodes. Gateways are never in the data path for established flows. |
+| **Direct mode by default, relay mode when needed** | Cross-cluster gateways handle signaling (initial peer resolution) and establish direct WireGuard tunnels between communicating nodes whenever possible. When nodes lack mutual reachability (corporate NAT, asymmetric firewalls, VPC peering gaps), gateways MUST relay encrypted data as a first-class supported mode. Direct mode is the default for flat networks; relay mode is expected in enterprise and hybrid-cloud environments. |
 | **Pull-based identity and policy** | Nodes request identity and policy information on demand, cache it with TTLs, and expire it. No push-based global state distribution. |
 | **O(active_peers) per node, not O(total_nodes)** | Every per-node resource -- WireGuard peers, identity cache entries, policy rules, route table entries -- scales with the number of active communication partners, not with the total size of the fleet. |
 | **Key-per-node, not key-per-pod** | Matches the WireGuard model and avoids quadratic key distribution. Pods on the same node share a tunnel. Same-node traffic is unencrypted (already isolated by kernel namespaces). |
@@ -672,9 +672,17 @@ When a packet matches an aggregate route for a remote cluster (no specific
 1. The packet is intercepted by the agent (or forwarded to the signaling
    gateway first, which hands it to the agent)
 2. The agent queries wirescale-control for the specific remote node
-3. A direct WireGuard tunnel is established to the remote node
-4. A specific /64 route is installed, overriding the aggregate route
-5. All subsequent traffic flows directly -- the gateway is bypassed
+3. The agent attempts a direct WireGuard tunnel to the remote node
+4. If direct handshake succeeds (direct mode):
+   a. A specific /64 route is installed, overriding the aggregate route
+   b. All subsequent traffic flows directly -- the gateway is not in the
+      data path for this peer
+5. If direct handshake fails (relay mode):
+   a. The agent requests relay allocation from control
+   b. A relay gateway is assigned and establishes forwarding state
+   c. A specific /64 route is installed via the relay gateway
+   d. Traffic is relayed through the gateway (encrypted end-to-end)
+   e. The agent periodically re-attempts direct tunnel establishment
 
 **Identity cache:**
 The agent maintains a local TTL-based cache of pod identities. On cache miss,
@@ -1124,13 +1132,26 @@ The agent SHOULD log a warning when multicast traffic is destined for
 
 ## 8. Cross-Cluster Connectivity
 
-### Signaling Gateway Model
+### Gateway Model: Direct and Relay Modes
 
-Each cluster designates gateway nodes (typically 2-3 for HA). Gateways handle
-**signaling only** -- initial cross-cluster peer resolution. They are NOT in
-the data path for established flows.
+Each cluster designates gateway nodes (typically 2-3 for HA). Gateways serve
+two distinct roles depending on network reachability between communicating
+nodes:
+
+**Direct mode** (default): Gateways handle signaling only -- initial
+cross-cluster peer resolution. After resolution, data flows directly between
+source and destination nodes via a point-to-point WireGuard tunnel. Gateways
+are NOT in the data path for established direct flows.
+
+**Relay mode** (when direct reachability is unavailable): Gateways relay
+encrypted WireGuard data between nodes that cannot establish direct tunnels.
+Relay mode is a first-class supported mode for enterprise and hybrid-cloud
+environments where NAT, firewalls, or VPC peering gaps prevent direct
+node-to-node connectivity.
 
 ```
+DIRECT MODE (flat networks, mutual reachability):
+
 Cluster 1 (3fff:1234:0001::/48)      Cluster 2 (3fff:1234:0002::/48)
 
 +---------+                           +---------+
@@ -1155,16 +1176,59 @@ Cluster 1 (3fff:1234:0001::/48)      Cluster 2 (3fff:1234:0002::/48)
      +=====================================+
      | 3. Direct WireGuard tunnel          |
      |    Node A <-> Node B                |
-     |    (gateway bypassed for data)      |
+     |    (gateway not in data path)       |
      +=====================================+
+
+
+RELAY MODE (NAT/firewall/VPC peering gap):
+
+Cluster 1 (3fff:1234:0001::/48)      Cluster 2 (3fff:1234:0002::/48)
+
++---------+                           +---------+
+| Node A  |      XXXX NAT XXXX       | Node B  |
+| (agent) |      (no direct path)    | (agent) |
++----+----+                           +----+----+
+     |                                     |
+     | 1. Direct tunnel fails              |
+     |    (handshake timeout)              |
+     |                                     |
++----+----+                           +----+----+
+| Gateway |===========================| Gateway |
+| (relay) |  WireGuard relay tunnel   | (relay) |
++----+----+                           +----+----+
+     |                                     |
+     | 2. Gateway relays encrypted data    |
+     |    Node A <-> Gateway <-> Node B    |
+     |    (end-to-end encryption preserved)|
+     +-------------------------------------+
 ```
 
-**Why signaling-only gateways?**
+**Direct mode advantages:**
 - Gateways are NOT a throughput bottleneck -- data flows directly between nodes
-- Gateways CAN be data relays for nodes without direct reachability (NAT
-  traversal), but this is the exception, not the rule
-- Gateway failure does not disrupt established cross-cluster tunnels
+- Gateway failure does not disrupt established direct tunnels
 - No single point of failure for cross-cluster data traffic
+- Line-rate throughput limited only by WireGuard crypto and link speed
+
+**When relay mode is needed:**
+- **Corporate NAT/CGNAT:** Nodes behind carrier-grade or enterprise NAT where
+  UDP hole-punching fails
+- **Asymmetric firewalls:** Security policies permit outbound but block inbound
+  UDP to node endpoints
+- **Cloud VPC peering gaps:** Cross-region or cross-account VPCs without direct
+  peering or transit gateway connectivity
+- **Split-horizon DNS / overlapping address space:** Environments where node
+  endpoints are not mutually routable
+
+**Relay mode guarantees:**
+- End-to-end WireGuard encryption is preserved -- the relay gateway forwards
+  opaque ciphertext and MUST NOT terminate or inspect the inner WireGuard
+  session
+- Source attribution is maintained through relay (see
+  [Section 12: Security Model](#12-security-model))
+- The agent MUST periodically re-attempt direct tunnel establishment (default
+  every 60s) and upgrade to direct mode if reachability is restored
+- Relay mode is per-peer, not per-cluster -- a node MAY use direct tunnels for
+  some remote peers and relayed tunnels for others simultaneously
 
 ### Cross-Cluster Peer Establishment Flow
 
@@ -1296,17 +1360,75 @@ traffic through the exit node. This is useful for:
 See [EGRESS.md](EGRESS.md) for the full egress gateway design, including the
 `WirescaleEgressGateway` CRD, NPTv6 prefix translation, and egress policy engine.
 
-### NAT Traversal
+### NAT Traversal and Relay Mode
 
-When direct node-to-node reachability is not available (nodes behind NAT),
-the signaling gateway MAY act as a data relay:
+When direct node-to-node reachability is not available, the gateway operates
+in relay mode. This is a first-class supported configuration, not a fallback.
 
-- The gateway maintains a WireGuard peer with both nodes
-- Traffic is relayed through the gateway's WireGuard interface
-- This adds one extra hop but preserves end-to-end encryption
-- The agent SHOULD periodically attempt to re-establish a direct tunnel
-  (NAT hole-punching via coordinated endpoint exchange through control)
-- A DERP-like relay protocol MAY be implemented for better NAT traversal
+**Relay establishment flow:**
+
+```
+1. Agent attempts direct WireGuard tunnel (standard flow)
+2. Handshake does not complete within timeout (default 5s)
+3. Agent requests relay allocation from wirescale-control:
+     "Direct tunnel to 3fff:1234:0002:002a::/64 failed; request relay"
+4. Control selects a relay gateway with available capacity
+5. Control coordinates relay setup:
+   a. Relay gateway establishes WireGuard peer with remote node
+      (gateway has direct reachability to both sides)
+   b. Relay gateway allocates forwarding state for this relay pair
+   c. Control returns relay parameters to requesting agent
+6. Agent configures WireGuard peer with relay gateway as endpoint
+   (instead of the remote node's direct endpoint)
+7. All traffic to the remote /64 is routed through the relay gateway
+8. Agent marks peer as relayed in its state table
+```
+
+**Relay mode properties:**
+- The relay gateway forwards encrypted WireGuard packets between nodes.
+  It MUST NOT decrypt, inspect, or modify the inner payload.
+- End-to-end encryption is preserved: the WireGuard session is between the
+  two communicating nodes. The relay gateway sees only ciphertext.
+- Source attribution is maintained: the relay gateway records which source
+  node originated each relayed flow, enabling policy enforcement and audit
+  (see [Section 12](#12-security-model)).
+- Each relay path adds one WireGuard hop (encrypt -> relay -> decrypt),
+  adding approximately 0.1-2 ms of latency depending on relay placement.
+
+**Direct tunnel re-promotion:**
+- The agent MUST periodically attempt to re-establish a direct tunnel
+  (default every 60s) via coordinated endpoint exchange through control.
+- If a direct handshake succeeds, the agent MUST upgrade the peer from
+  relay to direct mode and release the relay allocation.
+- NAT hole-punching via coordinated endpoint exchange through control
+  SHOULD be attempted before each relay re-promotion cycle.
+
+**Relay capacity and fairness:**
+- Each relay gateway MUST enforce per-source rate limits to prevent a
+  single node from monopolizing relay capacity (see
+  [PERFORMANCE.md Section 10](PERFORMANCE.md#10-gateway-performance-signaling-and-relay)).
+- Relay gateways MUST implement admission control: when relay capacity
+  is exhausted, new relay requests MUST be rejected with a backpressure
+  signal so the agent can retry on a different relay gateway.
+- Operators MUST monitor relay utilization and provision additional
+  gateway capacity when sustained utilization exceeds 70%.
+
+**DERP-like relay protocol:**
+- A DERP-like relay protocol (similar to Tailscale's DERP) MAY be
+  implemented as an alternative to WireGuard-level relay for improved
+  NAT traversal in severely restricted environments (e.g., TCP-only
+  egress). When DERP is used, the same end-to-end encryption guarantees
+  MUST apply.
+
+**Observability:**
+- Agents MUST expose `wirescale_peer_mode{mode="direct|relay"}` gauge
+  indicating the current mode of each active peer.
+- Relay gateways MUST expose `wirescale_relay_active_sessions`,
+  `wirescale_relay_bytes_total`, and `wirescale_relay_utilization_ratio`
+  metrics.
+- The `wirescale_relay_promotion_attempts_total` and
+  `wirescale_relay_promotion_successes_total` counters MUST be exposed
+  by each agent to track direct-tunnel re-promotion effectiveness.
 
 ---
 
@@ -2361,14 +2483,28 @@ spec:
     caCertRef:
       name: directory-ca
       key: ca.crt
-  # Signaling gateway nodes
+  # Gateway nodes (signaling + optional relay)
   gateways:
-    # Nodes designated as signaling gateways (label selector)
+    # Nodes designated as gateways (label selector)
     nodeSelector:
       matchLabels:
         wirescale.io/gateway: "true"
     # Number of desired gateway nodes
     replicas: 3
+    # Relay mode configuration (for nodes behind NAT/firewall)
+    relay:
+      # Enable relay capability on gateway nodes
+      enabled: true
+      # Maximum concurrent relay sessions per gateway node
+      maxSessionsPerNode: 10000
+      # Per-source relay bandwidth limit (bits/sec, 0 = unlimited)
+      perSourceRateLimitBps: 1000000000   # 1 Gbps per source
+      # Maximum aggregate relay throughput per gateway node (bits/sec)
+      maxRelayThroughputBps: 10000000000  # 10 Gbps per gateway
+      # Interval for agents to re-attempt direct tunnel (seconds)
+      directPromotionInterval: 60
+      # Handshake timeout before falling back to relay (seconds)
+      directHandshakeTimeout: 5
   # Peer lifecycle policy
   peerPolicy:
     # Seconds of idle time before a WireGuard peer is garbage-collected
@@ -2418,20 +2554,27 @@ spec:
   # Optional: subnet router / exit node
   advertisedRoutes: []
   exitNode: false
-  # Optional: designate as signaling gateway
+  # Optional: designate as gateway (signaling + relay)
   gateway: false
 status:
   # Updated by agent
   ready: true
   controlPlaneConnected: true
   activePeers: 23
-  crossClusterPeers: 2       # active peers to remote clusters
+  directPeers: 21             # peers using direct WireGuard tunnels
+  relayedPeers: 2             # peers using gateway relay
+  crossClusterPeers: 2        # active peers to remote clusters
   lastHandshake: "2026-03-02T10:00:00Z"
   wireguardInterface: "wg0"
-  natType: "full-cone"        # Detected NAT type
+  natType: "full-cone"        # Detected NAT type (full-cone | restricted | symmetric | unknown)
   bytesTransferred:
     tx: 1073741824
     rx: 2147483648
+  # Gateway-specific status (populated only on gateway nodes)
+  gatewayStatus:
+    relayActiveSessions: 42
+    relayUtilizationPercent: 35
+    relayBytesRelayedTotal: 10737418240
 ```
 
 ### WirescaleExternalPeer (cluster-scoped)
@@ -2624,7 +2767,7 @@ Host node-1: route 64:ff9b::/96 -> nat64 interface
 Return: IPv4 -> nat64 eBPF xlat -> IPv6 -> route to Pod A
 ```
 
-### Case 6: Cross-Cluster Pod-to-Pod (Cold Path)
+### Case 6: Cross-Cluster Pod-to-Pod, Direct Mode (Cold Path)
 
 ```
 Pod A in cluster-1 (3fff:1234:0001:0001::5) ->
@@ -2655,10 +2798,10 @@ Host node-A-1: no specific peer for 3fff:1234:0002:0002::/64
   11. Total cold-path delay: ~30-65ms
 
 Subsequent packets: direct WireGuard tunnel (warm path).
-Gateway is NOT in the data path.
+Gateway is not in the data path for direct-mode peers.
 ```
 
-### Case 7: Cross-Cluster Pod-to-Pod (Warm Path)
+### Case 7: Cross-Cluster Pod-to-Pod, Direct Mode (Warm Path)
 
 ```
 Pod A in cluster-1 -> Pod B in cluster-2
@@ -2676,7 +2819,45 @@ Host node-B-2: wg0 decrypt -> route to Pod B
 (identical to intra-cluster warm path, zero gateway overhead)
 ```
 
-### Case 8: External Peer to Pod
+### Case 8: Cross-Cluster Pod-to-Pod, Relay Mode (NAT/Firewall)
+
+When nodes lack mutual reachability (corporate NAT, asymmetric firewall,
+VPC peering gap), the gateway relays encrypted data:
+
+```
+Pod A in cluster-1 (3fff:1234:0001:0001::5) ->
+  Pod B in cluster-2 (3fff:1234:0002:0002::7)
+  (Node A and Node B cannot reach each other directly)
+
+Pod A: eth0 -> veth -> host
+Host node-A-1:
+  1. Agent attempts direct WireGuard tunnel to node-B-2 (Case 6 steps 1-8)
+  2. Handshake does not complete within 5s timeout
+  3. Agent -> control: "direct tunnel failed, request relay"
+  4. Control selects relay gateway with available capacity
+  5. Control coordinates relay:
+     a. Relay gateway (3fff:1234:0001:ff01::1) peers with node-B-2
+     b. Relay gateway allocates forwarding state
+  6. Agent configures WireGuard peer with relay gateway as endpoint:
+       wg set wg0 peer <node-B-pubkey> \
+         allowed-ips 3fff:1234:0002:0002::/64 \
+         endpoint [3fff:1234:0001:ff01::1]:51820
+  7. Queued packets drain through relay path
+
+Data path (relay mode, steady state):
+  Node A -> wg0 encrypt -> UDP to relay gateway
+  -> relay gateway forwards (opaque ciphertext) -> UDP to Node B
+  -> Node B wg0 decrypt -> route to Pod B
+
+  Additional latency: ~0.1-2 ms per relayed hop
+  End-to-end encryption: preserved (relay sees only ciphertext)
+  Source attribution: relay records source node for policy/audit
+
+Agent continues to attempt direct tunnel re-promotion every 60s.
+If direct handshake succeeds, agent upgrades to direct mode automatically.
+```
+
+### Case 9: External Peer to Pod
 
 ```
 Dev laptop (3fff:1234:00ff:0001::1) -> Pod B (3fff:1234:0001:0002::7)
@@ -2709,7 +2890,7 @@ Node-2: wg0 decrypt -> verify AllowedIPs -> route to Pod B
 | External peers | Yes (control-mediated) | Yes (tailnet) | No | No | Yes (Peer CRD) |
 | Control plane | Three-tier (directory + control + agent) | Tailscale SaaS | Cilium agent | Calico Felix | Kubernetes API |
 | Identity model | Control-issued tokens + WG keys | Tailscale identity | CiliumNode annotation | Node annotation | Node annotation |
-| Data-path gateways | No (signaling-only) | N/A | Yes (ClusterMesh) | Yes | Yes (zone leaders) |
+| Gateway data-path role | Signaling-only (direct mode); relay when nodes lack mutual reachability | N/A | Yes (ClusterMesh) | Yes | Yes (zone leaders) |
 
 ### Why Not Just Use Tailscale K8s Operator?
 
@@ -2799,23 +2980,44 @@ with all peers mediated through wirescale-control.
       remote control -> response)
 - [ ] Agent: aggregate route programming for remote clusters
 - [ ] Agent: cross-cluster peer establishment via signaling gateway
-- [ ] Signaling gateway nodes (signal-only, not data path)
+- [ ] Gateway nodes: signaling-only mode (direct peer resolution)
 - [ ] WirescaleCluster CRD (directory-scoped)
 - [ ] Cross-cluster WirescalePolicy support (clusterPeer selectors)
 
 **Result:** Federated multi-cluster mesh with O(clusters) state per node.
 Hundreds of clusters, hundreds of thousands of total hosts.
 
-### Phase 6: Performance and Hardening
+### Phase 6: Relay Mode and NAT Traversal
 
-- [ ] NAT traversal / DERP-like relay for nodes behind NAT
+- [ ] Agent: direct tunnel failure detection (handshake timeout)
+- [ ] Agent: relay allocation request to control on direct tunnel failure
+- [ ] Control: relay gateway selection (capacity-aware, locality-aware)
+- [ ] Gateway: relay forwarding (opaque WireGuard ciphertext relay)
+- [ ] Gateway: per-source rate limiting and admission control for relay
+- [ ] Agent: periodic direct tunnel re-promotion (default 60s cycle)
+- [ ] Agent: relay mode peer state tracking and metrics
+- [ ] Gateway: relay session metrics (active sessions, bytes, utilization)
+- [ ] NAT hole-punching via coordinated endpoint exchange through control
+- [ ] DERP-like relay protocol for TCP-only egress environments
+- [ ] WirescaleMesh CRD: relay configuration (capacity limits, rate limits)
+- [ ] Relay-specific alerting: utilization, session count, promotion rate
+
+**Result:** First-class relay support for enterprise and hybrid-cloud
+environments with NAT, firewalls, and VPC peering gaps. Relay mode is
+observable, capacity-managed, and automatically upgrades to direct when
+possible.
+
+### Phase 7: Performance and Hardening
+
 - [ ] Performance optimization (eBPF fast path, batch processing,
       see [PERFORMANCE.md](PERFORMANCE.md))
 - [ ] Metrics and observability (Prometheus, WireGuard handshake stats,
-      control plane latency histograms, directory health)
+      control plane latency histograms, directory health, relay utilization)
 - [ ] Load testing: 10K+ nodes per cluster, 100+ clusters
+- [ ] Load testing: relay capacity under sustained load
 - [ ] Chaos testing: directory failure, control failure, gateway failure,
-      network partition between clusters
+      relay gateway failure, network partition between clusters
+- [ ] Chaos testing: relay-to-direct promotion under changing network conditions
 
 **Result:** Production-grade network operator for hyperscale deployments
 with federated cross-cluster connectivity and proven resilience.

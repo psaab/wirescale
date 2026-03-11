@@ -4,8 +4,9 @@
 > the fabric routes /64 per host. Across clusters, a single aggregate
 > prefix per cluster collapses routing state from O(global_hosts) to
 > O(local_hosts + clusters). Direct WireGuard tunnels are established
-> after signaling-plane resolution -- the gateway is a control waypoint,
-> not a data-plane bottleneck.
+> after signaling-plane resolution when nodes have mutual reachability
+> (direct mode). When nodes lack direct reachability, gateways relay
+> encrypted data as a first-class supported mode (relay mode).
 >
 > **Addressing mode guidance:** The ULA overlay (`fd00::/8`) is the
 > recommended default for most deployments. GUA routable mode
@@ -48,7 +49,7 @@
 7. [WireGuard as Encryption-Only Layer](#7-wireguard-as-encryption-only-layer)
 8. [Selective Encryption via Deployment Profiles](#8-selective-encryption-via-deployment-profiles)
 9. [IPv4 Compatibility](#9-ipv4-compatibility)
-10. [Cross-Cluster Connectivity and Signaling Gateway](#10-cross-cluster-connectivity-and-signaling-gateway)
+10. [Cross-Cluster Connectivity and Gateway Modes](#10-cross-cluster-connectivity-and-gateway-modes)
 11. [Scaling Analysis](#11-scaling-analysis)
 12. [Packet Flow Walkthroughs](#12-packet-flow-walkthroughs)
 13. [Security: Internet-Routable Pods (Advanced Mode)](#13-security-internet-routable-pods-advanced-mode)
@@ -564,7 +565,8 @@ This gives three forwarding states per remote destination:
 | State | Route Matched | Path | Latency |
 |-------|--------------|------|---------|
 | No communication yet | Aggregate /48 (or /32 ULA) | Via gateway (triggers resolution) | Cold path: +10-50 ms |
-| Direct tunnel active | Specific /64 | Via WireGuard peer | Warm path: native |
+| Direct tunnel active | Specific /64 | Via WireGuard peer (direct) | Warm path: native |
+| Relay tunnel active | Specific /64 | Via relay gateway (encrypted) | Warm path: +0.1-2 ms relay overhead |
 | Tunnel GC'd | Aggregate /48 (or /32 ULA) | Via gateway (re-triggers resolution) | Cold path on next use |
 
 ### Within-Cluster Route Distribution
@@ -856,7 +858,9 @@ entirely.
 **Automatic failover.** If a direct tunnel fails (peer becomes
 unreachable), the /64 route is removed and traffic falls back to the
 aggregate via the gateway. The gateway can then re-initiate resolution,
-potentially finding a new path.
+potentially finding a new path. If direct reachability is unavailable
+(NAT, firewall), the agent requests relay allocation and traffic is
+relayed through the gateway until direct connectivity is restored.
 
 **No stale state.** Direct overrides are transient. They exist only while
 communication is active. When the GC timer fires, the override is removed
@@ -1213,30 +1217,47 @@ spec:
       encryption: required
 ```
 
-### Cross-Cluster Encryption via Direct Tunnels
+### Cross-Cluster Encryption: Direct and Relay Modes
 
 In all profiles except `development`, cross-cluster traffic (when it
 crosses a site boundary) is encrypted via **direct WireGuard tunnels
 between communicating hosts**, not gateway relay.
+The default design choice: cross-cluster encryption uses **direct
+WireGuard tunnels between communicating hosts** whenever possible. When
+nodes lack mutual reachability (corporate NAT, asymmetric firewalls, VPC
+peering gaps), gateways relay encrypted data as a first-class supported
+mode.
 
 ```
-WRONG (gateway as data relay):
-  host-A (cluster-1) -> gateway-1 -> WAN -> gateway-2 -> host-B (cluster-2)
-  Gateway is a throughput bottleneck. All cross-cluster traffic converges.
-
-RIGHT (gateway as signaling waypoint, direct tunnel after resolution):
+DIRECT MODE (mutual reachability -- preferred):
   Step 1: host-A -> gateway-1 -> signaling -> gateway-2 -> host-B (resolution)
   Step 2: host-A -> direct WireGuard tunnel -> host-B (data plane)
-  Gateway is off the data path after the first packet.
+  Gateway is off the data path after resolution.
+
+RELAY MODE (no mutual reachability -- NAT/firewall):
+  Step 1: host-A -> gateway attempts direct tunnel -> fails (handshake timeout)
+  Step 2: host-A -> relay gateway -> host-B (gateway relays encrypted data)
+  Gateway is in the data path but forwards only opaque ciphertext.
+  End-to-end encryption is preserved.
 ```
 
-This means:
+**Direct mode advantages:**
 - Cross-cluster throughput is NOT limited by gateway capacity
 - Gateways handle only signaling (low bandwidth, low CPU)
 - Each direct tunnel is point-to-point, encrypted end-to-end
 - Gateway failure does not disrupt established tunnels (only new resolution)
 
 ### Performance Impact by Profile
+**Relay mode guarantees:**
+- End-to-end encryption is preserved -- relay forwards opaque ciphertext
+- Source attribution is maintained through the relay for policy and audit
+- Agent periodically re-attempts direct tunnel (default every 60s) and
+  upgrades automatically if reachability is restored
+- Per-source rate limiting prevents relay capacity monopolization
+- See [PERFORMANCE.md Section 10](PERFORMANCE.md#10-gateway-performance-signaling-and-relay)
+  for relay capacity targets and SLOs
+
+### Performance Impact by Mode
 
 | Profile | Intra-Cluster Throughput | Cross-Cluster Throughput | CPU Overhead |
 |---------|-------------------------|--------------------------|-------------|
@@ -1321,26 +1342,31 @@ connect directly to the pod's GUA address.
 
 ---
 
-## 10. Cross-Cluster Connectivity and Signaling Gateway
+## 10. Cross-Cluster Connectivity and Gateway Modes
 
-### Signaling Gateway Model
+### Gateway Model: Direct and Relay
 
-The gateway is a **signaling waypoint** for cross-cluster peer resolution,
-NOT a data-plane relay for ongoing traffic. This is the critical distinction
-from traditional VPN gateway architectures:
+The gateway serves two roles depending on network reachability:
 
-| Aspect | Traditional VPN Gateway | Wirescale Signaling Gateway |
-|--------|------------------------|----------------------------|
-| Data forwarding | All cross-site traffic flows through gateway | Only initial packets (until direct tunnel) |
-| Throughput bottleneck | Yes -- gateway capacity limits cross-site BW | No -- direct tunnels bypass gateway |
-| Gateway failure impact | All cross-site traffic drops | Only new peer resolution; existing tunnels survive |
-| Scaling | Gateway must scale with total cross-site traffic | Gateway scales with peer resolution rate |
-| Encryption termination | Gateway decrypts and re-encrypts | End-to-end between communicating hosts |
+- **Signaling waypoint** (direct mode): For cross-cluster peer resolution
+  when nodes have mutual reachability. After resolution, data flows
+  directly between nodes -- the gateway is not in the data path.
+- **Data relay** (relay mode): For nodes that cannot establish direct
+  tunnels due to NAT, firewalls, or VPC peering gaps. The gateway
+  relays encrypted WireGuard data as a first-class supported mode.
 
-### Cross-Cluster Resolution Flow
+| Aspect | Traditional VPN Gateway | Wirescale Direct Mode | Wirescale Relay Mode |
+|--------|------------------------|----------------------|---------------------|
+| Data forwarding | All cross-site traffic | None (signaling only) | Only for unreachable node pairs |
+| Throughput bottleneck | Yes -- gateway limits BW | No -- direct tunnels | Per-pair, not aggregate |
+| Failure impact | All cross-site drops | Only new peer resolution | Relayed sessions only; direct unaffected |
+| Scaling driver | Total cross-site traffic | Peer resolution rate | Relayed traffic volume |
+| Encryption termination | Decrypts and re-encrypts | End-to-end | End-to-end (relay sees only ciphertext) |
+
+### Cross-Cluster Resolution Flow (Direct Mode)
 
 When a node in Cluster 1 first needs to communicate with a host in
-Cluster 2:
+Cluster 2 and nodes have mutual reachability:
 
 ```
 1. Node agent (Cluster 1) detects packet to 3fff:1234:0002:0042::/64
@@ -1369,12 +1395,30 @@ Cluster 2:
 
 8. Direct tunnel active
    - All subsequent traffic to 3fff:1234:0002:0042::/64 goes direct
-   - Gateway is no longer in the data path
+   - Gateway is not in the data path for this peer
+```
+
+### Relay Mode Establishment
+
+When a node in Cluster 1 cannot establish a direct tunnel to a host in
+Cluster 2 (NAT, firewall, VPC peering gap):
+
+```
+1. Steps 1-7 from direct mode (above) complete
+2. Direct WireGuard handshake fails (timeout, default 5s)
+3. Agent requests relay allocation from control
+4. Control selects relay gateway with available capacity
+5. Relay gateway establishes WireGuard peer with both nodes
+6. Agent configures WireGuard peer with relay gateway as endpoint
+7. Traffic flows through relay:
+   Node A -> encrypt -> relay gateway (forward ciphertext) -> Node B -> decrypt
+8. Agent periodically re-attempts direct tunnel (default 60s)
+   If direct handshake succeeds, agent upgrades to direct and releases relay
 ```
 
 ### Gateway Responsibilities
 
-The signaling gateway handles:
+The gateway handles the following functions:
 
 1. **Initial packet interception:** Receives packets matching the aggregate
    route and triggers resolution. During resolution, packets MAY be queued
@@ -1384,49 +1428,71 @@ The signaling gateway handles:
 2. **Resolution coordination:** Works with the local controller to resolve
    the remote host's peer information via the global directory.
 
-3. **NAT traversal assistance:** For nodes behind NAT or restrictive
-   firewalls that cannot establish direct tunnels, the gateway CAN relay
-   traffic. This is the exceptional case, not the common path.
+3. **Relay for unreachable nodes:** For nodes behind NAT or restrictive
+   firewalls that cannot establish direct tunnels, the gateway MUST relay
+   encrypted WireGuard data. This is a first-class supported mode for
+   enterprise and hybrid-cloud environments. Relay gateways MUST enforce
+   per-source rate limits and admission control (see
+   [PERFORMANCE.md Section 10](PERFORMANCE.md#10-gateway-performance-signaling-and-relay)).
 
 4. **Health monitoring:** Monitors the availability of direct tunnels and
-   falls back to gateway relay if a direct tunnel fails and cannot be
-   re-established.
+   coordinates relay establishment if a direct tunnel fails. The agent
+   MUST periodically re-attempt direct tunnel establishment for relayed
+   peers.
 
 ### Gateway Sizing
 
-Because the gateway handles signaling, not bulk data forwarding, it
-requires minimal resources:
+When the gateway handles signaling only (direct mode), it requires minimal
+resources. When the gateway also relays data, sizing MUST account for
+expected relay traffic volume:
 
 ```
-Resolution rate (typical): 10-100 new peer resolutions per second
-Resolution cost: ~1 ms CPU per resolution (TLS handshake + lookup)
-Gateway CPU: single core handles 1000+ resolutions/second
-Gateway memory: connection tracking for active resolutions only
+Signaling only (direct mode):
+  Resolution rate (typical): 10-100 new peer resolutions per second
+  Resolution cost: ~1 ms CPU per resolution (TLS handshake + lookup)
+  Gateway CPU: single core handles 1000+ resolutions/second
+  Gateway memory: connection tracking for active resolutions only
 
-Contrast with data-relay gateway:
-  Cross-cluster traffic: potentially 100+ Gbps aggregate
-  Would require: dedicated high-throughput hardware, multiple NICs
-  Wirescale avoids this entirely via direct tunnels.
+Signaling + relay (relay mode):
+  Add relay forwarding capacity based on expected relay traffic volume.
+  Per relay gateway: up to 10K concurrent sessions, up to 20 Gbps (25G NIC).
+  See PERFORMANCE.md Section 10 for detailed sizing guidance.
 ```
 
 ### NAT and Restricted Environments
 
 For nodes that cannot establish direct WireGuard tunnels (e.g., behind
-CGNAT, restrictive firewalls, or asymmetric routing):
+CGNAT, restrictive firewalls, or asymmetric routing), relay mode is a
+first-class supported configuration:
 
 1. The agent attempts direct tunnel establishment as normal.
-2. If the direct tunnel fails (no handshake completion within timeout),
-   the agent falls back to **gateway relay mode**.
-3. In relay mode, the gateway forwards data-plane traffic between the
-   two nodes. This incurs the traditional gateway bottleneck but only
-   for the specific unreachable nodes.
-4. The agent periodically re-attempts direct tunnel establishment. If
-   the network condition changes, the agent upgrades to direct tunnel
-   and removes the relay.
+2. If the direct tunnel fails (no handshake completion within timeout,
+   default 5s), the agent requests relay allocation from control.
+3. In relay mode, the gateway forwards encrypted WireGuard data between
+   the two nodes. The relay gateway MUST NOT decrypt or inspect the
+   inner payload -- end-to-end encryption is preserved.
+4. The agent MUST periodically re-attempt direct tunnel establishment
+   (default every 60s). If the network condition changes, the agent
+   upgrades to direct tunnel and releases the relay allocation.
+5. Relay gateways MUST enforce per-source rate limits (default 1 Gbps
+   per source) and admission control (reject when capacity exhausted).
 
-Gateway relay SHOULD be treated as an exceptional condition. Operators
-SHOULD monitor the fraction of traffic using relay mode and investigate
-nodes that consistently require it.
+**When relay mode is expected:**
+- **Corporate NAT/CGNAT:** Nodes behind carrier-grade or enterprise NAT
+  where UDP hole-punching fails.
+- **Asymmetric firewalls:** Security policies that permit outbound but
+  block inbound UDP to node endpoints.
+- **Cloud VPC peering gaps:** Cross-region or cross-account VPCs without
+  direct peering or transit gateway connectivity.
+- **Split-horizon DNS / overlapping address space:** Environments where
+  node endpoints are not mutually routable.
+
+Operators MUST monitor `wirescale_relay_utilization_ratio` and
+`wirescale_peer_mode{mode="relay"}` to understand the proportion of
+relayed traffic. Sustained relay utilization above 70% indicates the need
+for additional relay gateway capacity. See
+[OPERATIONS.md](OPERATIONS.md) for relay-specific alerting and
+troubleshooting runbooks.
 
 ### Control Federation (Mutual TLS)
 
@@ -1695,7 +1761,9 @@ Pod A in Cluster-1 (3fff:1234:0001:0001::a)
   | -> kernel routing: 3fff:1234:0002:0042::7/128 dev veth_X
   | -> veth_X -> Pod X
   |
-  | Direct tunnel. No gateway in the data path. WireGuard-limited throughput.
+  | Direct tunnel. Gateway not in the data path. WireGuard-limited throughput.
+  | (In relay mode, traffic would route through relay gateway instead of
+  |  direct to host-42, adding ~0.1-2 ms latency per hop.)
 ```
 
 ### Case 6: Pod to Internet (IPv6, Zero Overhead)
@@ -2096,8 +2164,8 @@ Requires:
 | **Routing state per node** | O(N) -- AllowedIPs | O(global_hosts) -- all /64s | O(local_hosts + clusters) |
 | **WireGuard state per node** | O(N) -- peer per node | O(N) or O(gateways) | O(active_peers) -- bounded |
 | **WAN routing table** | N/A (overlay) | O(global_hosts) -- /64 per host | O(clusters) -- /48 per cluster |
-| **Cross-cluster data path** | Via gateway (relay) | Via gateway (relay) | Direct tunnel (gateway off path) |
-| **Gateway throughput** | Must handle all cross-site BW | Must handle all cross-site BW | Signaling only (minimal) |
+| **Cross-cluster data path** | Via gateway (relay) | Via gateway (relay) | Direct tunnel (default); relay when nodes lack reachability |
+| **Gateway throughput** | Must handle all cross-site BW | Must handle all cross-site BW | Signaling only (direct mode); sized for relay traffic (relay mode) |
 | **Control plane** | K8s API (watch all nodes) | K8s API (IPAM only) | 3-tier: directory + controller + agent |
 | **Cold path latency** | WireGuard handshake | N/A (static routes) | +10-50 ms (signaling resolution) |
 | **Max practical scale** | ~1K nodes (O(N^2) state) | ~10K nodes (flat routing) | 100K+ nodes (hierarchical) |
@@ -2126,11 +2194,14 @@ Requires:
 - Multiple clusters across one or more sites
 - Operating at 10,000+ total nodes
 - Per-node state MUST remain bounded regardless of fleet growth
-- Cross-cluster encryption is required but gateway relay is a bottleneck
+- Cross-cluster encryption is required with direct tunnels (default) and
+  relay support for nodes behind NAT/firewalls
 - The deployment spans multiple sites or regions
 - Gateway should be signaling-only, not a data-plane chokepoint
 - All GUA preflight safety gates pass (see
   [Section 2.5](#25-prerequisites-and-safety-gates-for-gua-mode))
+- Gateway should be signaling-only for direct-reachable nodes, with relay
+  capability for restricted environments
 
 **Use both simultaneously (hybrid) when:**
 - Some clusters use GUA (datacenter, bare metal)
