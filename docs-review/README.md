@@ -34,6 +34,7 @@ The review intentionally moved beyond strict line-by-line proofreading to a high
 - `synthesis/CLAIM-STATUS-MATRIX.md`: Quantitative status matrix by file and overall totals
 - `synthesis/CROSS-DOC-CONTRADICTIONS.md`: Contradictions and architecture-level inconsistencies
 - `synthesis/REMEDIATION-BACKLOG.md`: Priority-ordered remediation actions
+- `synthesis/PR-SUGGESTIONS.md`: Suggested pull-request sequence for executing remediation work
 - `synthesis/OPEN-QUESTIONS.md`: Unresolved design and verification questions
 - `synthesis/SOURCE-INDEX.md`: Consolidated evidence index
 
